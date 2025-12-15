@@ -151,12 +151,20 @@ func (c *MemoryCache[K, V]) checkAndEvict() {
 func (c *MemoryCache[K, V]) LoadOrCompute(key K, valueFn func() (V, int, bool)) (actual V, loaded bool) {
 	// Try to get with read lock first
 	c.mu.RLock()
-	val, ok := c.get(key, true)
+	val, ok := c.get(key, false) // Use peek (no touch) to avoid modifying LRU under read lock
 	if ok && val != nil {
 		c.mu.RUnlock()
-		return *val, true
+		// Now update LRU with write lock since we found it
+		c.mu.Lock()
+		val, ok = c.get(key, true)
+		c.mu.Unlock()
+		if ok && val != nil {
+			return *val, true
+		}
+		// If it disappeared between locks, continue to compute
+	} else {
+		c.mu.RUnlock()
 	}
-	c.mu.RUnlock()
 
 	// Upgrade to write lock
 	c.mu.Lock()

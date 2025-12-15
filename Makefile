@@ -24,6 +24,34 @@ build-setup:
 	fi
 .PHONY: build-setup
 
+test: export TEST       ?= .*
+test: export TEST_DIR   ?= ./...
+test: export TEST_COUNT ?= 1
+test: test-setup ## Run basic unit tests: TEST=.* TEST_DIR=./... TEST_COUNT=1 make test
+	@go test -v -race -count=$(TEST_COUNT) -run "$(TEST)" $(TEST_DIR) 2>&1 | tee /tmp/sidekick-test.log
+	@echo "Test completed, see /tmp/sidekick-test.log for details"
+.PHONY: test
+
+test-bench: export TEST       ?= ^$
+test-bench: export TEST_BENCH ?= .
+test-bench: export TEST_DIR   ?= ./...
+test-bench: test-setup ## Run bench tests: TEST_BENCH="." TEST_DIR=./... make test-benchm
+	@go test -run="$(TEST)" -bench="$(TEST_BENCH)" -benchmem -benchtime=10s -timeout=5m $(TEST_DIR) 2>&1 | tee /tmp/sidekick-bench.log
+	@echo "Test completed, see /tmp/sidekick-bench.log for details"
+.PHONY: test-bench
+
+test-stress: export TEST       ?= TestConcurrent
+test-stress: export TEST_DIR   ?= ./...
+test-stress: export TEST_COUNT ?= 100
+test-stress: test-setup ## Run stress tests: TEST=TestConcurrent TEST_DIR=./... TEST_COUNT=100 make test-stress
+	@go test -v -race -count=$(TEST_COUNT) -run "$(TEST)" $(TEST_DIR) 2>&1 | tee /tmp/sidekick-stress.log
+	@echo "Test completed, see /tmp/sidekick-stress.log for details"
+.PHONY: test-stress
+
+test-setup:
+	@go clean -testcache
+.PHONY: test-setup
+
 fmt: ## Run go-fmt against codebase
 	@go fmt ./...
 .PHONY: fmt
