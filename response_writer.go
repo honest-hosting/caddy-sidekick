@@ -29,8 +29,8 @@ func NewResponseWriter(rw http.ResponseWriter, r *http.Request, storage *Storage
 		origUrl: *r.URL,
 
 		cacheMaxSize:       int(s.CacheMemoryItemMaxSize),
-		maxCacheableSize:   int(s.CacheItemMaxSize),
-		streamToDiskSize:   int(s.CacheStreamToDiskSize),
+		maxCacheableSize:   int(s.CacheDiskItemMaxSize),
+		streamToDiskSize:   int(s.CacheMemoryStreamToDiskSize),
 		cacheResponseCodes: s.CacheResponseCodes,
 		cacheHeaderName:    CacheHeaderName,
 		status:             -1,
@@ -200,10 +200,10 @@ func (r *ResponseWriter) WriteHeader(status int) {
 	// Check Content-Length if available
 	if contentLength := hdr.Get("Content-Length"); contentLength != "" {
 		if size, err := strconv.ParseInt(contentLength, 10, 64); err == nil {
-			// Check if caching is disabled (0) or if size exceeds limit
+			// Check if disk caching is disabled (0) or if size exceeds limit
 			if r.maxCacheableSize == 0 || (r.maxCacheableSize > 0 && size > int64(r.maxCacheableSize)) {
 				bypass = true
-				r.Debug("Bypass caching due to Content-Length", zap.Int64("size", size), zap.Int("limit", r.maxCacheableSize))
+				r.Debug("Bypass caching due to Content-Length exceeding disk limit", zap.Int64("size", size), zap.Int("limit", r.maxCacheableSize))
 			}
 		}
 	}
@@ -239,9 +239,9 @@ func (r *ResponseWriter) Write(b []byte) (int, error) {
 
 		newSize := r.totalSize + int64(len(b))
 
-		// Check if we exceed max cacheable size (0 = disabled, -1 = unlimited)
+		// Check if we exceed max disk cacheable size (0 = disabled, -1 = unlimited)
 		if r.maxCacheableSize == 0 || (r.maxCacheableSize > 0 && newSize > int64(r.maxCacheableSize)) {
-			// Too large to cache or caching disabled
+			// Too large to cache on disk or disk caching disabled
 			atomic.StoreInt32(&r.needCache, 0)
 			if r.tempFile != nil {
 				if err := r.tempFile.Close(); err != nil {
@@ -254,7 +254,7 @@ func (r *ResponseWriter) Write(b []byte) (int, error) {
 				r.tempFilePath = ""
 			}
 			r.buffer.Reset()
-			r.Debug("Bypass caching because of data size", zap.Int64("size", newSize), zap.Int("limit", r.maxCacheableSize))
+			r.Debug("Bypass caching because data size exceeds disk limit", zap.Int64("size", newSize), zap.Int("limit", r.maxCacheableSize))
 			return n, err
 		}
 
