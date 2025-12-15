@@ -3,7 +3,9 @@ module github.com/honest-hosting/caddy-sidekick
 go 1.24
 
 require (
+	github.com/andybalholm/brotli v1.0.6
 	github.com/caddyserver/caddy/v2 v2.10.0
+	github.com/klauspost/compress v1.18.0
 	go.uber.org/zap v1.27.0
 )
 
@@ -54,7 +56,6 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a // indirect
 	github.com/jackc/pgtype v1.14.0 // indirect
 	github.com/jackc/pgx/v4 v4.18.3 // indirect
-	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/libdns/libdns v1.0.0-beta.1 // indirect
 	github.com/manifoldco/promptui v0.9.0 // indirect

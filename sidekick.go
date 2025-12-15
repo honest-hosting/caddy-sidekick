@@ -1,15 +1,17 @@
 package sidekick
 
 import (
+	"bytes"
+	"crypto/md5"
 	"encoding/json"
+	"fmt"
 	"math"
+	"net/http"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-
-	"net/http"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -36,11 +38,21 @@ type Sidekick struct {
 	MemoryItemMaxSize   int
 	MemoryCacheMaxSize  int
 	MemoryCacheMaxCount int
+	MaxCacheableSize    int // Maximum size for a response to be cached (0 = unlimited)
+	StreamToDiskSize    int // Size threshold to stream directly to disk instead of memory
+
+	// Cache key configuration
+	CacheKeyHeaders []string // Headers to include in cache key
+	CacheKeyQueries []string // Query parameters to include in cache key
+	CacheKeyCookies []string // Cookies to include in cache key
 
 	pathRx *regexp.Regexp
 
 	// Synchronization handler (initialized during Provision)
 	syncHandler *SyncHandler
+
+	// Buffer pool for response buffering
+	bufferPool *sync.Pool
 }
 
 // SyncHandler manages synchronization for cache operations
@@ -150,6 +162,34 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil {
 				s.MemoryCacheMaxCount = int(n)
 			}
+
+		case "max_cacheable_size":
+			if n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil {
+				s.MaxCacheableSize = int(n)
+			}
+
+		case "stream_to_disk_size":
+			if n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil {
+				s.StreamToDiskSize = int(n)
+			}
+
+		case "cache_key_headers":
+			s.CacheKeyHeaders = strings.Split(strings.TrimSpace(value), ",")
+			for i := range s.CacheKeyHeaders {
+				s.CacheKeyHeaders[i] = strings.TrimSpace(s.CacheKeyHeaders[i])
+			}
+
+		case "cache_key_queries":
+			s.CacheKeyQueries = strings.Split(strings.TrimSpace(value), ",")
+			for i := range s.CacheKeyQueries {
+				s.CacheKeyQueries[i] = strings.TrimSpace(s.CacheKeyQueries[i])
+			}
+
+		case "cache_key_cookies":
+			s.CacheKeyCookies = strings.Split(strings.TrimSpace(value), ",")
+			for i := range s.CacheKeyCookies {
+				s.CacheKeyCookies[i] = strings.TrimSpace(s.CacheKeyCookies[i])
+			}
 		}
 	}
 
@@ -167,12 +207,22 @@ const (
 	DefaultCacheHeaderName     = "X-Sidekick-Cache"
 	DefaultBypassPathRegex     = ".*(\\.[^.]+)$" // bypass all media, images, css, js, etc
 	DefaultTTL                 = 6000
+	DefaultMaxCacheableSize    = 100 * 1024 * 1024 // 100MB
+	DefaultStreamToDiskSize    = 10 * 1024 * 1024  // 10MB
+	DefaultBufferSize          = 32 * 1024         // 32KB buffer size
 )
 
 func (s *Sidekick) Provision(ctx caddy.Context) error {
 	s.logger = ctx.Logger(s)
 	s.syncHandler = &SyncHandler{
 		inFlight: make(map[string]*sync.Once),
+	}
+
+	// Initialize buffer pool
+	s.bufferPool = &sync.Pool{
+		New: func() interface{} {
+			return bytes.NewBuffer(make([]byte, 0, DefaultBufferSize))
+		},
 	}
 
 	if s.Loc == "" {
@@ -280,6 +330,14 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 		s.MemoryCacheMaxCount = DefaultMemoryCacheMaxCount
 	}
 
+	if s.MaxCacheableSize == 0 {
+		s.MaxCacheableSize = DefaultMaxCacheableSize
+	}
+
+	if s.StreamToDiskSize == 0 {
+		s.StreamToDiskSize = DefaultStreamToDiskSize
+	}
+
 	s.Storage = NewStorage(s.Loc, s.TTL, s.MemoryCacheMaxSize, s.MemoryCacheMaxCount, s.logger)
 
 	return nil
@@ -321,9 +379,12 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		return next.ServeHTTP(w, r)
 	}
 
-	// Build cache key
-	cacheKey := ""
-	cacheKey = storage.buildCacheKey(r.URL.Path, cacheKey)
+	// Check for conditional requests (If-None-Match, If-Modified-Since)
+	etag := r.Header.Get("If-None-Match")
+	modifiedSince := r.Header.Get("If-Modified-Since")
+
+	// Build cache key with configurable components
+	cacheKey := s.buildCacheKey(r)
 
 	requestEncoding := strings.Split(strings.Join(reqHdr["Accept-Encoding"], ""), ",")
 	if len(requestEncoding) == 1 && len(requestEncoding[0]) == 0 {
@@ -347,6 +408,12 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	s.syncHandler.cacheMu.RUnlock()
 
 	if err == nil {
+		// Check for 304 Not Modified
+		if s.shouldReturn304(cacheMeta, etag, modifiedSince) {
+			w.WriteHeader(http.StatusNotModified)
+			return nil
+		}
+
 		// Serve from cache
 		hdr.Set(s.CacheHeaderName, "HIT")
 		hdr.Set("Vary", "Accept-Encoding")
@@ -381,8 +448,12 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	s.syncHandler.inFlightMu.Unlock()
 
 	// Create custom writer to capture response
-	nw := NewResponseWriter(w, r, storage, s.logger, s, once, cacheKey)
+	buf := s.bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	nw := NewResponseWriter(w, r, storage, s.logger, s, once, cacheKey, buf)
 	defer func() {
+		// Return buffer to pool
+		s.bufferPool.Put(buf)
 		if err := nw.Close(); err != nil {
 			s.logger.Error("Error closing response writer", zap.Error(err))
 		}
@@ -477,6 +548,71 @@ func (s *Sidekick) shouldBypass(r *http.Request) bool {
 	for _, cookie := range cookies {
 		if strings.HasPrefix(cookie.Name, "wordpress_logged_in") {
 			return true
+		}
+	}
+
+	return false
+}
+
+// buildCacheKey builds a cache key based on configured components
+func (s *Sidekick) buildCacheKey(r *http.Request) string {
+	h := md5.New()
+
+	// Always include path
+	h.Write([]byte(r.URL.Path))
+
+	// Include configured query parameters
+	if len(s.CacheKeyQueries) > 0 {
+		query := r.URL.Query()
+		for _, q := range s.CacheKeyQueries {
+			if q == "*" {
+				// Include all query parameters
+				h.Write([]byte(query.Encode()))
+				break
+			}
+			if val := query.Get(q); val != "" {
+				h.Write([]byte(q + "=" + val))
+			}
+		}
+	}
+
+	// Include configured headers
+	for _, hdr := range s.CacheKeyHeaders {
+		if val := r.Header.Get(hdr); val != "" {
+			h.Write([]byte(hdr + ":" + val))
+		}
+	}
+
+	// Include configured cookies
+	for _, cookieName := range s.CacheKeyCookies {
+		if cookie, err := r.Cookie(cookieName); err == nil {
+			h.Write([]byte(cookieName + "=" + cookie.Value))
+		}
+	}
+
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// shouldReturn304 checks if we should return a 304 Not Modified response
+func (s *Sidekick) shouldReturn304(meta *Metadata, ifNoneMatch, ifModifiedSince string) bool {
+	// Check ETag
+	if ifNoneMatch != "" {
+		for _, kv := range meta.Header {
+			if len(kv) == 2 && kv[0] == "Etag" && kv[1] == ifNoneMatch {
+				return true
+			}
+		}
+	}
+
+	// Check Last-Modified
+	if ifModifiedSince != "" {
+		for _, kv := range meta.Header {
+			if len(kv) == 2 && kv[0] == "Last-Modified" {
+				// Simple string comparison - could be enhanced with proper date parsing
+				if kv[1] == ifModifiedSince {
+					return true
+				}
+			}
 		}
 	}
 

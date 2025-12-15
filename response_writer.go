@@ -1,8 +1,15 @@
 package sidekick
 
 import (
+	"bufio"
+	"bytes"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path"
 	"slices"
 	"strconv"
 	"sync"
@@ -11,7 +18,7 @@ import (
 	"go.uber.org/zap"
 )
 
-func NewResponseWriter(rw http.ResponseWriter, r *http.Request, storage *Storage, logger *zap.Logger, s *Sidekick, once *sync.Once, cacheKey string) *ResponseWriter {
+func NewResponseWriter(rw http.ResponseWriter, r *http.Request, storage *Storage, logger *zap.Logger, s *Sidekick, once *sync.Once, cacheKey string, buf *bytes.Buffer) *ResponseWriter {
 	nw := ResponseWriter{
 		ResponseWriter: rw,
 		Request:        r,
@@ -22,12 +29,16 @@ func NewResponseWriter(rw http.ResponseWriter, r *http.Request, storage *Storage
 		origUrl: *r.URL,
 
 		cacheMaxSize:       s.MemoryItemMaxSize,
+		maxCacheableSize:   s.MaxCacheableSize,
+		streamToDiskSize:   s.StreamToDiskSize,
 		cacheResponseCodes: s.CacheResponseCodes,
 		cacheHeaderName:    s.CacheHeaderName,
 		status:             -1,
 		once:               once,
 		cacheKey:           cacheKey,
 		cacheMu:            &s.syncHandler.cacheMu,
+		buffer:             buf,
+		sidekick:           s,
 	}
 	return &nw
 }
@@ -43,6 +54,8 @@ type ResponseWriter struct {
 	cacheResponseCodes []string
 	cacheHeaderName    string
 	cacheMaxSize       int
+	maxCacheableSize   int
+	streamToDiskSize   int
 
 	origUrl url.URL
 
@@ -52,15 +65,23 @@ type ResponseWriter struct {
 	// flag response data need to be cached
 	needCache int32
 
-	// currently cache in memory
-	// assume response data not too large
-	buf []byte
+	// Buffer from pool
+	buffer *bytes.Buffer
+
+	// For streaming to disk
+	tempFile     *os.File
+	tempFilePath string
+	isStreaming  bool
+	totalSize    int64
 
 	// Concurrency control
 	once     *sync.Once
 	cacheKey string
 	cacheMu  *sync.RWMutex
 	bufMu    sync.Mutex
+
+	// Reference to parent
+	sidekick *Sidekick
 }
 
 func (r *ResponseWriter) Unwrap() http.ResponseWriter {
@@ -69,6 +90,22 @@ func (r *ResponseWriter) Unwrap() http.ResponseWriter {
 
 // Close sets cache on response end
 func (r *ResponseWriter) Close() error {
+	// Clean up temp file if streaming
+	if r.isStreaming && r.tempFile != nil {
+		defer func() {
+			if err := r.tempFile.Close(); err != nil {
+				r.Error("Failed to close temp file", zap.Error(err))
+			}
+		}()
+		if r.tempFilePath != "" {
+			defer func() {
+				if err := os.Remove(r.tempFilePath); err != nil {
+					r.Debug("Failed to remove temp file", zap.String("path", r.tempFilePath), zap.Error(err))
+				}
+			}()
+		}
+	}
+
 	if atomic.LoadInt32(&r.needCache) == 1 {
 		// Use sync.Once to ensure caching happens only once for this key
 		var cacheErr error
@@ -82,13 +119,30 @@ func (r *ResponseWriter) Close() error {
 				return
 			}
 
-			// Lock buffer for reading
-			r.bufMu.Lock()
-			bufCopy := make([]byte, len(r.buf))
-			copy(bufCopy, r.buf)
-			r.bufMu.Unlock()
+			// Get the data to cache
+			var dataToCache []byte
+			if r.isStreaming && r.tempFile != nil {
+				// Read from temp file
+				if _, err := r.tempFile.Seek(0, 0); err != nil {
+					r.Error("Failed to seek temp file", zap.Error(err))
+					return
+				}
+				dataToCache = make([]byte, r.totalSize)
+				_, err := io.ReadFull(r.tempFile, dataToCache)
+				if err != nil {
+					r.Error("Failed to read temp file", zap.Error(err))
+					return
+				}
+			} else {
+				// Get data from buffer
+				r.bufMu.Lock()
+				dataToCache = make([]byte, r.buffer.Len())
+				copy(dataToCache, r.buffer.Bytes())
+				r.bufMu.Unlock()
+			}
 
-			cacheErr = r.Set(r.origUrl.Path, "", meta, bufCopy)
+			// Store in cache using the cache key we built
+			cacheErr = r.SetWithKey(r.cacheKey, meta, dataToCache)
 			if cacheErr != nil {
 				r.Error("Failed to cache response", zap.Error(cacheErr))
 			}
@@ -143,6 +197,16 @@ func (r *ResponseWriter) WriteHeader(status int) {
 		}
 	}
 
+	// Check Content-Length if available
+	if contentLength := hdr.Get("Content-Length"); contentLength != "" {
+		if size, err := strconv.ParseInt(contentLength, 10, 64); err == nil {
+			if r.maxCacheableSize > 0 && size > int64(r.maxCacheableSize) {
+				bypass = true
+				r.Debug("Bypass caching due to Content-Length", zap.Int64("size", size), zap.Int("limit", r.maxCacheableSize))
+			}
+		}
+	}
+
 	cacheState := "BYPASS"
 	if bypass {
 		hdr.Set(r.cacheHeaderName, cacheState)
@@ -164,21 +228,118 @@ func (r *ResponseWriter) Write(b []byte) (int, error) {
 		r.WriteHeader(200)
 	}
 
-	// save response data
+	// Always write to the actual response writer first
+	n, err := r.ResponseWriter.Write(b)
+
+	// save response data for caching
 	if atomic.LoadInt32(&r.needCache) == 1 {
 		r.bufMu.Lock()
-		sz := len(r.buf) + len(b)
-		if sz <= r.cacheMaxSize {
-			r.buf = append(r.buf, b...)
-			r.bufMu.Unlock()
-		} else {
-			// too large, skip cache in memory
+		defer r.bufMu.Unlock()
+
+		newSize := r.totalSize + int64(len(b))
+
+		// Check if we exceed max cacheable size
+		if r.maxCacheableSize > 0 && newSize > int64(r.maxCacheableSize) {
+			// Too large to cache
 			atomic.StoreInt32(&r.needCache, 0)
-			r.buf = nil
-			r.bufMu.Unlock()
-			r.Debug("Bypass caching because of data size", zap.Int("sz", sz), zap.Int("limit", r.cacheMaxSize))
+			if r.tempFile != nil {
+				if err := r.tempFile.Close(); err != nil {
+					r.Error("Failed to close temp file", zap.Error(err))
+				}
+				if err := os.Remove(r.tempFilePath); err != nil {
+					r.Debug("Failed to remove temp file", zap.String("path", r.tempFilePath), zap.Error(err))
+				}
+				r.tempFile = nil
+				r.tempFilePath = ""
+			}
+			r.buffer.Reset()
+			r.Debug("Bypass caching because of data size", zap.Int64("size", newSize), zap.Int("limit", r.maxCacheableSize))
+			return n, err
+		}
+
+		// Check if we should switch to streaming to disk
+		if !r.isStreaming && r.streamToDiskSize > 0 && newSize > int64(r.streamToDiskSize) {
+			// Switch to streaming to disk
+			if err := r.switchToStreaming(); err != nil {
+				r.Error("Failed to switch to streaming", zap.Error(err))
+				atomic.StoreInt32(&r.needCache, 0)
+				return n, err
+			}
+		}
+
+		// Write to buffer or temp file
+		if r.isStreaming {
+			if _, writeErr := r.tempFile.Write(b); writeErr != nil {
+				r.Error("Failed to write to temp file", zap.Error(writeErr))
+				atomic.StoreInt32(&r.needCache, 0)
+				return n, err
+			}
+		} else {
+			r.buffer.Write(b)
+		}
+
+		r.totalSize = newSize
+	}
+
+	return n, err
+}
+
+// switchToStreaming switches from memory buffering to disk streaming
+func (r *ResponseWriter) switchToStreaming() error {
+	// Create temp file
+	tempDir := path.Join(r.loc, "temp")
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		return fmt.Errorf("failed to create temp dir: %w", err)
+	}
+
+	tempFile, err := os.CreateTemp(tempDir, "sidekick-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+
+	// Write existing buffer content to temp file
+	if r.buffer.Len() > 0 {
+		if _, err := tempFile.Write(r.buffer.Bytes()); err != nil {
+			closeErr := tempFile.Close()
+			removeErr := os.Remove(tempFile.Name())
+			if closeErr != nil {
+				r.Error("Failed to close temp file after write error", zap.Error(closeErr))
+			}
+			if removeErr != nil {
+				r.Debug("Failed to remove temp file after write error", zap.String("name", tempFile.Name()), zap.Error(removeErr))
+			}
+			return fmt.Errorf("failed to write buffer to temp file: %w", err)
 		}
 	}
 
-	return r.ResponseWriter.Write(b)
+	r.tempFile = tempFile
+	r.tempFilePath = tempFile.Name()
+	r.isStreaming = true
+	r.buffer.Reset() // Clear the buffer to free memory
+
+	r.Debug("Switched to streaming to disk", zap.String("tempFile", r.tempFilePath))
+	return nil
+}
+
+// Implement http.Flusher interface if the underlying ResponseWriter supports it
+func (r *ResponseWriter) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// Implement http.Hijacker interface if the underlying ResponseWriter supports it
+func (r *ResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hijacker, ok := r.ResponseWriter.(http.Hijacker); ok {
+		return hijacker.Hijack()
+	}
+	return nil, nil, fmt.Errorf("hijacking not supported")
+}
+
+// Implement http.Pusher interface if the underlying ResponseWriter supports it
+func (r *ResponseWriter) Push(target string, opts *http.PushOptions) error {
+	if pusher, ok := r.ResponseWriter.(http.Pusher); ok {
+		return pusher.Push(target, opts)
+	}
+	return fmt.Errorf("push not supported")
 }

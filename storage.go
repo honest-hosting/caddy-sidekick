@@ -1,6 +1,8 @@
 package sidekick
 
 import (
+	"bytes"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 	"go.uber.org/zap"
 )
 
@@ -177,11 +181,37 @@ func (s *Storage) Get(key string, ce string) ([]byte, *Metadata, error) {
 
 func (s *Storage) Set(reqPath string, cacheKey string, meta *Metadata, value []byte) error {
 	key := s.buildCacheKey(reqPath, cacheKey)
+	return s.SetWithKey(key, meta, value)
+}
+
+// SetWithKey stores data with a pre-built cache key
+func (s *Storage) SetWithKey(key string, meta *Metadata, value []byte) error {
 	s.logger.Debug("Cache Key", zap.String("Key", key), zap.String("ce", meta.contentEncoding))
 
 	key = strings.ReplaceAll(key, "/", "+")
 	ce := meta.contentEncoding
 
+	// Compress data if not already compressed
+	if ce == "none" || ce == "" {
+		// Try to compress with gzip by default
+		compressedData, err := s.compressData(value, "gzip")
+		if err == nil && len(compressedData) < len(value) {
+			// Compression is beneficial, also store compressed version
+			compressedMeta := *meta
+			compressedMeta.contentEncoding = "gzip"
+			go func() {
+				if err := s.storeData(key, "gzip", &compressedMeta, compressedData); err != nil {
+					s.logger.Error("Failed to store compressed data", zap.Error(err))
+				}
+			}()
+		}
+	}
+
+	return s.storeData(key, ce, meta, value)
+}
+
+// storeData stores the data with the given key and content encoding
+func (s *Storage) storeData(key string, ce string, meta *Metadata, value []byte) error {
 	// Get per-key mutex for writing
 	keyMu := s.getKeyMutex(key)
 	keyMu.Lock()
@@ -194,7 +224,7 @@ func (s *Storage) Set(reqPath string, cacheKey string, meta *Metadata, value []b
 			value:    value,
 		}, len(value))
 
-		s.logger.Debug("Setting key in cache", zap.String("key", key), zap.String("ce", meta.contentEncoding), zap.Bool("replace", existed))
+		s.logger.Debug("Setting key in cache", zap.String("key", key), zap.String("ce", ce), zap.Bool("replace", existed))
 	}
 
 	// Write to disk with file lock
@@ -223,6 +253,63 @@ func (s *Storage) Set(reqPath string, cacheKey string, meta *Metadata, value []b
 	}
 
 	return nil
+}
+
+// compressData compresses data using the specified encoding
+func (s *Storage) compressData(data []byte, encoding string) ([]byte, error) {
+	var buf bytes.Buffer
+
+	switch encoding {
+	case "gzip":
+		writer := gzip.NewWriter(&buf)
+		defer func() {
+			if err := writer.Close(); err != nil {
+				s.logger.Error("Failed to close gzip writer", zap.Error(err))
+			}
+		}()
+		if _, err := writer.Write(data); err != nil {
+			return nil, err
+		}
+		if err := writer.Close(); err != nil {
+			return nil, err
+		}
+
+	case "br":
+		writer := brotli.NewWriter(&buf)
+		defer func() {
+			if err := writer.Close(); err != nil {
+				s.logger.Error("Failed to close brotli writer", zap.Error(err))
+			}
+		}()
+		if _, err := writer.Write(data); err != nil {
+			return nil, err
+		}
+		if err := writer.Close(); err != nil {
+			return nil, err
+		}
+
+	case "zstd":
+		writer, err := zstd.NewWriter(&buf)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if err := writer.Close(); err != nil {
+				s.logger.Error("Failed to close zstd writer", zap.Error(err))
+			}
+		}()
+		if _, err := writer.Write(data); err != nil {
+			return nil, err
+		}
+		if err := writer.Close(); err != nil {
+			return nil, err
+		}
+
+	default:
+		return nil, fmt.Errorf("unsupported encoding: %s", encoding)
+	}
+
+	return buf.Bytes(), nil
 }
 
 func (s *Storage) Purge(key string) {
