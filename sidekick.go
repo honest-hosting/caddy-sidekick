@@ -5,7 +5,6 @@ import (
 	"crypto/md5"
 	"encoding/json"
 	"fmt"
-	"math"
 	"net/http"
 	"os"
 	"regexp"
@@ -17,36 +16,36 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/dustin/go-humanize"
 	"go.uber.org/zap"
 )
 
 type Sidekick struct {
 	logger             *zap.Logger
-	Loc                string
-	PurgePath          string
-	PurgeKeyHeader     string
-	PurgeKey           string
-	CacheHeaderName    string
-	BypassPathPrefixes []string
-	BypassPathRegex    string
-	BypassHome         bool
-	BypassDebugQuery   string
-	CacheResponseCodes []string
-	TTL                int
+	CacheDir           string   `json:"cache_dir,omitempty"`
+	PurgePath          string   `json:"purge_path,omitempty"`
+	PurgeKey           string   `json:"purge_key,omitempty"`
+	NoCache            []string `json:"nocache,omitempty"`       // Path prefixes to bypass
+	NoCacheRegex       string   `json:"nocache_regex,omitempty"` // Regex pattern to bypass
+	NoCacheHome        bool     `json:"nocache_home,omitempty"`  // Whether to skip caching home page
+	CacheResponseCodes []string `json:"cache_response_codes,omitempty"`
+	CacheTTL           int      `json:"cache_ttl,omitempty"` // TTL in seconds
 	Storage            *Storage
 
-	MemoryItemMaxSize   int
-	MemoryCacheMaxSize  int
-	MemoryCacheMaxCount int
-	MaxCacheableSize    int // Maximum size for a response to be cached (0 = unlimited)
-	StreamToDiskSize    int // Size threshold to stream directly to disk instead of memory
+	// Size configurations (stored as int64 for byte values)
+	CacheMemoryItemMaxSize int64 `json:"cache_memory_item_max_size,omitempty"` // Max size for single item in memory
+	CacheMemoryMaxSize     int64 `json:"cache_memory_max_size,omitempty"`      // Total memory cache size limit
+	CacheMemoryMaxCount    int   `json:"cache_memory_max_count,omitempty"`     // Max number of items in memory
+	CacheItemMaxSize       int64 `json:"cache_item_max_size,omitempty"`        // Max size for any cached item
+	CacheStreamToDiskSize  int64 `json:"cache_stream_to_disk_size,omitempty"`  // Threshold to stream to disk
 
 	// Cache key configuration
-	CacheKeyHeaders []string // Headers to include in cache key
-	CacheKeyQueries []string // Query parameters to include in cache key
-	CacheKeyCookies []string // Cookies to include in cache key
+	CacheKeyHeaders []string `json:"cache_key_headers,omitempty"`
+	CacheKeyQueries []string `json:"cache_key_queries,omitempty"`
+	CacheKeyCookies []string `json:"cache_key_cookies,omitempty"`
 
-	pathRx *regexp.Regexp
+	pathRx           *regexp.Regexp
+	bypassDebugQuery string // Internal field for debug query bypass
 
 	// Synchronization handler (initialized during Provision)
 	syncHandler *SyncHandler
@@ -79,116 +78,168 @@ func parseCaddyfileHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler,
 	return s, nil
 }
 
+// parseSize parses human-readable size strings like "4MB", "1.5GB", etc.
+// Returns -1 for unlimited, 0 for disabled, or the size in bytes
+func parseSize(value string) (int64, error) {
+	value = strings.TrimSpace(value)
+
+	// Check for special values
+	if value == "-1" || strings.ToLower(value) == "unlimited" {
+		return -1, nil
+	}
+	if value == "0" || strings.ToLower(value) == "disabled" {
+		return 0, nil
+	}
+
+	// Try parsing as plain number first (assume bytes)
+	if n, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return n, nil
+	}
+
+	// Parse human-readable format
+	bytes, err := humanize.ParseBytes(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size format: %s", value)
+	}
+	return int64(bytes), nil
+}
+
 func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
-		var value string
+		for d.NextBlock(0) {
+			key := d.Val()
 
-		key := d.Val()
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			value := d.Val()
 
-		if !d.Args(&value) {
-			continue
-		}
+			switch key {
+			case "cache_dir":
+				s.CacheDir = value
 
-		switch key {
-		case "loc":
-			s.Loc = value
+			case "nocache":
+				// Can be comma-separated or multiple arguments
+				prefixes := strings.Split(value, ",")
+				for d.NextArg() {
+					prefixes = append(prefixes, strings.Split(d.Val(), ",")...)
+				}
+				for i := range prefixes {
+					prefixes[i] = strings.TrimSpace(prefixes[i])
+				}
+				s.NoCache = prefixes
 
-		case "bypass_path_prefixes":
-			s.BypassPathPrefixes = strings.Split(strings.TrimSpace(value), ",")
+			case "nocache_regex":
+				value = strings.TrimSpace(value)
+				if len(value) != 0 {
+					_, err := regexp.Compile(value)
+					if err != nil {
+						return err
+					}
+				}
+				s.NoCacheRegex = value
 
-		case "bypass_path_regex":
-			value = strings.TrimSpace(value)
-			if len(value) != 0 {
-				_, err := regexp.Compile(value)
+			case "nocache_home":
+				b, err := strconv.ParseBool(value)
 				if err != nil {
-					return err
+					return d.Errf("nocache_home must be true or false")
 				}
-			} else {
-				// bypass all media, images, css, js, etc
-				value = ".*(\\.[^.]+)$"
-			}
-			s.BypassPathRegex = value
+				s.NoCacheHome = b
 
-		case "bypass_home":
-			if strings.ToLower(value) == "true" {
-				s.BypassHome = true
-			}
-
-		case "bypass_debug_query":
-			s.BypassDebugQuery = strings.TrimSpace(value)
-
-		case "cache_response_codes":
-			codes := strings.Split(strings.TrimSpace(value), ",")
-			s.CacheResponseCodes = make([]string, len(codes))
-
-			for i, code := range codes {
-				code = strings.TrimSpace(code)
-				if strings.Contains(code, "XX") {
-					code = string(code[0])
+			case "cache_response_codes":
+				codes := strings.Split(value, ",")
+				for d.NextArg() {
+					codes = append(codes, strings.Split(d.Val(), ",")...)
 				}
-				s.CacheResponseCodes[i] = code
-			}
+				s.CacheResponseCodes = make([]string, len(codes))
+				for i, code := range codes {
+					code = strings.TrimSpace(code)
+					if strings.Contains(code, "XX") {
+						code = string(code[0])
+					}
+					s.CacheResponseCodes[i] = code
+				}
 
-		case "ttl":
-			ttl, err := strconv.Atoi(value)
-			if err != nil {
-				s.logger.Error("Invalid TTL value", zap.Error(err))
-				continue
-			}
-			s.TTL = ttl
+			case "cache_ttl":
+				ttl, err := strconv.Atoi(value)
+				if err != nil {
+					return d.Errf("invalid cache_ttl value: %v", err)
+				}
+				s.CacheTTL = ttl
 
-		case "purge_path":
-			s.PurgePath = value
+			case "purge_path":
+				s.PurgePath = value
 
-		case "purge_key":
-			s.PurgeKey = strings.TrimSpace(value)
+			case "purge_key":
+				s.PurgeKey = strings.TrimSpace(value)
 
-		case "purge_key_header":
-			s.PurgeKeyHeader = value
+			case "cache_memory_item_max_size":
+				size, err := parseSize(value)
+				if err != nil {
+					return d.Errf("invalid cache_memory_item_max_size: %v", err)
+				}
+				s.CacheMemoryItemMaxSize = size
 
-		case "cache_header_name":
-			s.CacheHeaderName = value
+			case "cache_memory_max_size":
+				size, err := parseSize(value)
+				if err != nil {
+					return d.Errf("invalid cache_memory_max_size: %v", err)
+				}
+				s.CacheMemoryMaxSize = size
 
-		case "memory_item_max_size":
-			if n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil {
-				s.MemoryItemMaxSize = int(n)
-			}
+			case "cache_memory_max_count":
+				count, err := strconv.Atoi(value)
+				if err != nil {
+					return d.Errf("invalid cache_memory_max_count: %v", err)
+				}
+				s.CacheMemoryMaxCount = count
 
-		case "memory_max_size":
-			if n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil {
-				s.MemoryCacheMaxSize = int(n)
-			}
-		case "memory_max_count":
-			if n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil {
-				s.MemoryCacheMaxCount = int(n)
-			}
+			case "cache_item_max_size":
+				size, err := parseSize(value)
+				if err != nil {
+					return d.Errf("invalid cache_item_max_size: %v", err)
+				}
+				s.CacheItemMaxSize = size
 
-		case "max_cacheable_size":
-			if n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil {
-				s.MaxCacheableSize = int(n)
-			}
+			case "cache_stream_to_disk_size":
+				size, err := parseSize(value)
+				if err != nil {
+					return d.Errf("invalid cache_stream_to_disk_size: %v", err)
+				}
+				s.CacheStreamToDiskSize = size
 
-		case "stream_to_disk_size":
-			if n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil {
-				s.StreamToDiskSize = int(n)
-			}
+			case "cache_key_headers":
+				headers := strings.Split(value, ",")
+				for d.NextArg() {
+					headers = append(headers, strings.Split(d.Val(), ",")...)
+				}
+				for i := range headers {
+					headers[i] = strings.TrimSpace(headers[i])
+				}
+				s.CacheKeyHeaders = headers
 
-		case "cache_key_headers":
-			s.CacheKeyHeaders = strings.Split(strings.TrimSpace(value), ",")
-			for i := range s.CacheKeyHeaders {
-				s.CacheKeyHeaders[i] = strings.TrimSpace(s.CacheKeyHeaders[i])
-			}
+			case "cache_key_queries":
+				queries := strings.Split(value, ",")
+				for d.NextArg() {
+					queries = append(queries, strings.Split(d.Val(), ",")...)
+				}
+				for i := range queries {
+					queries[i] = strings.TrimSpace(queries[i])
+				}
+				s.CacheKeyQueries = queries
 
-		case "cache_key_queries":
-			s.CacheKeyQueries = strings.Split(strings.TrimSpace(value), ",")
-			for i := range s.CacheKeyQueries {
-				s.CacheKeyQueries[i] = strings.TrimSpace(s.CacheKeyQueries[i])
-			}
+			case "cache_key_cookies":
+				cookies := strings.Split(value, ",")
+				for d.NextArg() {
+					cookies = append(cookies, strings.Split(d.Val(), ",")...)
+				}
+				for i := range cookies {
+					cookies[i] = strings.TrimSpace(cookies[i])
+				}
+				s.CacheKeyCookies = cookies
 
-		case "cache_key_cookies":
-			s.CacheKeyCookies = strings.Split(strings.TrimSpace(value), ",")
-			for i := range s.CacheKeyCookies {
-				s.CacheKeyCookies[i] = strings.TrimSpace(s.CacheKeyCookies[i])
+			default:
+				return d.Errf("unknown subdirective: %s", key)
 			}
 		}
 	}
@@ -198,14 +249,15 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 // Constants for default values
 const (
+	DefaultCacheDir            = "/var/www/html/wp-content/cache"
 	DefaultMemoryItemMaxSize   = 4 * 1024 * 1024   // 4MB
 	DefaultMemoryCacheMaxSize  = 128 * 1024 * 1024 // 128MB
 	DefaultMemoryCacheMaxCount = 32 * 1024         // 32K items
-	DefaultBypassDebugQuery    = "WPEverywhere-NOCACHE"
+	DefaultBypassDebugQuery    = "sidekick-nocache"
 	DefaultPurgePath           = "/__sidekick/purge"
 	DefaultPurgeKeyHeader      = "X-Sidekick-Purge-Key"
-	DefaultCacheHeaderName     = "X-Sidekick-Cache"
-	DefaultBypassPathRegex     = ".*(\\.[^.]+)$" // bypass all media, images, css, js, etc
+	CacheHeaderName            = "X-Sidekick-Cache" // Not configurable
+	DefaultNoCacheRegex        = `\.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot|otf|mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe|doc|docx|xls|xlsx|ppt|pptx)$`
 	DefaultTTL                 = 6000
 	DefaultMaxCacheableSize    = 100 * 1024 * 1024 // 100MB
 	DefaultStreamToDiskSize    = 10 * 1024 * 1024  // 10MB
@@ -225,15 +277,16 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 		},
 	}
 
-	if s.Loc == "" {
-		s.Loc = os.Getenv("CACHE_LOC")
-		if s.Loc == "" {
-			s.Loc = "/var/www/html/wp-content/cache"
+	// Load from environment variables with SIDEKICK_ prefix
+	if s.CacheDir == "" {
+		s.CacheDir = os.Getenv("SIDEKICK_CACHE_DIR")
+		if s.CacheDir == "" {
+			s.CacheDir = DefaultCacheDir
 		}
 	}
 
 	if s.CacheResponseCodes == nil {
-		codes := os.Getenv("CACHE_RESPONSE_CODES")
+		codes := os.Getenv("SIDEKICK_CACHE_RESPONSE_CODES")
 		if codes == "" {
 			codes = "200,404,405"
 		}
@@ -249,96 +302,161 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 		}
 	}
 
-	if s.BypassPathPrefixes == nil {
-		prefixes := os.Getenv("BYPASS_PATH_PREFIX")
+	if s.NoCache == nil {
+		prefixes := os.Getenv("SIDEKICK_NOCACHE")
 		if prefixes == "" {
 			prefixes = "/wp-admin,/wp-json"
 		}
-		s.BypassPathPrefixes = strings.Split(strings.TrimSpace(prefixes), ",")
+		s.NoCache = strings.Split(strings.TrimSpace(prefixes), ",")
+		for i := range s.NoCache {
+			s.NoCache[i] = strings.TrimSpace(s.NoCache[i])
+		}
 	}
 
-	if s.BypassPathRegex == "" {
-		s.BypassPathRegex = DefaultBypassPathRegex
+	if s.NoCacheRegex == "" {
+		s.NoCacheRegex = os.Getenv("SIDEKICK_NOCACHE_REGEX")
+		if s.NoCacheRegex == "" {
+			s.NoCacheRegex = DefaultNoCacheRegex
+		}
 	}
-	if s.BypassPathRegex != "" {
-		rx, err := regexp.Compile(s.BypassPathRegex)
+	if s.NoCacheRegex != "" {
+		rx, err := regexp.Compile(s.NoCacheRegex)
 		if err != nil {
-			return err
+			return fmt.Errorf("invalid nocache_regex pattern: %v", err)
 		}
 		s.pathRx = rx
 	}
 
-	if !s.BypassHome {
-		if strings.ToLower(os.Getenv("BYPASS_HOME")) == "true" {
-			s.BypassHome = true
+	if !s.NoCacheHome {
+		if strings.ToLower(os.Getenv("SIDEKICK_NOCACHE_HOME")) == "true" {
+			s.NoCacheHome = true
 		}
 	}
 
-	if s.BypassDebugQuery == "" {
-		s.BypassDebugQuery = os.Getenv("BYPASS_DEBUG_QUERY")
-		if s.BypassDebugQuery == "" {
-			s.BypassDebugQuery = DefaultBypassDebugQuery
-		}
-	}
+	// Internal bypass debug query
+	s.bypassDebugQuery = DefaultBypassDebugQuery
 
-	if s.TTL == 0 {
-		ttl, err := strconv.Atoi(os.Getenv("TTL"))
-		if err == nil && ttl > 0 {
-			s.TTL = ttl
-		} else {
-			s.TTL = DefaultTTL
+	if s.CacheTTL == 0 {
+		ttl := os.Getenv("SIDEKICK_CACHE_TTL")
+		if ttl != "" {
+			if n, err := strconv.Atoi(ttl); err == nil && n > 0 {
+				s.CacheTTL = n
+			}
+		}
+		if s.CacheTTL == 0 {
+			s.CacheTTL = DefaultTTL
 		}
 	}
 
 	if s.PurgePath == "" {
-		s.PurgePath = os.Getenv("PURGE_PATH")
+		s.PurgePath = os.Getenv("SIDEKICK_PURGE_PATH")
 		if s.PurgePath == "" {
 			s.PurgePath = DefaultPurgePath
 		}
 	}
 
 	if s.PurgeKey == "" {
-		s.PurgeKey = os.Getenv("PURGE_KEY")
+		s.PurgeKey = os.Getenv("SIDEKICK_PURGE_KEY")
 	}
 
-	if s.PurgeKeyHeader == "" {
-		s.PurgeKeyHeader = os.Getenv("PURGE_KEY_HEADER")
-		if s.PurgeKeyHeader == "" {
-			s.PurgeKeyHeader = DefaultPurgeKeyHeader
+	// Parse size configurations from environment if not set
+	if s.CacheMemoryItemMaxSize == 0 {
+		if envVal := os.Getenv("SIDEKICK_CACHE_MEMORY_ITEM_MAX_SIZE"); envVal != "" {
+			if size, err := parseSize(envVal); err == nil {
+				s.CacheMemoryItemMaxSize = size
+			}
+		}
+		if s.CacheMemoryItemMaxSize == 0 {
+			s.CacheMemoryItemMaxSize = DefaultMemoryItemMaxSize
 		}
 	}
 
-	if s.CacheHeaderName == "" {
-		s.CacheHeaderName = os.Getenv("CACHE_HEADER_NAME")
-		if s.CacheHeaderName == "" {
-			s.CacheHeaderName = DefaultCacheHeaderName
+	if s.CacheMemoryMaxSize == 0 {
+		if envVal := os.Getenv("SIDEKICK_CACHE_MEMORY_MAX_SIZE"); envVal != "" {
+			if size, err := parseSize(envVal); err == nil {
+				s.CacheMemoryMaxSize = size
+			}
+		}
+		if s.CacheMemoryMaxSize == 0 {
+			s.CacheMemoryMaxSize = DefaultMemoryCacheMaxSize
 		}
 	}
 
-	if s.MemoryItemMaxSize == 0 {
-		s.MemoryItemMaxSize = DefaultMemoryItemMaxSize
-	}
-	if s.MemoryItemMaxSize < 0 {
-		s.MemoryItemMaxSize = math.MaxInt
-	}
-
-	if s.MemoryCacheMaxSize == 0 {
-		s.MemoryCacheMaxSize = DefaultMemoryCacheMaxSize
-	}
-
-	if s.MemoryCacheMaxCount == 0 {
-		s.MemoryCacheMaxCount = DefaultMemoryCacheMaxCount
+	if s.CacheMemoryMaxCount == 0 {
+		if envVal := os.Getenv("SIDEKICK_CACHE_MEMORY_MAX_COUNT"); envVal != "" {
+			if n, err := strconv.Atoi(envVal); err == nil {
+				s.CacheMemoryMaxCount = n
+			}
+		}
+		if s.CacheMemoryMaxCount == 0 {
+			s.CacheMemoryMaxCount = DefaultMemoryCacheMaxCount
+		}
 	}
 
-	if s.MaxCacheableSize == 0 {
-		s.MaxCacheableSize = DefaultMaxCacheableSize
+	if s.CacheItemMaxSize == 0 {
+		if envVal := os.Getenv("SIDEKICK_CACHE_ITEM_MAX_SIZE"); envVal != "" {
+			if size, err := parseSize(envVal); err == nil {
+				s.CacheItemMaxSize = size
+			}
+		}
+		if s.CacheItemMaxSize == 0 {
+			s.CacheItemMaxSize = DefaultMaxCacheableSize
+		}
 	}
 
-	if s.StreamToDiskSize == 0 {
-		s.StreamToDiskSize = DefaultStreamToDiskSize
+	if s.CacheStreamToDiskSize == 0 {
+		if envVal := os.Getenv("SIDEKICK_CACHE_STREAM_TO_DISK_SIZE"); envVal != "" {
+			if size, err := parseSize(envVal); err == nil {
+				s.CacheStreamToDiskSize = size
+			}
+		}
+		if s.CacheStreamToDiskSize == 0 {
+			s.CacheStreamToDiskSize = DefaultStreamToDiskSize
+		}
 	}
 
-	s.Storage = NewStorage(s.Loc, s.TTL, s.MemoryCacheMaxSize, s.MemoryCacheMaxCount, s.logger)
+	// Load cache key configuration from environment
+	if len(s.CacheKeyHeaders) == 0 {
+		if envVal := os.Getenv("SIDEKICK_CACHE_KEY_HEADERS"); envVal != "" {
+			s.CacheKeyHeaders = strings.Split(envVal, ",")
+			for i := range s.CacheKeyHeaders {
+				s.CacheKeyHeaders[i] = strings.TrimSpace(s.CacheKeyHeaders[i])
+			}
+		}
+	}
+
+	if len(s.CacheKeyQueries) == 0 {
+		if envVal := os.Getenv("SIDEKICK_CACHE_KEY_QUERIES"); envVal != "" {
+			s.CacheKeyQueries = strings.Split(envVal, ",")
+			for i := range s.CacheKeyQueries {
+				s.CacheKeyQueries[i] = strings.TrimSpace(s.CacheKeyQueries[i])
+			}
+		}
+	}
+
+	if len(s.CacheKeyCookies) == 0 {
+		if envVal := os.Getenv("SIDEKICK_CACHE_KEY_COOKIES"); envVal != "" {
+			s.CacheKeyCookies = strings.Split(envVal, ",")
+			for i := range s.CacheKeyCookies {
+				s.CacheKeyCookies[i] = strings.TrimSpace(s.CacheKeyCookies[i])
+			}
+		}
+	}
+
+	// Convert size values for storage initialization
+	memMaxSize := int(s.CacheMemoryMaxSize)
+	if s.CacheMemoryMaxSize < 0 {
+		memMaxSize = -1 // Unlimited
+	} else if s.CacheMemoryMaxSize == 0 {
+		memMaxSize = 0 // Disabled
+	}
+
+	memMaxCount := s.CacheMemoryMaxCount
+	if memMaxCount < 0 {
+		memMaxCount = -1 // Unlimited
+	}
+
+	s.Storage = NewStorage(s.CacheDir, s.CacheTTL, memMaxSize, memMaxCount, s.logger)
 
 	return nil
 }
@@ -375,7 +493,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 
 	hdr := w.Header()
 	if bypass {
-		hdr.Set(s.CacheHeaderName, "BYPASS")
+		hdr.Set(CacheHeaderName, "BYPASS")
 		return next.ServeHTTP(w, r)
 	}
 
@@ -415,7 +533,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		}
 
 		// Serve from cache
-		hdr.Set(s.CacheHeaderName, "HIT")
+		hdr.Set(CacheHeaderName, "HIT")
 		hdr.Set("Vary", "Accept-Encoding")
 		if ce != "none" {
 			hdr.Set("Content-Encoding", ce)
@@ -470,7 +588,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 
 func (s *Sidekick) handlePurgeRequest(w http.ResponseWriter, r *http.Request, storage *Storage) error {
 	reqHdr := r.Header
-	key := reqHdr.Get(s.PurgeKeyHeader)
+	key := reqHdr.Get(DefaultPurgeKeyHeader)
 
 	// Validate purge key
 	if s.PurgeKey != "" && key != s.PurgeKey {
@@ -520,12 +638,12 @@ func (s *Sidekick) handlePurgeRequest(w http.ResponseWriter, r *http.Request, st
 
 func (s *Sidekick) shouldBypass(r *http.Request) bool {
 	// Check debug query parameter
-	if s.BypassDebugQuery != "" && r.URL.Query().Has(s.BypassDebugQuery) {
+	if s.bypassDebugQuery != "" && r.URL.Query().Has(s.bypassDebugQuery) {
 		return true
 	}
 
 	// Check path prefixes
-	for _, prefix := range s.BypassPathPrefixes {
+	for _, prefix := range s.NoCache {
 		if prefix != "" && strings.HasPrefix(r.URL.Path, prefix) {
 			s.logger.Debug("sidekick - bypass prefix", zap.String("prefix", prefix))
 			return true
@@ -534,12 +652,12 @@ func (s *Sidekick) shouldBypass(r *http.Request) bool {
 
 	// Check regex pattern
 	if s.pathRx != nil && s.pathRx.MatchString(r.URL.Path) {
-		s.logger.Debug("sidekick - bypass regex", zap.String("regex", s.BypassPathRegex))
+		s.logger.Debug("sidekick - bypass regex", zap.String("regex", s.NoCacheRegex))
 		return true
 	}
 
 	// Check home page
-	if s.BypassHome && r.URL.Path == "/" {
+	if s.NoCacheHome && r.URL.Path == "/" {
 		return true
 	}
 

@@ -5,6 +5,7 @@ go 1.24
 require (
 	github.com/andybalholm/brotli v1.0.6
 	github.com/caddyserver/caddy/v2 v2.10.0
+	github.com/dustin/go-humanize v1.0.1
 	github.com/klauspost/compress v1.18.0
 	go.uber.org/zap v1.27.0
 )

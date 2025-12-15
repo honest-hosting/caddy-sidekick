@@ -28,11 +28,11 @@ func NewResponseWriter(rw http.ResponseWriter, r *http.Request, storage *Storage
 		// keep original request info
 		origUrl: *r.URL,
 
-		cacheMaxSize:       s.MemoryItemMaxSize,
-		maxCacheableSize:   s.MaxCacheableSize,
-		streamToDiskSize:   s.StreamToDiskSize,
+		cacheMaxSize:       int(s.CacheMemoryItemMaxSize),
+		maxCacheableSize:   int(s.CacheItemMaxSize),
+		streamToDiskSize:   int(s.CacheStreamToDiskSize),
 		cacheResponseCodes: s.CacheResponseCodes,
-		cacheHeaderName:    s.CacheHeaderName,
+		cacheHeaderName:    CacheHeaderName,
 		status:             -1,
 		once:               once,
 		cacheKey:           cacheKey,
@@ -200,7 +200,8 @@ func (r *ResponseWriter) WriteHeader(status int) {
 	// Check Content-Length if available
 	if contentLength := hdr.Get("Content-Length"); contentLength != "" {
 		if size, err := strconv.ParseInt(contentLength, 10, 64); err == nil {
-			if r.maxCacheableSize > 0 && size > int64(r.maxCacheableSize) {
+			// Check if caching is disabled (0) or if size exceeds limit
+			if r.maxCacheableSize == 0 || (r.maxCacheableSize > 0 && size > int64(r.maxCacheableSize)) {
 				bypass = true
 				r.Debug("Bypass caching due to Content-Length", zap.Int64("size", size), zap.Int("limit", r.maxCacheableSize))
 			}
@@ -238,9 +239,9 @@ func (r *ResponseWriter) Write(b []byte) (int, error) {
 
 		newSize := r.totalSize + int64(len(b))
 
-		// Check if we exceed max cacheable size
-		if r.maxCacheableSize > 0 && newSize > int64(r.maxCacheableSize) {
-			// Too large to cache
+		// Check if we exceed max cacheable size (0 = disabled, -1 = unlimited)
+		if r.maxCacheableSize == 0 || (r.maxCacheableSize > 0 && newSize > int64(r.maxCacheableSize)) {
+			// Too large to cache or caching disabled
 			atomic.StoreInt32(&r.needCache, 0)
 			if r.tempFile != nil {
 				if err := r.tempFile.Close(); err != nil {
@@ -257,7 +258,7 @@ func (r *ResponseWriter) Write(b []byte) (int, error) {
 			return n, err
 		}
 
-		// Check if we should switch to streaming to disk
+		// Check if we should switch to streaming to disk (0 = disabled, -1 = unlimited/never stream)
 		if !r.isStreaming && r.streamToDiskSize > 0 && newSize > int64(r.streamToDiskSize) {
 			// Switch to streaming to disk
 			if err := r.switchToStreaming(); err != nil {
