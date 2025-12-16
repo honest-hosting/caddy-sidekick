@@ -864,7 +864,7 @@ func (s *Sidekick) handlePurgeRequest(w http.ResponseWriter, r *http.Request, st
 				return nil
 			}
 		} else {
-			storage.Purge(pathToPurge)
+			_ = storage.Purge(pathToPurge)
 			s.syncHandler.cacheMu.Unlock()
 		}
 
