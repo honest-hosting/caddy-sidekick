@@ -240,6 +240,9 @@ func (dc *DiskCache) evictForCount() {
 func (dc *DiskCache) LoadIndex() error {
 	startTime := time.Now()
 
+	// Clean the base path for consistent comparison
+	cleanBasePath := filepath.Clean(dc.basePath)
+
 	// Use goroutines for parallel loading
 	entriesChan := make(chan *DiskCacheItem, 100)
 	var wg sync.WaitGroup
@@ -263,17 +266,28 @@ func (dc *DiskCache) LoadIndex() error {
 
 	// Scan directories
 	go func() {
-		_ = filepath.Walk(dc.basePath, func(dirPath string, info os.FileInfo, err error) error {
-			if err != nil || !info.IsDir() || dirPath == dc.basePath {
+		dirCount := 0
+		err := filepath.Walk(cleanBasePath, func(dirPath string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+
+			if !info.IsDir() || dirPath == cleanBasePath {
 				return nil
 			}
 
 			// Check if this is a cache directory (direct child of base path)
-			if filepath.Dir(dirPath) == dc.basePath {
+			parent := filepath.Dir(dirPath)
+			if parent == cleanBasePath {
+				dirCount++
 				dirChan <- dirPath
 			}
 			return filepath.SkipDir // Don't recurse into subdirectories
 		})
+
+		if err != nil && dc.logger != nil {
+			dc.logger.Error("LoadIndex walk error", zap.Error(err))
+		}
 		close(dirChan)
 	}()
 

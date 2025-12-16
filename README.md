@@ -39,8 +39,9 @@ All environment variables use the `SIDEKICK_` prefix for namespace isolation:
 | `SIDEKICK_NOCACHE_HOME` | Skip caching home page | `false` |
 | `SIDEKICK_NOCACHE_REGEX` | Regex pattern for paths to bypass | `\.(jpg\|jpeg\|png\|gif\|ico\|css\|js\|svg\|woff\|woff2\|ttf\|eot\|otf\|mp4\|webm\|mp3\|ogg\|wav\|pdf\|zip\|tar\|gz\|7z\|exe\|doc\|docx\|xls\|xlsx\|ppt\|pptx)$` |
 | `SIDEKICK_CACHE_TTL` | Cache time-to-live in seconds | `6000` |
-| `SIDEKICK_PURGE_KEY` | Secret key for purge authentication | _(none)_ |
-| `SIDEKICK_PURGE_PATH` | API endpoint for cache purging | `/__sidekick/purge` |
+| `SIDEKICK_PURGE_HEADER` | HTTP header name for purge token | `X-Sidekick-Purge` |
+| `SIDEKICK_PURGE_URI` | API endpoint for cache purging (absolute path, only a-z0-9-_/ allowed) | `/__sidekick/purge` |
+| `SIDEKICK_PURGE_TOKEN` | Secret token for purge authentication (required when cache is enabled) | `dead-beef` |
 | `SIDEKICK_CACHE_MEMORY_ITEM_MAX_SIZE` | Max size for single item in memory (e.g., `4MB`, `0` = disabled, `-1` = unlimited) | `4MB` |
 | `SIDEKICK_CACHE_MEMORY_MAX_SIZE` | Total memory cache size limit (e.g., `128MB`, `0` = disabled, `-1` = unlimited) | `128MB` |
 | `SIDEKICK_CACHE_MEMORY_MAX_PERCENT` | Memory cache as % of RAM (1-100, `0` = disabled, `-1` = unlimited). Mutually exclusive with `SIDEKICK_CACHE_MEMORY_MAX_SIZE` | _(none)_ |
@@ -53,6 +54,8 @@ All environment variables use the `SIDEKICK_` prefix for namespace isolation:
 | `SIDEKICK_CACHE_KEY_HEADERS` | Headers to include in cache key (comma-separated) | _(none)_ |
 | `SIDEKICK_CACHE_KEY_QUERIES` | Query parameters to include in cache key (comma-separated, use `*` for all) | _(none)_ |
 | `SIDEKICK_CACHE_KEY_COOKIES` | Cookies to include in cache key (comma-separated) | _(none)_ |
+
+**Note:** When either memory or disk cache is enabled, all purge-related options (`SIDEKICK_PURGE_HEADER`, `SIDEKICK_PURGE_URI`, `SIDEKICK_PURGE_TOKEN`) are required to be set.
 
 ### Caddyfile Example
 
@@ -89,9 +92,10 @@ example.com {
         # Default includes common static assets
         # nocache_regex "\.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot|otf)$"
         
-        # Purge endpoint configuration
-        purge_path /__sidekick/purge
-        purge_key "your-secret-purge-key-here"  # Update for your deployment
+        # Purge endpoint configuration (required when cache is enabled)
+        purge_uri /__sidekick/purge              # Must be absolute path with only a-z0-9-_/
+        purge_header X-Sidekick-Purge            # HTTP header name for token
+        purge_token "your-secret-token-here"     # Update for production deployment
         
         # Memory cache limits
         cache_memory_item_max_size 4MB      # Max size for single item in memory
@@ -161,8 +165,9 @@ For those preferring JSON configuration:
                           "nocache": ["/wp-admin", "/wp-json", "/wp-login.php"],
                           "nocache_home": false,
                           "nocache_regex": "\\.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot|otf)$",
-                          "purge_path": "/__sidekick/purge",
-                          "purge_key": "your-secret-purge-key-here",
+                          "purge_uri": "/__sidekick/purge",
+                          "purge_header": "X-Sidekick-Purge",
+                          "purge_token": "your-secret-token-here",
                           "cache_memory_item_max_size": 4194304,
                           "cache_memory_max_size": 134217728,
                           "cache_memory_max_percent": 0,
@@ -216,7 +221,9 @@ Minimal configuration for a standard WordPress site:
 example.com {
     sidekick {
         cache_dir /var/cache/sidekick
-        purge_key "secret123"  # TODO: Update with secure key
+        purge_uri /__sidekick/purge
+        purge_header X-Sidekick-Purge
+        purge_token "secret123"  # TODO: Update with secure token
     }
     
     root * /var/www/html
@@ -252,7 +259,9 @@ example.com {
         cache_key_cookies wordpress_logged_in_* woocommerce_*
         
         # Security
-        purge_key "complex-secure-key-here"  # TODO: Update
+        purge_uri /__sidekick/purge
+        purge_header X-Sidekick-Purge
+        purge_token "complex-secure-token-here"  # TODO: Update
     }
     
     # ... rest of config
@@ -275,7 +284,9 @@ example.com {
         # Don't cache language switcher
         nocache /wp-admin /wp-json /?lang= /language-switcher
         
-        purge_key "secure-key"  # TODO: Update
+        purge_uri /__sidekick/purge
+        purge_header X-Sidekick-Purge
+        purge_token "secure-token"  # TODO: Update
     }
     
     # ... rest of config
@@ -286,22 +297,28 @@ example.com {
 
 ### Purging Cache
 
-#### Purge all cache:
+The purge API only accepts POST requests with an optional JSON body specifying paths to purge.
+
+#### Purge all cache (empty body or no body):
 ```bash
 curl -X POST https://example.com/__sidekick/purge \
-  -H "X-Sidekick-Purge-Key: your-secret-purge-key"
+  -H "X-Sidekick-Purge: your-secret-token"
 ```
 
-#### Purge specific path:
+#### Purge specific paths (JSON body):
 ```bash
-curl -X POST https://example.com/__sidekick/purge/blog/post-slug \
-  -H "X-Sidekick-Purge-Key: your-secret-purge-key"
+curl -X POST https://example.com/__sidekick/purge \
+  -H "X-Sidekick-Purge: your-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{"paths": ["/blog/post-1", "/blog/post-2", "/products/*"]}'
 ```
 
-#### List cached items:
+#### Purge with wildcard patterns:
 ```bash
-curl https://example.com/__sidekick/purge \
-  -H "X-Sidekick-Purge-Key: your-secret-purge-key"
+curl -X POST https://example.com/__sidekick/purge \
+  -H "X-Sidekick-Purge: your-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{"paths": ["/blog/*", "/products/category-*", "/api/v1/*"]}'
 ```
 
 ### WordPress Integration
@@ -318,10 +335,12 @@ add_action('save_post', function($post_id) {
     $permalink = get_permalink($post_id);
     $path = parse_url($permalink, PHP_URL_PATH);
     
-    wp_remote_post(home_url('/__sidekick/purge' . $path), [
+    wp_remote_post(home_url('/__sidekick/purge'), [
         'headers' => [
-            'X-Sidekick-Purge-Key' => 'your-secret-purge-key'
-        ]
+            'X-Sidekick-Purge' => 'your-secret-token',
+            'Content-Type' => 'application/json'
+        ],
+        'body' => json_encode(['paths' => [$path]])
     ]);
 });
 
@@ -329,8 +348,9 @@ add_action('save_post', function($post_id) {
 add_action('switch_theme', function() {
     wp_remote_post(home_url('/__sidekick/purge'), [
         'headers' => [
-            'X-Sidekick-Purge-Key' => 'your-secret-purge-key'
-        ]
+            'X-Sidekick-Purge' => 'your-secret-token'
+        ],
+        'body' => '' // Empty body purges all
     ]);
 });
 ```

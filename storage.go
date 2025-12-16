@@ -57,9 +57,6 @@ type MemoryCacheItem struct {
 	value bytes.Buffer
 }
 
-// CACHE_DIR is the subdirectory name for cache storage
-const CACHE_DIR = "cache"
-
 // NewStorage creates a new Storage instance
 func NewStorage(loc string, ttl int, memMaxSize int, memMaxCount int, diskItemMaxSize int, diskMaxSize int, diskMaxCount int, logger *zap.Logger) *Storage {
 	s := &Storage{
@@ -79,15 +76,14 @@ func NewStorage(loc string, ttl int, memMaxSize int, memMaxCount int, diskItemMa
 	s.memCache.Store(memCache)
 
 	// Create cache directory if it doesn't exist
-	cacheDir := path.Join(loc, CACHE_DIR)
-	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+	if err := os.MkdirAll(loc, 0755); err != nil {
 		if logger != nil {
-			logger.Error("Failed to create cache directory", zap.String("path", cacheDir), zap.Error(err))
+			logger.Error("Failed to create cache directory", zap.String("path", loc), zap.Error(err))
 		}
 	}
 
 	// Initialize disk cache
-	diskCache := NewDiskCache(cacheDir, diskMaxCount, int64(diskMaxSize), int64(diskItemMaxSize), logger)
+	diskCache := NewDiskCache(loc, diskMaxCount, int64(diskMaxSize), int64(diskItemMaxSize), logger)
 	s.diskCache.Store(diskCache)
 
 	// Load disk cache index asynchronously
@@ -249,7 +245,7 @@ func (s *Storage) SetWithKey(key string, metadata *Metadata, data []byte) error 
 	// Store on disk
 	diskCache := s.getDiskCache()
 	if diskCache != nil {
-		cacheDir := path.Join(s.loc, CACHE_DIR, key)
+		cacheDir := path.Join(s.loc, key)
 		dataFilePath := path.Join(cacheDir, "data")
 
 		// Store the data
@@ -355,18 +351,17 @@ func (s *Storage) Flush() error {
 	s.memCache.Store(memCache)
 
 	// Clear disk cache
-	cacheDir := path.Join(s.loc, CACHE_DIR)
 	s.fileMu.Lock()
-	err := os.RemoveAll(cacheDir)
+	err := os.RemoveAll(s.loc)
 	if err == nil {
 		// Recreate the cache directory
-		err = os.MkdirAll(cacheDir, 0755)
+		err = os.MkdirAll(s.loc, 0755)
 	}
 	s.fileMu.Unlock()
 
 	// Reinitialize disk cache
 	if err == nil {
-		diskCache := NewDiskCache(cacheDir, s.diskMaxCount, int64(s.diskMaxSize), int64(s.diskItemMaxSize), s.logger)
+		diskCache := NewDiskCache(s.loc, s.diskMaxCount, int64(s.diskMaxSize), int64(s.diskItemMaxSize), s.logger)
 		s.diskCache.Store(diskCache)
 	}
 
