@@ -208,3 +208,22 @@ func (c *MemoryCache[K, V]) Range(f func(key K, value V) bool) {
 		}
 	}
 }
+
+// GetLRUKeys returns a slice of keys in LRU order (oldest first)
+// This is useful for eviction strategies
+func (c *MemoryCache[K, V]) GetLRUKeys(limit int) []K {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	keys := make([]K, 0, limit)
+	count := 0
+
+	// Iterate from back (oldest) to front (newest)
+	for elem := c.ll.Back(); elem != nil && count < limit; elem = elem.Prev() {
+		valEntry := elem.Value.(*entry[K, V])
+		keys = append(keys, valEntry.key)
+		count++
+	}
+
+	return keys
+}

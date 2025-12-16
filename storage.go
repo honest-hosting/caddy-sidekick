@@ -35,27 +35,19 @@ type Storage struct {
 
 	memMaxSize  int
 	memMaxCount int
-	memCache    atomic.Value // *MemoryCache[string, *MemoryCacheItem]
+	memCache    atomic.Value // *MemoryCache
 
-	// Disk cache limits
+	// Disk cache
 	diskItemMaxSize int
 	diskMaxSize     int
 	diskMaxCount    int
-	diskUsage       int64 // Current disk usage in bytes
-	diskItemCount   int64 // Current number of items on disk
-
-	// Disk cache index for fast eviction
-	diskIndex   map[string]*DiskCacheEntry
-	diskIndexMu sync.RWMutex
-	diskLRU     []*DiskCacheEntry // Sorted by access time for LRU eviction
+	diskCache       atomic.Value // *DiskCache
 
 	// Mutex for file operations
 	fileMu sync.RWMutex
 	// Per-key mutexes for granular locking
 	keyMutexes   map[string]*sync.RWMutex
 	keyMutexesMu sync.Mutex
-	// Mutex for disk usage tracking
-	diskUsageMu sync.RWMutex
 	// WaitGroup for tracking async operations
 	asyncOps sync.WaitGroup
 }
@@ -80,8 +72,6 @@ func NewStorage(loc string, ttl int, memMaxSize int, memMaxCount int, diskItemMa
 		diskMaxSize:     diskMaxSize,
 		diskMaxCount:    diskMaxCount,
 		keyMutexes:      make(map[string]*sync.RWMutex),
-		diskIndex:       make(map[string]*DiskCacheEntry),
-		diskLRU:         make([]*DiskCacheEntry, 0),
 	}
 
 	// Initialize memory cache
@@ -96,21 +86,16 @@ func NewStorage(loc string, ttl int, memMaxSize int, memMaxCount int, diskItemMa
 		}
 	}
 
+	// Initialize disk cache
+	diskCache := NewDiskCache(cacheDir, diskMaxCount, int64(diskMaxSize), int64(diskItemMaxSize), logger)
+	s.diskCache.Store(diskCache)
+
 	// Load disk cache index asynchronously
 	s.asyncOps.Add(1)
 	go func() {
 		defer s.asyncOps.Done()
-		startTime := time.Now()
-		s.loadDiskCacheIndex()
-		if logger != nil {
-			s.diskUsageMu.RLock()
-			items := s.diskItemCount
-			usage := s.diskUsage
-			s.diskUsageMu.RUnlock()
-			logger.Info("Disk cache index loaded",
-				zap.Duration("load_time", time.Since(startTime)),
-				zap.Int64("items", items),
-				zap.String("usage", s.humanizeSize(usage)))
+		if dc := s.getDiskCache(); dc != nil {
+			_ = dc.LoadIndex()
 		}
 	}()
 
@@ -123,6 +108,14 @@ func (s *Storage) getMemCache() *MemoryCache[string, *MemoryCacheItem] {
 		return nil
 	}
 	return cache.(*MemoryCache[string, *MemoryCacheItem])
+}
+
+func (s *Storage) getDiskCache() *DiskCache {
+	cache := s.diskCache.Load()
+	if cache == nil {
+		return nil
+	}
+	return cache.(*DiskCache)
 }
 
 // getKeyMutex returns a mutex for a specific key to ensure per-key locking
@@ -179,25 +172,31 @@ func (s *Storage) Get(key string, ce string) ([]byte, *Metadata, error) {
 	}
 
 	// Check disk cache
-	cacheDir := path.Join(s.loc, CACHE_DIR, key)
-	if info, err := os.Stat(cacheDir); err == nil && info.IsDir() {
-		data, md, err := s.readDiskCache(key, cacheDir)
-		if err == nil {
-			if s.logger != nil {
-				s.logger.Debug("Cache hit (disk)",
-					zap.String("key", key),
-					zap.Int("data_size", len(data)))
+	diskCache := s.getDiskCache()
+	if diskCache != nil {
+		item, err := diskCache.Get(key)
+		if err == nil && item != nil {
+			// Read the actual data from disk
+			data, md, err := s.readDiskCacheData(key, item.Path)
+			if err == nil {
+				if s.logger != nil {
+					s.logger.Debug("Cache hit (disk)",
+						zap.String("key", key),
+						zap.Int("data_size", len(data)))
+				}
+				return data, md, nil
 			}
-			return data, md, nil
-		}
-		if err == ErrCacheExpired {
-			return nil, nil, err
-		}
-		// Log other errors but continue
-		if s.logger != nil {
-			s.logger.Warn("Failed to read from disk cache",
-				zap.String("key", key),
-				zap.Error(err))
+			if err == ErrCacheExpired {
+				// Clean up expired entry
+				_ = diskCache.Delete(key)
+				return nil, nil, err
+			}
+			// Log other errors but continue
+			if s.logger != nil {
+				s.logger.Warn("Failed to read from disk cache",
+					zap.String("key", key),
+					zap.Error(err))
+			}
 		}
 	}
 
@@ -248,52 +247,51 @@ func (s *Storage) SetWithKey(key string, metadata *Metadata, data []byte) error 
 	}
 
 	// Store on disk
-	cacheDir := path.Join(s.loc, CACHE_DIR, key)
-	dataFilePath := path.Join(cacheDir, "data")
+	diskCache := s.getDiskCache()
+	if diskCache != nil {
+		cacheDir := path.Join(s.loc, CACHE_DIR, key)
+		dataFilePath := path.Join(cacheDir, "data")
 
-	// Check if we need to evict items to make space
-	s.diskUsageMu.RLock()
-	currentUsage := s.diskUsage
-	currentCount := s.diskItemCount
-	s.diskUsageMu.RUnlock()
+		// Store the data
+		if err := s.storeDataToDisk(cacheDir, dataFilePath, data, metadata); err != nil {
+			if s.logger != nil {
+				s.logger.Error("Failed to store data on disk",
+					zap.String("key", key),
+					zap.Error(err))
+			}
+			return err
+		}
 
-	// Calculate the size we need (estimate with some overhead for metadata)
-	estimatedSize := int64(dataSize + 1024) // Add 1KB for metadata
+		// Calculate actual size on disk
+		var actualSize int64
+		filepath.Walk(cacheDir, func(path string, info os.FileInfo, err error) error { //nolint:errcheck
+			if err == nil && !info.IsDir() {
+				actualSize += info.Size()
+			}
+			return nil
+		})
 
-	// Check if we need to evict for size
-	if s.diskMaxSize > 0 && currentUsage+estimatedSize > int64(s.diskMaxSize) {
-		s.evictOldestFromDisk(estimatedSize, "size")
-	}
+		// Create disk cache item
+		item := &DiskCacheItem{
+			Metadata:   metadata,
+			Path:       cacheDir,
+			Size:       actualSize,
+			AccessTime: time.Now(),
+			ModTime:    time.Now(),
+		}
 
-	// Check if we need to evict for count
-	if s.diskMaxCount > 0 && currentCount >= int64(s.diskMaxCount) {
-		s.evictOldestFromDisk(0, "count")
-	}
+		// Add to disk cache
+		if err := diskCache.Put(key, item); err != nil {
+			// If we can't add to cache index, remove the files
+			_ = os.RemoveAll(cacheDir)
+			return err
+		}
 
-	// Store the data
-	if err := s.storeData(cacheDir, dataFilePath, data, metadata); err != nil {
 		if s.logger != nil {
-			s.logger.Error("Failed to store data on disk",
+			s.logger.Debug("Stored on disk",
 				zap.String("key", key),
-				zap.Error(err))
+				zap.String("size", diskCache.humanizeSize(actualSize)))
 		}
-		return err
-	}
-
-	// Update disk index
-	var actualSize int64
-	filepath.Walk(cacheDir, func(path string, info os.FileInfo, err error) error { //nolint:errcheck
-		if err == nil && !info.IsDir() {
-			actualSize += info.Size()
-		}
-		return nil
-	})
-	s.updateDiskIndex(key, actualSize, true)
-
-	if s.logger != nil {
-		s.logger.Debug("Stored on disk",
-			zap.String("key", key),
-			zap.String("size", s.humanizeSize(actualSize)))
 	}
 
 	return nil
@@ -330,23 +328,18 @@ func (s *Storage) Purge(key string) error {
 		memCache.Delete(key)
 	}
 
-	// Remove from disk
-	cacheDir := path.Join(s.loc, CACHE_DIR, key)
-	s.fileMu.Lock()
-	err := os.RemoveAll(cacheDir)
-	s.fileMu.Unlock()
-
-	if err != nil && !os.IsNotExist(err) {
-		if s.logger != nil {
-			s.logger.Error("Failed to purge cache",
-				zap.String("key", key),
-				zap.Error(err))
+	// Remove from disk cache
+	diskCache := s.getDiskCache()
+	if diskCache != nil {
+		if err := diskCache.Delete(key); err != nil && !os.IsNotExist(err) {
+			if s.logger != nil {
+				s.logger.Error("Failed to purge cache",
+					zap.String("key", key),
+					zap.Error(err))
+			}
+			return err
 		}
-		return err
 	}
-
-	// Update disk index
-	s.removeDiskEntry(key)
 
 	if s.logger != nil {
 		s.logger.Debug("Purged cache entry",
@@ -371,17 +364,11 @@ func (s *Storage) Flush() error {
 	}
 	s.fileMu.Unlock()
 
-	// Clear disk index
-	s.diskIndexMu.Lock()
-	s.diskIndex = make(map[string]*DiskCacheEntry)
-	s.diskLRU = make([]*DiskCacheEntry, 0)
-	s.diskIndexMu.Unlock()
-
-	// Reset usage stats
-	s.diskUsageMu.Lock()
-	s.diskUsage = 0
-	s.diskItemCount = 0
-	s.diskUsageMu.Unlock()
+	// Reinitialize disk cache
+	if err == nil {
+		diskCache := NewDiskCache(cacheDir, s.diskMaxCount, int64(s.diskMaxSize), int64(s.diskItemMaxSize), s.logger)
+		s.diskCache.Store(diskCache)
+	}
 
 	if s.logger != nil {
 		if err != nil {
@@ -408,12 +395,11 @@ func (s *Storage) List() map[string][]string {
 		})
 	}
 
-	// Get keys from disk cache using the index
-	s.diskIndexMu.RLock()
-	for key := range s.diskIndex {
-		diskKeys = append(diskKeys, key)
+	// Get keys from disk cache
+	diskCache := s.getDiskCache()
+	if diskCache != nil {
+		diskKeys = diskCache.List()
 	}
-	s.diskIndexMu.RUnlock()
 
 	result["mem"] = memKeys
 	result["disk"] = diskKeys
