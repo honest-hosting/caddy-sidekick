@@ -85,6 +85,7 @@ type Metadata struct {
 	StateCode int        `json:"c,omitempty"`
 	Header    [][]string `json:"h,omitempty"`
 	Timestamp int64      `json:"t,omitempty"`
+	Path      string     `json:"p,omitempty"` // Original request path
 
 	contentEncoding string
 }
@@ -108,6 +109,15 @@ func NewMetadata(stateCode int, hdr http.Header) *Metadata {
 		contentEncoding: ce,
 	}
 	meta.SetHeader(hdr)
+	return meta
+}
+
+// NewMetadataWithPath creates metadata with path information
+func NewMetadataWithPath(stateCode int, hdr http.Header, path string) *Metadata {
+	meta := NewMetadata(stateCode, hdr)
+	if meta != nil {
+		meta.Path = path
+	}
 	return meta
 }
 

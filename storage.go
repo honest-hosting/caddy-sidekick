@@ -90,7 +90,7 @@ func NewStorage(loc string, ttl int, memMaxSize int, memMaxCount int, diskItemMa
 	s.asyncOps.Add(1)
 	go func() {
 		defer s.asyncOps.Done()
-		if dc := s.getDiskCache(); dc != nil {
+		if dc := s.GetDiskCache(); dc != nil {
 			_ = dc.LoadIndex()
 		}
 	}()
@@ -98,7 +98,7 @@ func NewStorage(loc string, ttl int, memMaxSize int, memMaxCount int, diskItemMa
 	return s
 }
 
-func (s *Storage) getMemCache() *MemoryCache[string, *MemoryCacheItem] {
+func (s *Storage) GetMemCache() *MemoryCache[string, *MemoryCacheItem] {
 	cache := s.memCache.Load()
 	if cache == nil {
 		return nil
@@ -106,7 +106,7 @@ func (s *Storage) getMemCache() *MemoryCache[string, *MemoryCacheItem] {
 	return cache.(*MemoryCache[string, *MemoryCacheItem])
 }
 
-func (s *Storage) getDiskCache() *DiskCache {
+func (s *Storage) GetDiskCache() *DiskCache {
 	cache := s.diskCache.Load()
 	if cache == nil {
 		return nil
@@ -142,7 +142,7 @@ func (s *Storage) Get(key string, ce string) ([]byte, *Metadata, error) {
 	defer keyMu.RUnlock()
 
 	// Check memory cache first
-	memCache := s.getMemCache()
+	memCache := s.GetMemCache()
 	if memCache != nil {
 		if cacheItem, ok := memCache.Get(key); ok && cacheItem != nil && (*cacheItem).Metadata != nil {
 			// Check TTL
@@ -168,7 +168,7 @@ func (s *Storage) Get(key string, ce string) ([]byte, *Metadata, error) {
 	}
 
 	// Check disk cache
-	diskCache := s.getDiskCache()
+	diskCache := s.GetDiskCache()
 	if diskCache != nil {
 		item, err := diskCache.Get(key)
 		if err == nil && item != nil {
@@ -243,7 +243,7 @@ func (s *Storage) SetWithKey(key string, metadata *Metadata, data []byte) error 
 	}
 
 	// Store on disk
-	diskCache := s.getDiskCache()
+	diskCache := s.GetDiskCache()
 	if diskCache != nil {
 		cacheDir := path.Join(s.loc, key)
 		dataFilePath := path.Join(cacheDir, "data")
@@ -294,7 +294,7 @@ func (s *Storage) SetWithKey(key string, metadata *Metadata, data []byte) error 
 }
 
 func (s *Storage) storeInMemory(key string, data []byte, metadata *Metadata) error {
-	memCache := s.getMemCache()
+	memCache := s.GetMemCache()
 	if memCache == nil {
 		return fmt.Errorf("memory cache not initialized")
 	}
@@ -319,13 +319,13 @@ func (s *Storage) Purge(key string) error {
 	defer s.cleanupKeyMutex(key)
 
 	// Remove from memory cache
-	memCache := s.getMemCache()
+	memCache := s.GetMemCache()
 	if memCache != nil {
 		memCache.Delete(key)
 	}
 
 	// Remove from disk cache
-	diskCache := s.getDiskCache()
+	diskCache := s.GetDiskCache()
 	if diskCache != nil {
 		if err := diskCache.Delete(key); err != nil && !os.IsNotExist(err) {
 			if s.logger != nil {
@@ -352,9 +352,21 @@ func (s *Storage) Flush() error {
 
 	// Clear disk cache
 	s.fileMu.Lock()
-	err := os.RemoveAll(s.loc)
+	// Remove contents of cache directory, not the directory itself
+	dir, err := os.Open(s.loc)
 	if err == nil {
-		// Recreate the cache directory
+		defer dir.Close() //nolint:errcheck
+		entries, err := dir.Readdirnames(-1)
+		if err == nil {
+			for _, entry := range entries {
+				fullPath := filepath.Join(s.loc, entry)
+				if removeErr := os.RemoveAll(fullPath); removeErr != nil && err == nil {
+					err = removeErr
+				}
+			}
+		}
+	} else if os.IsNotExist(err) {
+		// If directory doesn't exist, create it
 		err = os.MkdirAll(s.loc, 0755)
 	}
 	s.fileMu.Unlock()
@@ -382,7 +394,7 @@ func (s *Storage) List() map[string][]string {
 	diskKeys := make([]string, 0)
 
 	// Get keys from memory cache
-	memCache := s.getMemCache()
+	memCache := s.GetMemCache()
 	if memCache != nil {
 		memCache.Range(func(key string, _ *MemoryCacheItem) bool {
 			memKeys = append(memKeys, key)
@@ -391,7 +403,7 @@ func (s *Storage) List() map[string][]string {
 	}
 
 	// Get keys from disk cache
-	diskCache := s.getDiskCache()
+	diskCache := s.GetDiskCache()
 	if diskCache != nil {
 		diskKeys = diskCache.List()
 	}

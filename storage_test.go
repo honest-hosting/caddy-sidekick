@@ -109,7 +109,7 @@ func TestStorageMemoryCacheEvictionByCount(t *testing.T) {
 	}
 
 	// Check that memory cache respects count limit
-	memCache := storage.getMemCache()
+	memCache := storage.GetMemCache()
 	if memCache == nil {
 		t.Fatal("Memory cache is nil")
 	}
@@ -157,7 +157,7 @@ func TestMemoryCacheEvictionBySize(t *testing.T) {
 	}
 
 	// Check memory cache cost is within limit
-	memCache := storage.getMemCache()
+	memCache := storage.GetMemCache()
 	if memCache == nil {
 		t.Fatal("Memory cache is nil")
 	}
@@ -349,7 +349,7 @@ func TestMemoryCacheCostAccounting(t *testing.T) {
 	logger := getTestLogger()
 	storage := NewStorage(testCacheDir, testTTL, largeDataSize, 100, 0, 0, 0, logger)
 
-	memCache := storage.getMemCache()
+	memCache := storage.GetMemCache()
 	if memCache == nil {
 		t.Fatal("Memory cache is nil")
 	}
@@ -488,7 +488,7 @@ func TestMemoryPressure(t *testing.T) {
 		_ = storage.SetWithKey(key, metadata, data)
 	}
 
-	memCache := storage.getMemCache()
+	memCache := storage.GetMemCache()
 	if memCache == nil {
 		t.Fatal("Memory cache is nil")
 	}

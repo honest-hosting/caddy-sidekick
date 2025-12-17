@@ -11,18 +11,17 @@ lint: ## Run linter against codebase
 	@golangci-lint -v run
 .PHONY: lint
 
-# CADDY_VERSION should match the equivalent go.mod entry
-build: export CADDY_VERSION       ?= v2.10.0
-build: export WITH_CADDY_SIDEKICK ?= github.com/honest-hosting/caddy-sidekick=.
-build: lint build-setup ## Run 'xcaddy' to build vault storage plugin in to caddy binary
-	@xcaddy build ${CADDY_VERSION} --output bin/caddy --with ${WITH_CADDY_SIDEKICK}
+# GO_VERSION should (generally) match go.mod version
+build: export GO_VERSION               ?= 1.24.3
+build: export XCADDY_VERSION           ?= 0.4.5
+build: export CADDY_VERSION            ?= 2.10.0
+build: export FRANKENPHP_CADDY_VERSION ?= 1.9.0
+build: lint ## Run 'docker composer build' to build caddy with plugin
+	@cd integration-test && docker compose build --build-arg GO_VERSION=$(GO_VERSION) --build-arg XCADDY_VERSION=$(XCADDY_VERSION) --build-arg CADDY_VERSION=$(CADDY_VERSION) --build-arg FRANKENPHP_CADDY_VERSION=$(FRANKENPHP_CADDY_VERSION)
+	@CID=$$(docker create caddy-sidekick-integration-test:latest);          \
+		docker cp $$CID:/usr/local/bin/caddy ./bin/caddy >/dev/null 2>&1;   \
+		docker rm $$CID >/dev/null
 .PHONY: build
-
-build-setup:
-	@if ! command -v xcaddy >/dev/null 2>&1; then                          \
-		echo "ERROR: Missing 'xcaddy' binary on \$PATH, cannot continue";  \
-	fi
-.PHONY: build-setup
 
 test: export TEST       ?= .*
 test: export TEST_DIR   ?= ./...
@@ -52,6 +51,22 @@ test-setup:
 	@go clean -testcache
 .PHONY: test-setup
 
+test-integration: export TEST     ?= TestIntegration
+test-integration: export TEST_DIR ?= ./integration-test/...
+test-integration: test-integration-setup ## Run integration tests with Docker Compose
+	@echo "Running integration tests..."
+	@go test -v -timeout=30s -run "$(TEST)" $(TEST_DIR) 2>&1 | tee /tmp/sidekick-integration.log
+	@echo "Integration test completed, see /tmp/sidekick-integration.log for details"
+.PHONY: test-integration
+
+test-integration-setup:
+	@cd integration-test && docker compose up -d --wait
+.PHONY: test-integration-setup
+
+test-integration-cleanup:
+	@cd integration-test && docker compose down || true
+.PHONY: test-integration-cleanup
+
 fmt: ## Run go-fmt against codebase
 	@go fmt ./...
 .PHONY: fmt
@@ -74,6 +89,7 @@ mod-update: ## Update go proxy with latest module version: MODULE=github.com/hon
 	fi
 .PHONY: mod-update
 
-clean: ## Clean up repo
+clean: test-integration-cleanup ## Clean up repo
+	@docker rmi -f caddy-sidekick-integration-test:latest 2>/dev/null || true
 	@rm -f bin/caddy 2>/dev/null || true
 .PHONY: clean

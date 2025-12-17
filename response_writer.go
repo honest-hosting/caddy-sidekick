@@ -114,7 +114,7 @@ func (r *ResponseWriter) Close() error {
 			defer r.cacheMu.Unlock()
 
 			hdr := r.ResponseWriter.Header()
-			meta := NewMetadata(int(atomic.LoadInt32(&r.status)), hdr)
+			meta := NewMetadataWithPath(int(atomic.LoadInt32(&r.status)), hdr, r.origUrl.Path)
 			if meta == nil {
 				return
 			}

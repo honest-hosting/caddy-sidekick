@@ -1,0 +1,37 @@
+services:
+  caddy-sidekick-test:
+    build:
+      context: ..
+      dockerfile: integration-test/Dockerfile
+    image: caddy-sidekick-integration-test:latest
+    container_name: sidekick-integration-test
+    ports:
+      - "8080:80"
+      - "8443:443"
+    volumes:
+      - ./cache:/var/www/cache
+      - ./html:/var/www/html:ro
+      - ./etc/Caddyfile:/etc/caddy/Caddyfile:ro
+    # environment:
+    #   - SIDEKICK_CACHE_DIR=/var/cache/sidekick
+    #   - SIDEKICK_CACHE_TTL=60
+    #   - SIDEKICK_PURGE_URI=/__sidekick/purge
+    #   - SIDEKICK_PURGE_HEADER=X-Sidekick-Purge
+    #   - SIDEKICK_PURGE_TOKEN=test-token-12345
+    #   - SIDEKICK_CACHE_MEMORY_MAX_SIZE=64MB
+    #   - SIDEKICK_CACHE_DISK_MAX_SIZE=256MB
+    #   - SIDEKICK_CACHE_RESPONSE_CODES=200,404,301,302
+    #   - SIDEKICK_NOCACHE=/wp-admin,/wp-json,/non-cacheable,/api/realtime
+    #   - SIDEKICK_NOCACHE_HOME=false
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health.php"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks:
+      - sidekick-test
+
+networks:
+  sidekick-test:
+    driver: bridge

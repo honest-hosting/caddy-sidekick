@@ -1,0 +1,128 @@
+{
+	#order sidekick before file_server
+	admin off
+	log {
+		level DEBUG
+	}
+	frankenphp
+
+	order php_server before file_server
+	order php before file_server
+	order sidekick before rewrite
+	order request_header before sidekick
+}
+
+:80 {
+	# Enable sidekick caching with test configuration
+	sidekick {
+		# Cache storage location
+		cache_dir /var/www/cache
+
+		# Cache TTL (60 seconds for testing)
+		cache_ttl 60
+
+		# HTTP status codes to cache
+		cache_response_codes 200 301 302
+
+		# Paths to bypass cache (WordPress-like paths for testing)
+		nocache /wp-admin /wp-json /non-cacheable /api/realtime /health.php
+
+		# Don't cache home page (set to false for testing)
+		nocache_home false
+
+		# Regex for file types to bypass (testing with images)
+		# We'll allow caching of test image paths for testing
+		nocache_regex "\\.(mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe)$"
+
+		# Purge endpoint configuration
+		purge_uri /__sidekick/purge
+		purge_header X-Sidekick-Purge
+		purge_token test-token-12345
+
+		# Memory cache limits (small for testing)
+		cache_memory_item_max_size 1MB
+		cache_memory_max_size 64MB
+		cache_memory_max_count 100
+		cache_memory_stream_to_disk_size 512KB
+
+		# Disk cache limits (small for testing)
+		cache_disk_item_max_size 10MB
+		cache_disk_max_size 256MB
+		cache_disk_max_count 1000
+
+		# Cache key customization for testing query parameters
+		cache_key_queries name page size
+		cache_key_headers Accept-Language X-Test-Header
+		cache_key_cookies test_session wordpress_logged_in_*
+	}
+
+	# Set up root directory
+	root * /var/www/html
+
+	# Use FrankenPHP to handle PHP files
+	#php {
+	#	root /var/www/html
+	#	index index.php
+	#}
+
+	###
+	#root * /var/www/html/
+	#encode br zstd gzip
+
+	php_server
+	###
+
+	# Serve static files
+	file_server
+
+	# Add response headers for debugging
+	header {
+		X-Test-Server "Caddy-Sidekick-Integration"
+		X-Test-Request-UUID "{http.request.uuid}"
+		X-Test-Request-Duration-MS "{http.request.duration_ms}"
+	}
+
+	# Log all requests for debugging
+	log {
+		output stdout
+		format console
+		level DEBUG
+	}
+
+	# Handle errors
+	handle_errors {
+		@404 expression {http.error.status_code} == 404
+		handle @404 {
+			header X-Sidekick-Cache "BYPASS"
+			header Content-Type "text/html; charset=utf-8"
+			respond "<!DOCTYPE html>
+<html>
+<head>
+    <title>404 Not Found</title>
+</head>
+<body>
+    <h1>404 - Not Found</h1>
+    <p>Path not found: {http.request.uri.path}</p>
+</body>
+</html>" 404
+		}
+
+		@500 expression {http.error.status_code} >= 500
+		handle @500 {
+			header X-Sidekick-Cache "BYPASS"
+			header Content-Type "text/html; charset=utf-8"
+			respond "<!DOCTYPE html>
+<html>
+<head>
+    <title>500 Internal Server Error</title>
+</head>
+<body>
+    <h1>500 - Internal Server Error</h1>
+    <p>Something went wrong</p>
+</body>
+</html>" 500
+		}
+
+		respond "{http.error.status_code} {http.error.status_text}"
+	}
+}

@@ -47,7 +47,7 @@ func TestDiskCacheStorage(t *testing.T) {
 	}
 
 	// Verify disk cache index
-	diskCache := storage.getDiskCache()
+	diskCache := storage.GetDiskCache()
 	if diskCache == nil {
 		t.Fatal("Disk cache not initialized")
 	}
@@ -80,7 +80,7 @@ func TestDiskCacheEvictionByCount(t *testing.T) {
 	storage.WaitForAsyncOps()
 
 	// Check that only maxCount items remain
-	diskCache := storage.getDiskCache()
+	diskCache := storage.GetDiskCache()
 	if diskCache == nil {
 		t.Fatal("Disk cache not initialized")
 	}
@@ -134,7 +134,7 @@ func TestDiskCacheEvictionBySize(t *testing.T) {
 
 	// Check disk usage is within limit with proper locking
 	// Check disk usage
-	diskCache := storage.getDiskCache()
+	diskCache := storage.GetDiskCache()
 	if diskCache == nil {
 		t.Fatal("Disk cache not initialized")
 	}
@@ -289,7 +289,7 @@ func TestDiskCacheStartupPerformance(t *testing.T) {
 	storage.WaitForAsyncOps()
 
 	// Read stats from disk cache
-	diskCache := storage.getDiskCache()
+	diskCache := storage.GetDiskCache()
 	if diskCache == nil {
 		t.Fatal("Disk cache not initialized")
 	}
@@ -308,7 +308,7 @@ func TestDiskCacheStartupPerformance(t *testing.T) {
 	storage2.WaitForAsyncOps()
 
 	// Check that index was loaded correctly
-	diskCache2 := storage2.getDiskCache()
+	diskCache2 := storage2.GetDiskCache()
 	if diskCache2 == nil {
 		t.Fatal("Disk cache not initialized")
 	}
@@ -369,7 +369,7 @@ func TestDiskSpacePressure(t *testing.T) {
 
 	// Disk usage should be within limit with proper locking
 	// Check disk usage
-	diskCache := storage.getDiskCache()
+	diskCache := storage.GetDiskCache()
 	if diskCache == nil {
 		t.Fatal("Disk cache not initialized")
 	}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -932,15 +933,26 @@ func (s *Sidekick) handlePurgeRequest(w http.ResponseWriter, r *http.Request, st
 			return nil
 		}
 	} else {
-		// Purge specific paths
+		// Purge specific paths by checking metadata
 		for _, path := range purgeRequest.Paths {
-			s.logger.Debug("sidekick - purge", zap.String("path", path))
+			s.logger.Debug("sidekick - purge specific path", zap.String("path", path))
+
+			// Get all cache keys
+			cacheList := storage.List()
+			allKeys := append(cacheList["mem"], cacheList["disk"]...)
+
+			s.logger.Debug("sidekick - total cache keys",
+				zap.Int("memory_keys", len(cacheList["mem"])),
+				zap.Int("disk_keys", len(cacheList["disk"])),
+				zap.Int("total_keys", len(allKeys)))
+
+			purgedCount := 0
+			keysToPurge := []string{}
 
 			// Handle wildcard patterns
+			var pathMatcher func(string) bool
 			if strings.Contains(path, "*") {
-				// Get all cache keys and match against pattern
-				cacheList := storage.List()
-				// Convert wildcard pattern to regex, escaping special regex chars first
+				// Convert wildcard pattern to regex
 				pattern := regexp.QuoteMeta(path)
 				pattern = strings.ReplaceAll(pattern, "\\*", ".*")
 				re, err := regexp.Compile("^" + pattern + "$")
@@ -948,19 +960,95 @@ func (s *Sidekick) handlePurgeRequest(w http.ResponseWriter, r *http.Request, st
 					s.logger.Error("Invalid wildcard pattern", zap.String("pattern", path), zap.Error(err))
 					continue
 				}
-
-				// Purge all matching keys from both memory and disk
-				allKeys := append(cacheList["mem"], cacheList["disk"]...)
-				for _, key := range allKeys {
-					if re.MatchString(key) {
-						_ = storage.Purge(key)
-					}
+				pathMatcher = func(p string) bool {
+					return re.MatchString(p)
 				}
 			} else {
-				// For non-wildcard paths, directly purge the key
-				// In this simplified test, paths are used directly as keys
-				_ = storage.Purge(path)
+				// Exact path match
+				pathMatcher = func(p string) bool {
+					return p == path
+				}
 			}
+
+			// Check each cached item's metadata
+			for _, key := range allKeys {
+				// Get metadata without loading the full content
+				var meta *Metadata
+
+				// Check memory cache first
+				memCache := storage.GetMemCache()
+				if memCache != nil {
+					if cacheItem, ok := memCache.Get(key); ok && cacheItem != nil && (*cacheItem).Metadata != nil {
+						meta = (*cacheItem).Metadata
+						s.logger.Debug("sidekick - found metadata in memory",
+							zap.String("key", key),
+							zap.String("path", meta.Path))
+					}
+				}
+
+				// If not in memory, check disk cache metadata
+				if meta == nil {
+					diskCache := storage.GetDiskCache()
+					if diskCache != nil {
+						if item, err := diskCache.Get(key); err == nil && item != nil {
+							// Load just the metadata
+							metaPath := filepath.Join(item.Path, "metadata.json")
+							tempMeta := &Metadata{}
+							if err := tempMeta.LoadFromFile(metaPath); err == nil {
+								meta = tempMeta
+								s.logger.Debug("sidekick - found metadata on disk",
+									zap.String("key", key),
+									zap.String("path", meta.Path),
+									zap.String("metaPath", metaPath))
+							} else {
+								s.logger.Debug("sidekick - failed to load metadata from disk",
+									zap.String("key", key),
+									zap.String("metaPath", metaPath),
+									zap.Error(err))
+							}
+						}
+					}
+				}
+
+				// Check if this entry's path matches
+				if meta != nil {
+					s.logger.Debug("sidekick - checking path match",
+						zap.String("key", key),
+						zap.String("metaPath", meta.Path),
+						zap.String("targetPath", path),
+						zap.Bool("hasPath", meta.Path != ""),
+						zap.Bool("matches", meta.Path != "" && pathMatcher(meta.Path)))
+
+					if meta.Path != "" && pathMatcher(meta.Path) {
+						keysToPurge = append(keysToPurge, key)
+						s.logger.Debug("sidekick - will purge key", zap.String("key", key))
+					}
+				} else {
+					s.logger.Debug("sidekick - no metadata found for key", zap.String("key", key))
+				}
+			}
+
+			// Purge all matching keys
+			s.logger.Debug("sidekick - keys to purge",
+				zap.String("path", path),
+				zap.Int("count", len(keysToPurge)),
+				zap.Strings("keys", keysToPurge))
+
+			for _, key := range keysToPurge {
+				if err := storage.Purge(key); err == nil {
+					purgedCount++
+					s.logger.Debug("sidekick - successfully purged key", zap.String("key", key))
+				} else {
+					s.logger.Error("sidekick - failed to purge key",
+						zap.String("key", key),
+						zap.Error(err))
+				}
+			}
+
+			s.logger.Debug("sidekick - purge complete",
+				zap.String("path", path),
+				zap.Int("purged_count", purgedCount),
+				zap.Int("target_count", len(keysToPurge)))
 		}
 	}
 

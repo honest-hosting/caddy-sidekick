@@ -1,0 +1,71 @@
+# Git files
+.git
+.gitignore
+.gitattributes
+
+# Documentation
+*.md
+LICENSE
+docs/
+
+# Build artifacts
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test files and directories
+*_test.go
+*.test
+*.out
+integration-test/cache/
+integration-test/docker-compose.yml
+integration-test/*.log
+
+# Development files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Go specific
+vendor/
+go.work
+go.work.sum
+
+# Docker files (we don't want to copy these into the build context)
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Scripts that aren't needed in the container
+scripts/
+*.sh
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Coverage and test reports
+*.cover
+*.coverage
+coverage.*
+test-results/
+test-reports/
+
+# Logs
+*.log
+logs/
+
+# Cache directories
+.cache/
+cache/

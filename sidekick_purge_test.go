@@ -2,7 +2,9 @@ package sidekick
 
 import (
 	"bytes"
+	"crypto/md5"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -190,20 +192,27 @@ func TestPurgeHandler(t *testing.T) {
 	// Initialize storage
 	s.Storage = NewStorage(s.CacheDir, s.CacheTTL, 10*1024*1024, 100, 0, 0, 0, s.logger)
 
-	// Store some test data in cache
-	testMetadata := &Metadata{
-		StateCode: 200,
-		Header: [][]string{
-			{"Content-Type", "text/plain"},
-		},
-		Timestamp: time.Now().Unix(),
+	// Helper function to generate cache key like the real implementation
+	generateCacheKey := func(path string) string {
+		h := md5.New()
+		h.Write([]byte(path))
+		return fmt.Sprintf("%x", h.Sum(nil))
 	}
-	testData := []byte("test content")
 
-	_ = s.Storage.Set("/test-path-1", testMetadata, testData)
-	_ = s.Storage.Set("/test-path-2", testMetadata, testData)
-	_ = s.Storage.Set("/blog/post-1", testMetadata, testData)
-	_ = s.Storage.Set("/blog/post-2", testMetadata, testData)
+	// Helper function to store data with proper metadata including path
+	storeTestData := func(path string) {
+		metadata := &Metadata{
+			StateCode: 200,
+			Header: [][]string{
+				{"Content-Type", "text/plain"},
+			},
+			Timestamp: time.Now().Unix(),
+			Path:      path, // Include the path in metadata for purging
+		}
+		testData := []byte("test content for " + path)
+		key := generateCacheKey(path)
+		_ = s.Storage.SetWithKey(key, metadata, testData)
+	}
 
 	tests := []struct {
 		name           string
@@ -289,18 +298,24 @@ func TestPurgeHandler(t *testing.T) {
 			},
 			expectedStatus: http.StatusOK,
 			checkCache: func(t *testing.T, storage *Storage) {
-				// These should be purged (paths directly used as keys in this test)
-				if _, _, err := storage.Get("/test-path-1", "none"); err == nil {
+				// Check using the actual MD5 cache keys
+				key1 := generateCacheKey("/test-path-1")
+				key2 := generateCacheKey("/test-path-2")
+				key3 := generateCacheKey("/blog/post-1")
+				key4 := generateCacheKey("/blog/post-2")
+
+				// These should be purged (matched by path in metadata)
+				if _, _, err := storage.Get(key1, "none"); err == nil {
 					t.Error("Expected /test-path-1 to be purged")
 				}
-				if _, _, err := storage.Get("/blog/post-1", "none"); err == nil {
+				if _, _, err := storage.Get(key3, "none"); err == nil {
 					t.Error("Expected /blog/post-1 to be purged")
 				}
 				// These should remain
-				if _, _, err := storage.Get("/test-path-2", "none"); err != nil {
+				if _, _, err := storage.Get(key2, "none"); err != nil {
 					t.Error("Expected /test-path-2 to remain in cache")
 				}
-				if _, _, err := storage.Get("/blog/post-2", "none"); err != nil {
+				if _, _, err := storage.Get(key4, "none"); err != nil {
 					t.Error("Expected /blog/post-2 to remain in cache")
 				}
 			},
@@ -318,18 +333,23 @@ func TestPurgeHandler(t *testing.T) {
 			},
 			expectedStatus: http.StatusOK,
 			checkCache: func(t *testing.T, storage *Storage) {
-				// Blog posts should be purged
-				if _, _, err := storage.Get("/blog/post-1", "none"); err == nil {
+				key1 := generateCacheKey("/test-path-1")
+				key2 := generateCacheKey("/test-path-2")
+				key3 := generateCacheKey("/blog/post-1")
+				key4 := generateCacheKey("/blog/post-2")
+
+				// Blog posts should be purged (matched by wildcard pattern in metadata)
+				if _, _, err := storage.Get(key3, "none"); err == nil {
 					t.Error("Expected /blog/post-1 to be purged")
 				}
-				if _, _, err := storage.Get("/blog/post-2", "none"); err == nil {
+				if _, _, err := storage.Get(key4, "none"); err == nil {
 					t.Error("Expected /blog/post-2 to be purged")
 				}
 				// Test paths should remain
-				if _, _, err := storage.Get("/test-path-1", "none"); err != nil {
+				if _, _, err := storage.Get(key1, "none"); err != nil {
 					t.Error("Expected /test-path-1 to remain in cache")
 				}
-				if _, _, err := storage.Get("/test-path-2", "none"); err != nil {
+				if _, _, err := storage.Get(key2, "none"); err != nil {
 					t.Error("Expected /test-path-2 to remain in cache")
 				}
 			},
@@ -354,17 +374,84 @@ func TestPurgeHandler(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:   "POST with paths not matching metadata",
+			method: "POST",
+			path:   "/__sidekick/purge",
+			headers: map[string]string{
+				"X-Sidekick-Purge": "test-token",
+				"Content-Type":     "application/json",
+			},
+			body: map[string]interface{}{
+				"paths": []string{"/non-existent-path"},
+			},
+			expectedStatus: http.StatusOK,
+			checkCache: func(t *testing.T, storage *Storage) {
+				// All items should remain since no paths match
+				key1 := generateCacheKey("/test-path-1")
+				key2 := generateCacheKey("/test-path-2")
+				key3 := generateCacheKey("/blog/post-1")
+				key4 := generateCacheKey("/blog/post-2")
+
+				if _, _, err := storage.Get(key1, "none"); err != nil {
+					t.Error("Expected /test-path-1 to remain in cache")
+				}
+				if _, _, err := storage.Get(key2, "none"); err != nil {
+					t.Error("Expected /test-path-2 to remain in cache")
+				}
+				if _, _, err := storage.Get(key3, "none"); err != nil {
+					t.Error("Expected /blog/post-1 to remain in cache")
+				}
+				if _, _, err := storage.Get(key4, "none"); err != nil {
+					t.Error("Expected /blog/post-2 to remain in cache")
+				}
+			},
+		},
+		{
+			name:   "POST with multiple wildcard patterns",
+			method: "POST",
+			path:   "/__sidekick/purge",
+			headers: map[string]string{
+				"X-Sidekick-Purge": "test-token",
+				"Content-Type":     "application/json",
+			},
+			body: map[string]interface{}{
+				"paths": []string{"/test-path-*", "/blog/post-1"},
+			},
+			expectedStatus: http.StatusOK,
+			checkCache: func(t *testing.T, storage *Storage) {
+				key1 := generateCacheKey("/test-path-1")
+				key2 := generateCacheKey("/test-path-2")
+				key3 := generateCacheKey("/blog/post-1")
+				key4 := generateCacheKey("/blog/post-2")
+
+				// test-path-* and /blog/post-1 should be purged
+				if _, _, err := storage.Get(key1, "none"); err == nil {
+					t.Error("Expected /test-path-1 to be purged")
+				}
+				if _, _, err := storage.Get(key2, "none"); err == nil {
+					t.Error("Expected /test-path-2 to be purged")
+				}
+				if _, _, err := storage.Get(key3, "none"); err == nil {
+					t.Error("Expected /blog/post-1 to be purged")
+				}
+				// /blog/post-2 should remain
+				if _, _, err := storage.Get(key4, "none"); err != nil {
+					t.Error("Expected /blog/post-2 to remain in cache")
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Reset cache for each test
 			_ = s.Storage.Flush()
-			// Use SetWithKey to directly set the paths as keys (simulating what would be stored)
-			_ = s.Storage.SetWithKey("/test-path-1", testMetadata, testData)
-			_ = s.Storage.SetWithKey("/test-path-2", testMetadata, testData)
-			_ = s.Storage.SetWithKey("/blog/post-1", testMetadata, testData)
-			_ = s.Storage.SetWithKey("/blog/post-2", testMetadata, testData)
+			// Store test data with proper metadata including paths
+			storeTestData("/test-path-1")
+			storeTestData("/test-path-2")
+			storeTestData("/blog/post-1")
+			storeTestData("/blog/post-2")
 
 			// Prepare request body
 			var bodyBytes []byte
@@ -402,6 +489,363 @@ func TestPurgeHandler(t *testing.T) {
 				tt.checkCache(t, s.Storage)
 			}
 		})
+	}
+}
+
+func TestPurgePathVariations(t *testing.T) {
+	// Test that purging a path removes all cache variations
+	// (different query params, headers, cookies resulting in different cache keys)
+	tmpDir := t.TempDir()
+
+	s := &Sidekick{
+		CacheDir:               tmpDir,
+		CacheTTL:               60,
+		PurgeURI:               "/__sidekick/purge",
+		PurgeHeader:            "X-Sidekick-Purge",
+		PurgeToken:             "test-token",
+		CacheMemoryItemMaxSize: 1024 * 1024,      // 1MB
+		CacheMemoryMaxSize:     10 * 1024 * 1024, // 10MB
+		CacheMemoryMaxCount:    100,
+		CacheResponseCodes:     []string{"200"},
+		CacheKeyQueries:        []string{"page", "sort"},
+		CacheKeyHeaders:        []string{"Accept-Language"},
+		CacheKeyCookies:        []string{"session"},
+	}
+
+	// Initialize logger
+	s.logger = zap.NewNop()
+
+	// Initialize sync handler
+	s.syncHandler = &SyncHandler{
+		inFlight: make(map[string]*sync.Once),
+	}
+
+	// Initialize storage
+	s.Storage = NewStorage(s.CacheDir, s.CacheTTL, 10*1024*1024, 100, 0, 0, 0, s.logger)
+
+	// Helper to generate cache keys with variations
+	generateVariationKey := func(path string, queries map[string]string, headers map[string]string, cookies map[string]string) string {
+		h := md5.New()
+		h.Write([]byte(path))
+
+		// Include query params like the real implementation
+		for _, q := range s.CacheKeyQueries {
+			if val, ok := queries[q]; ok {
+				h.Write([]byte(q + "=" + val))
+			}
+		}
+
+		// Include headers
+		for _, hdr := range s.CacheKeyHeaders {
+			if val, ok := headers[hdr]; ok {
+				h.Write([]byte(hdr + ":" + val))
+			}
+		}
+
+		// Include cookies
+		for _, cookie := range s.CacheKeyCookies {
+			if val, ok := cookies[cookie]; ok {
+				h.Write([]byte(cookie + "=" + val))
+			}
+		}
+
+		return fmt.Sprintf("%x", h.Sum(nil))
+	}
+
+	// Store multiple variations of /api/users
+	variations := []struct {
+		queries map[string]string
+		headers map[string]string
+		cookies map[string]string
+		desc    string
+	}{
+		{
+			queries: nil,
+			headers: nil,
+			cookies: nil,
+			desc:    "no variations",
+		},
+		{
+			queries: map[string]string{"page": "1"},
+			headers: nil,
+			cookies: nil,
+			desc:    "with page query",
+		},
+		{
+			queries: map[string]string{"page": "2", "sort": "name"},
+			headers: nil,
+			cookies: nil,
+			desc:    "with page and sort queries",
+		},
+		{
+			queries: nil,
+			headers: map[string]string{"Accept-Language": "en-US"},
+			cookies: nil,
+			desc:    "with Accept-Language header",
+		},
+		{
+			queries: map[string]string{"page": "1"},
+			headers: map[string]string{"Accept-Language": "de-DE"},
+			cookies: map[string]string{"session": "abc123"},
+			desc:    "with all variations",
+		},
+	}
+
+	// Store all variations
+	path := "/api/users"
+	storedKeys := []string{}
+	for _, v := range variations {
+		key := generateVariationKey(path, v.queries, v.headers, v.cookies)
+		storedKeys = append(storedKeys, key)
+
+		metadata := &Metadata{
+			StateCode: 200,
+			Header: [][]string{
+				{"Content-Type", "application/json"},
+			},
+			Timestamp: time.Now().Unix(),
+			Path:      path, // All variations have the same path
+		}
+		testData := []byte(fmt.Sprintf("data for %s: %s", path, v.desc))
+		_ = s.Storage.SetWithKey(key, metadata, testData)
+	}
+
+	// Also store a different path
+	otherPath := "/api/posts"
+	otherKey := generateVariationKey(otherPath, nil, nil, nil)
+	otherMetadata := &Metadata{
+		StateCode: 200,
+		Header: [][]string{
+			{"Content-Type", "application/json"},
+		},
+		Timestamp: time.Now().Unix(),
+		Path:      otherPath,
+	}
+	_ = s.Storage.SetWithKey(otherKey, otherMetadata, []byte("data for /api/posts"))
+
+	// Verify all variations are in cache
+	for i, key := range storedKeys {
+		if _, _, err := s.Storage.Get(key, "none"); err != nil {
+			t.Errorf("Expected variation %d (%s) to be in cache before purge", i, variations[i].desc)
+		}
+	}
+	if _, _, err := s.Storage.Get(otherKey, "none"); err != nil {
+		t.Error("Expected /api/posts to be in cache before purge")
+	}
+
+	// Create purge request for /api/users
+	body := map[string]interface{}{
+		"paths": []string{"/api/users"},
+	}
+	bodyBytes, _ := json.Marshal(body)
+	req := httptest.NewRequest("POST", "/__sidekick/purge", bytes.NewReader(bodyBytes))
+	req.Header.Set("X-Sidekick-Purge", "test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	err := s.handlePurgeRequest(w, req, s.Storage)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Check that all variations of /api/users are purged
+	for i, key := range storedKeys {
+		if _, _, err := s.Storage.Get(key, "none"); err == nil {
+			t.Errorf("Expected variation %d (%s) to be purged", i, variations[i].desc)
+		}
+	}
+
+	// Check that /api/posts remains
+	if _, _, err := s.Storage.Get(otherKey, "none"); err != nil {
+		t.Error("Expected /api/posts to remain in cache after purging /api/users")
+	}
+
+	// Verify response
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", w.Code)
+	}
+
+	var response map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err == nil {
+		if response["status"] != "ok" {
+			t.Errorf("Expected response status 'ok', got '%s'", response["status"])
+		}
+	}
+}
+
+func TestPurgeBackwardCompatibility(t *testing.T) {
+	// Test that entries without Path in metadata are not affected by path-based purging
+	// This ensures backward compatibility with cached items from before the Path field was added
+	tmpDir := t.TempDir()
+
+	s := &Sidekick{
+		CacheDir:               tmpDir,
+		CacheTTL:               60,
+		PurgeURI:               "/__sidekick/purge",
+		PurgeHeader:            "X-Sidekick-Purge",
+		PurgeToken:             "test-token",
+		CacheMemoryItemMaxSize: 1024 * 1024,      // 1MB
+		CacheMemoryMaxSize:     10 * 1024 * 1024, // 10MB
+		CacheMemoryMaxCount:    100,
+		CacheResponseCodes:     []string{"200"},
+	}
+
+	// Initialize logger
+	s.logger = zap.NewNop()
+
+	// Initialize sync handler
+	s.syncHandler = &SyncHandler{
+		inFlight: make(map[string]*sync.Once),
+	}
+
+	// Initialize storage
+	s.Storage = NewStorage(s.CacheDir, s.CacheTTL, 10*1024*1024, 100, 0, 0, 0, s.logger)
+
+	// Store entries with Path metadata (new style)
+	withPathKey1 := "key_with_path_1"
+	withPathMetadata1 := &Metadata{
+		StateCode: 200,
+		Header: [][]string{
+			{"Content-Type", "text/html"},
+		},
+		Timestamp: time.Now().Unix(),
+		Path:      "/api/users", // Has path
+	}
+	_ = s.Storage.SetWithKey(withPathKey1, withPathMetadata1, []byte("data with path 1"))
+
+	withPathKey2 := "key_with_path_2"
+	withPathMetadata2 := &Metadata{
+		StateCode: 200,
+		Header: [][]string{
+			{"Content-Type", "text/html"},
+		},
+		Timestamp: time.Now().Unix(),
+		Path:      "/api/posts", // Has path
+	}
+	_ = s.Storage.SetWithKey(withPathKey2, withPathMetadata2, []byte("data with path 2"))
+
+	// Store entries WITHOUT Path metadata (old style - backward compatibility)
+	withoutPathKey1 := "key_without_path_1"
+	withoutPathMetadata1 := &Metadata{
+		StateCode: 200,
+		Header: [][]string{
+			{"Content-Type", "text/html"},
+		},
+		Timestamp: time.Now().Unix(),
+		// Path field is empty - simulating old cached entries
+	}
+	_ = s.Storage.SetWithKey(withoutPathKey1, withoutPathMetadata1, []byte("data without path 1"))
+
+	withoutPathKey2 := "key_without_path_2"
+	withoutPathMetadata2 := &Metadata{
+		StateCode: 200,
+		Header: [][]string{
+			{"Content-Type", "text/html"},
+		},
+		Timestamp: time.Now().Unix(),
+		// Path field is empty - simulating old cached entries
+	}
+	_ = s.Storage.SetWithKey(withoutPathKey2, withoutPathMetadata2, []byte("data without path 2"))
+
+	// Verify all entries are in cache before purge
+	if _, _, err := s.Storage.Get(withPathKey1, "none"); err != nil {
+		t.Error("Expected entry with path 1 to be in cache")
+	}
+	if _, _, err := s.Storage.Get(withPathKey2, "none"); err != nil {
+		t.Error("Expected entry with path 2 to be in cache")
+	}
+	if _, _, err := s.Storage.Get(withoutPathKey1, "none"); err != nil {
+		t.Error("Expected entry without path 1 to be in cache")
+	}
+	if _, _, err := s.Storage.Get(withoutPathKey2, "none"); err != nil {
+		t.Error("Expected entry without path 2 to be in cache")
+	}
+
+	// Purge /api/users
+	body := map[string]interface{}{
+		"paths": []string{"/api/users"},
+	}
+	bodyBytes, _ := json.Marshal(body)
+	req := httptest.NewRequest("POST", "/__sidekick/purge", bytes.NewReader(bodyBytes))
+	req.Header.Set("X-Sidekick-Purge", "test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	err := s.handlePurgeRequest(w, req, s.Storage)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Check results:
+	// - Entry with path="/api/users" should be purged
+	if _, _, err := s.Storage.Get(withPathKey1, "none"); err == nil {
+		t.Error("Expected entry with path=/api/users to be purged")
+	}
+
+	// - Entry with path="/api/posts" should remain
+	if _, _, err := s.Storage.Get(withPathKey2, "none"); err != nil {
+		t.Error("Expected entry with path=/api/posts to remain in cache")
+	}
+
+	// - Entries without Path should remain (backward compatibility)
+	if _, _, err := s.Storage.Get(withoutPathKey1, "none"); err != nil {
+		t.Error("Expected entry without path 1 to remain in cache (backward compatibility)")
+	}
+	if _, _, err := s.Storage.Get(withoutPathKey2, "none"); err != nil {
+		t.Error("Expected entry without path 2 to remain in cache (backward compatibility)")
+	}
+
+	// Purge with wildcard should also not affect entries without Path
+	_ = s.Storage.SetWithKey(withPathKey1, withPathMetadata1, []byte("data with path 1")) // Re-add for next test
+
+	body = map[string]interface{}{
+		"paths": []string{"/api/*"},
+	}
+	bodyBytes, _ = json.Marshal(body)
+	req = httptest.NewRequest("POST", "/__sidekick/purge", bytes.NewReader(bodyBytes))
+	req.Header.Set("X-Sidekick-Purge", "test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	w = httptest.NewRecorder()
+	err = s.handlePurgeRequest(w, req, s.Storage)
+	if err != nil {
+		t.Fatalf("Unexpected error in wildcard purge: %v", err)
+	}
+
+	// Both /api/users and /api/posts should be purged
+	if _, _, err := s.Storage.Get(withPathKey1, "none"); err == nil {
+		t.Error("Expected entry with path=/api/users to be purged by wildcard")
+	}
+	if _, _, err := s.Storage.Get(withPathKey2, "none"); err == nil {
+		t.Error("Expected entry with path=/api/posts to be purged by wildcard")
+	}
+
+	// Entries without Path should still remain
+	if _, _, err := s.Storage.Get(withoutPathKey1, "none"); err != nil {
+		t.Error("Expected entry without path 1 to remain after wildcard purge")
+	}
+	if _, _, err := s.Storage.Get(withoutPathKey2, "none"); err != nil {
+		t.Error("Expected entry without path 2 to remain after wildcard purge")
+	}
+
+	// Purge all should remove everything
+	body = map[string]interface{}{}
+	bodyBytes, _ = json.Marshal(body)
+	req = httptest.NewRequest("POST", "/__sidekick/purge", bytes.NewReader(bodyBytes))
+	req.Header.Set("X-Sidekick-Purge", "test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	w = httptest.NewRecorder()
+	err = s.handlePurgeRequest(w, req, s.Storage)
+	if err != nil {
+		t.Fatalf("Unexpected error in purge all: %v", err)
+	}
+
+	// All entries should be gone
+	list := s.Storage.List()
+	totalCount := len(list["mem"]) + len(list["disk"])
+	if totalCount != 0 {
+		t.Errorf("Expected all entries to be purged, but found %d items", totalCount)
 	}
 }
 
