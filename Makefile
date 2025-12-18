@@ -12,12 +12,12 @@ lint: ## Run linter against codebase
 .PHONY: lint
 
 # GO_VERSION should (generally) match go.mod version
-build: export GO_VERSION               ?= 1.24.3
+build: export GO_VERSION               ?= 1.25.5
 build: export XCADDY_VERSION           ?= 0.4.5
 build: export CADDY_VERSION            ?= 2.10.2
 build: export FRANKENPHP_CADDY_VERSION ?= 1.9.0
 build: lint ## Run 'docker composer build' to build caddy with plugin
-	@cd integration-test && docker compose build --build-arg GO_VERSION=$(GO_VERSION) --build-arg XCADDY_VERSION=$(XCADDY_VERSION) --build-arg CADDY_VERSION=$(CADDY_VERSION) --build-arg FRANKENPHP_CADDY_VERSION=$(FRANKENPHP_CADDY_VERSION)
+	@docker compose build --build-arg GO_VERSION=$(GO_VERSION) --build-arg XCADDY_VERSION=$(XCADDY_VERSION) --build-arg CADDY_VERSION=$(CADDY_VERSION) --build-arg FRANKENPHP_CADDY_VERSION=$(FRANKENPHP_CADDY_VERSION)
 	@CID=$$(docker create caddy-sidekick-integration-test:latest);          \
 		docker cp $$CID:/usr/local/bin/caddy ./bin/caddy >/dev/null 2>&1;   \
 		docker rm $$CID >/dev/null
@@ -60,11 +60,11 @@ test-integration: test-integration-setup ## Run integration tests with Docker Co
 .PHONY: test-integration
 
 test-integration-setup:
-	@cd integration-test && docker compose up -d --wait
+	@docker compose up -d --wait
 .PHONY: test-integration-setup
 
 test-integration-cleanup:
-	@cd integration-test && docker compose down || true
+	@docker compose down || true
 .PHONY: test-integration-cleanup
 
 fmt: ## Run go-fmt against codebase
@@ -79,13 +79,13 @@ mod-tidy: ## Make sure go modules are tidy
 	@go mod tidy
 .PHONY: mod-tidy
 
-mod-update: export MODULE ?=
-mod-update: ## Update go proxy with latest module version: MODULE=github.com/honest-hosting/caddy-sidekick@v0.0.1 make mod-update
-	@if [[ -n "${MODULE}" ]]; then                       \
-		GOPROXY=proxy.golang.org go list -m ${MODULE};   \
-	else                                                 \
-		echo "ERROR: Missing 'MODULE', cannot continue"; \
-		exit 1;                                          \
+mod-update:
+	@if [[ -n "${MODULE}" ]] && [[ -n "${MODULE_VERSION}" ]]; then          \
+		echo "Running 'go list -m ${MODULE}@${MODULE_VERSION}' ...";        \
+		GOPROXY=proxy.golang.org go list -m "${MODULE}@${MODULE_VERSION}";  \
+	else                                                                    \
+		echo "ERROR: Missing 'MODULE'/'MODULE_VERSION', cannot continue";   \
+		exit 1;                                                             \
 	fi
 .PHONY: mod-update
 
@@ -93,3 +93,8 @@ clean: test-integration-cleanup ## Clean up repo
 	@docker rmi -f caddy-sidekick-integration-test:latest 2>/dev/null || true
 	@rm -f bin/caddy 2>/dev/null || true
 .PHONY: clean
+
+release: export MODULE         ?= github.com/honest-hosting/caddy-sidekick
+release: export MODULE_VERSION ?=
+release: mod-update ## Run release step(s) for module version: MODULE_VERSION=v0.0.1 make release
+.PHONY: release

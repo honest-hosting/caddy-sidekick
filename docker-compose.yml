@@ -1,0 +1,26 @@
+services:
+  caddy-sidekick-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: caddy-sidekick-integration-test:latest
+    container_name: sidekick-integration-test
+    ports:
+      - "8080:80"
+      - "8443:443"
+    volumes:
+      - ./integration-test/cache:/var/www/cache
+      - ./integration-test/html:/var/www/html:ro
+      - ./integration-test/etc/Caddyfile:/etc/caddy/Caddyfile:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health.php"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks:
+      - sidekick-test
+
+networks:
+  sidekick-test:
+    driver: bridge

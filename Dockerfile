@@ -48,6 +48,8 @@ RUN CGO_ENABLED=1 XCADDY_SETCAP=1 XCADDY_GO_BUILD_FLAGS='-ldflags="-w -s" -tags=
     --with github.com/honest-hosting/caddy-sidekick=/sidekick               \
     --output /usr/local/bin/caddy
 
+RUN /usr/local/bin/caddy version
+
 # Final stage - minimal runtime image
 FROM dunglas/frankenphp:php8.3-bookworm
 
