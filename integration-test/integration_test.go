@@ -221,7 +221,7 @@ func TestIntegrationNoCachePaths(t *testing.T) {
 	}
 	checkCacheHeader(t, resp1, "BYPASS")
 
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(1250 * time.Millisecond)
 
 	resp2, body2 := makeRequest(t, "GET", baseURL+"/wp-admin/index.php", nil, nil)
 	if resp2.StatusCode != 200 {

@@ -14,7 +14,7 @@ lint: ## Run linter against codebase
 # GO_VERSION should (generally) match go.mod version
 build: export GO_VERSION               ?= 1.24.3
 build: export XCADDY_VERSION           ?= 0.4.5
-build: export CADDY_VERSION            ?= 2.10.0
+build: export CADDY_VERSION            ?= 2.10.2
 build: export FRANKENPHP_CADDY_VERSION ?= 1.9.0
 build: lint ## Run 'docker composer build' to build caddy with plugin
 	@cd integration-test && docker compose build --build-arg GO_VERSION=$(GO_VERSION) --build-arg XCADDY_VERSION=$(XCADDY_VERSION) --build-arg CADDY_VERSION=$(CADDY_VERSION) --build-arg FRANKENPHP_CADDY_VERSION=$(FRANKENPHP_CADDY_VERSION)
