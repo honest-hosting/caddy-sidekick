@@ -1,9 +1,9 @@
 {
-	#order sidekick before file_server
 	admin off
 	log {
 		level DEBUG
 	}
+
 	frankenphp
 
 	order php_server before file_server
@@ -58,21 +58,7 @@
 
 	# Set up root directory
 	root * /var/www/html
-
-	# Use FrankenPHP to handle PHP files
-	#php {
-	#	root /var/www/html
-	#	index index.php
-	#}
-
-	###
-	#root * /var/www/html/
-	#encode br zstd gzip
-
 	php_server
-	###
-
-	# Serve static files
 	file_server
 
 	# Add response headers for debugging

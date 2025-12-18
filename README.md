@@ -17,6 +17,11 @@ Lightning-fast server side caching Caddy module for PHP applications, with an em
 - **Selective Caching**: Path prefixes, regex patterns, and response codes
 - **Purge API**: Secure cache invalidation endpoint
 
+### WordPress Integration
+- **Automatic mu-plugin Deployment**: Manages WordPress must-use plugins for cache purging and URL rewriting
+- **Checksum Verification**: Ensures mu-plugin integrity with SHA-256 checksums
+- **Smart Directory Management**: Creates directories as needed with parent directory validation
+
 ## Installation
 
 ### Building with xcaddy
@@ -54,82 +59,138 @@ All environment variables use the `SIDEKICK_` prefix for namespace isolation:
 | `SIDEKICK_CACHE_KEY_HEADERS` | Headers to include in cache key (comma-separated) | _(none)_ |
 | `SIDEKICK_CACHE_KEY_QUERIES` | Query parameters to include in cache key (comma-separated, use `*` for all) | _(none)_ |
 | `SIDEKICK_CACHE_KEY_COOKIES` | Cookies to include in cache key (comma-separated) | _(none)_ |
+| `SIDEKICK_WP_MU_PLUGIN_ENABLED` | Enable automatic WordPress mu-plugin management | `true` |
+| `SIDEKICK_WP_MU_PLUGIN_DIR` | Directory for WordPress mu-plugins | `/var/www/html/wp-content/mu-plugins` |
 
 **Note:** When either memory or disk cache is enabled, all purge-related options (`SIDEKICK_PURGE_HEADER`, `SIDEKICK_PURGE_URI`, `SIDEKICK_PURGE_TOKEN`) are required to be set.
 
-### Caddyfile Example
+### Quick Start
 
-Complete example for a WordPress site:
+Minimal configuration for a WordPress site:
+
+```caddyfile
+{
+    order sidekick before rewrite
+}
+
+example.com {
+    sidekick {
+        cache_dir /var/www/cache
+        cache_ttl 3600
+        
+        purge_uri /__sidekick/purge
+        purge_header X-Sidekick-Purge
+        purge_token "change-this-secret"
+    }
+    
+    root * /var/www/html
+    php_server
+    file_server
+}
+```
+
+### Complete Caddyfile Example
+
+Full configuration with all options for a production WordPress site:
 
 ```caddyfile
 {
     # Global options
-    order sidekick before file_server
+    admin off
     
-    # Optional: admin endpoint
-    admin localhost:2019
+    # FrankenPHP configuration
+    frankenphp
+    
+    # Module ordering
+    order php_server before file_server
+    order php before file_server
+    order sidekick before rewrite
+    order request_header before sidekick
 }
 
 example.com {
     # Enable Sidekick caching
     sidekick {
         # Cache storage location
-        cache_dir /var/cache/caddy/sidekick
+        cache_dir /var/www/cache
         
         # Cache TTL in seconds (1 hour)
         cache_ttl 3600
         
         # HTTP status codes to cache
-        cache_response_codes 200 404 301 302
+        cache_response_codes 200 301 302
         
-        # Paths to bypass cache
+        # Paths to bypass cache (WordPress paths)
         nocache /wp-admin /wp-json /wp-login.php
         
         # Don't cache home page (optional)
         nocache_home false
         
         # Regex for file types to bypass
-        # Default includes common static assets
-        # nocache_regex "\.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot|otf)$"
+        # Exclude large media files from cache
+        nocache_regex "\\.(mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe)$"
         
         # Purge endpoint configuration (required when cache is enabled)
-        purge_uri /__sidekick/purge              # Must be absolute path with only a-z0-9-_/
-        purge_header X-Sidekick-Purge            # HTTP header name for token
-        purge_token "your-secret-token-here"     # Update for production deployment
+        purge_uri /__sidekick/purge
+        purge_header X-Sidekick-Purge
+        purge_token "your-secret-token-here"  # CHANGE THIS!
         
         # Memory cache limits
-        cache_memory_item_max_size 4MB      # Max size for single item in memory
-        cache_memory_max_size 128MB         # Total memory cache limit (or use cache_memory_max_percent)
-        # cache_memory_max_percent 10       # Alternative: Use 10% of available RAM
-        cache_memory_max_count 32768        # Max items in memory
-        cache_memory_stream_to_disk_size 10MB # Stream to disk if larger than this
+        cache_memory_item_max_size 4MB
+        cache_memory_max_size 128MB
+        cache_memory_max_count 32768
+        cache_memory_stream_to_disk_size 10MB
         
         # Disk cache limits
-        cache_disk_item_max_size 100MB      # Max size for any cached item on disk
-        cache_disk_max_size 10GB            # Total disk cache limit (or use cache_disk_max_percent)
-        # cache_disk_max_percent 5          # Alternative: Use 5% of available disk space
-        cache_disk_max_count 100000         # Max number of items on disk (LRU eviction)
+        cache_disk_item_max_size 100MB
+        cache_disk_max_size 10GB
+        cache_disk_max_count 100000
         
         # Cache key customization
-        cache_key_queries page sort filter  # Include these query params
-        cache_key_headers Accept-Language   # Vary cache by these headers
+        cache_key_queries page sort filter     # Include these query params
+        cache_key_headers Accept-Language      # Vary cache by these headers
         cache_key_cookies wordpress_logged_in_* # Include these cookies
+        
+        # WordPress mu-plugin management
+        wp_mu_plugin_enabled true
+        wp_mu_plugin_dir /var/www/html/wp-content/mu-plugins
     }
     
-    # PHP handling with FrankenPHP or php_fastcgi
-    php {
-        root * /var/www/html
-    }
+    # Set document root
+    root * /var/www/html
     
-    # Or use php_fastcgi
-    # root * /var/www/html
-    # php_fastcgi localhost:9000
+    # PHP handling with FrankenPHP
+    php_server
     
     # Static file serving
     file_server
     
     # Compression
     encode gzip
+    
+    # Optional: Add custom headers
+    header {
+        X-Frame-Options "SAMEORIGIN"
+        X-Content-Type-Options "nosniff"
+        X-XSS-Protection "1; mode=block"
+    }
+    
+    # Optional: Logging
+    log {
+        output file /var/log/caddy/access.log
+        format console
+    }
+    
+    # Handle errors
+    handle_errors {
+        @404 expression {http.error.status_code} == 404
+        handle @404 {
+            header Content-Type "text/html; charset=utf-8"
+            respond "<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 - Page Not Found</h1></body></html>" 404
+        }
+        
+        respond "{http.error.status_code} {http.error.status_text}"
+    }
 }
 ```
 
@@ -159,35 +220,63 @@ For those preferring JSON configuration:
                       "handle": [
                         {
                           "handler": "sidekick",
-                          "cache_dir": "/var/cache/caddy/sidekick",
+                          "cache_dir": "/var/www/cache",
                           "cache_ttl": 3600,
-                          "cache_response_codes": ["200", "404", "301", "302"],
+                          "cache_response_codes": ["200", "301", "302"],
                           "nocache": ["/wp-admin", "/wp-json", "/wp-login.php"],
                           "nocache_home": false,
-                          "nocache_regex": "\\.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot|otf)$",
+                          "nocache_regex": "\\.(mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe)$",
                           "purge_uri": "/__sidekick/purge",
                           "purge_header": "X-Sidekick-Purge",
                           "purge_token": "your-secret-token-here",
                           "cache_memory_item_max_size": 4194304,
                           "cache_memory_max_size": 134217728,
-                          "cache_memory_max_percent": 0,
                           "cache_memory_max_count": 32768,
                           "cache_memory_stream_to_disk_size": 10485760,
                           "cache_disk_item_max_size": 104857600,
                           "cache_disk_max_size": 10737418240,
-                          "cache_disk_max_percent": 0,
                           "cache_disk_max_count": 100000,
                           "cache_key_queries": ["page", "sort", "filter"],
                           "cache_key_headers": ["Accept-Language"],
-                          "cache_key_cookies": ["wordpress_logged_in_*"]
+                          "cache_key_cookies": ["wordpress_logged_in_*"],
+                          "wp_mu_plugin_enabled": true,
+                          "wp_mu_plugin_dir": "/var/www/html/wp-content/mu-plugins"
                         }
                       ]
                     },
                     {
                       "handle": [
                         {
-                          "handler": "php",
-                          "root": "/var/www/html"
+                          "handler": "rewrite",
+                          "uri": "{http.matchers.file.relative}"
+                        }
+                      ],
+                      "match": [
+                        {
+                          "file": {
+                            "try_files": ["{http.request.uri.path}", "{http.request.uri.path}/", "index.php"]
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "handle": [
+                        {
+                          "handler": "reverse_proxy",
+                          "transport": {
+                            "protocol": "fastcgi",
+                            "split_path": [".php"]
+                          },
+                          "upstreams": [
+                            {
+                              "dial": "localhost:9000"
+                            }
+                          ]
+                        }
+                      ],
+                      "match": [
+                        {
+                          "path": ["*.php"]
                         }
                       ]
                     },
@@ -203,93 +292,55 @@ For those preferring JSON configuration:
                 }
               ]
             }
-          ]
+          ],
+          "errors": {
+            "routes": [
+              {
+                "match": [
+                  {
+                    "expression": "{http.error.status_code} == 404"
+                  }
+                ],
+                "handle": [
+                  {
+                    "handler": "headers",
+                    "response": {
+                      "set": {
+                        "Content-Type": ["text/html; charset=utf-8"]
+                      }
+                    }
+                  },
+                  {
+                    "handler": "static_response",
+                    "status_code": 404,
+                    "body": "<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 - Page Not Found</h1></body></html>"
+                  }
+                ]
+              }
+            ]
+          },
+          "logs": {
+            "logger_names": {
+              "*": "default"
+            }
+          }
+        }
+      }
+    },
+    "logging": {
+      "logs": {
+        "default": {
+          "writer": {
+            "output": "file",
+            "filename": "/var/log/caddy/access.log"
+          },
+          "encoder": {
+            "format": "console"
+          }
         }
       }
     }
   }
-}
-```
-
-## Usage Examples
-
-### Basic WordPress Configuration
-
-Minimal configuration for a standard WordPress site:
-
-```caddyfile
-example.com {
-    sidekick {
-        cache_dir /var/cache/sidekick
-        purge_uri /__sidekick/purge
-        purge_header X-Sidekick-Purge
-        purge_token "secret123"  # TODO: Update with secure token
-    }
-    
-    root * /var/www/html
-    php_fastcgi localhost:9000
-    file_server
-}
-```
-
-### High-Traffic Site Configuration
-
-Optimized for high-traffic WordPress sites:
-
-```caddyfile
-example.com {
-    sidekick {
-        # Storage
-        cache_dir /nvme/cache/sidekick  # Fast NVMe storage
-        
-        # Performance
-        cache_ttl 7200                   # 2 hours
-        cache_memory_max_size 512MB      # More memory for hot content
-        cache_memory_max_count 100000    # More items in memory
-        cache_memory_stream_to_disk_size 5MB # Stream earlier to save memory
-        cache_disk_max_size 50GB         # Large disk cache for static content
-        cache_disk_max_count 500000      # Allow many items on disk
-        
-        # Selective caching
-        cache_response_codes 200 301 302
-        nocache /wp-admin /wp-json /cart /checkout
-        
-        # Cache variations for e-commerce
-        cache_key_queries "*"             # All query params matter
-        cache_key_cookies wordpress_logged_in_* woocommerce_*
-        
-        # Security
-        purge_uri /__sidekick/purge
-        purge_header X-Sidekick-Purge
-        purge_token "complex-secure-token-here"  # TODO: Update
-    }
-    
-    # ... rest of config
-}
-```
-
-### Multi-Language Site Configuration
-
-Configuration for sites with multiple languages:
-
-```caddyfile
-example.com {
-    sidekick {
-        cache_dir /var/cache/sidekick
-        
-        # Vary cache by language
-        cache_key_headers Accept-Language Cookie
-        cache_key_cookies pll_language qtrans_front_language
-        
-        # Don't cache language switcher
-        nocache /wp-admin /wp-json /?lang= /language-switcher
-        
-        purge_uri /__sidekick/purge
-        purge_header X-Sidekick-Purge
-        purge_token "secure-token"  # TODO: Update
-    }
-    
-    # ... rest of config
 }
 ```
 
@@ -321,9 +372,34 @@ curl -X POST https://example.com/__sidekick/purge \
   -d '{"paths": ["/blog/*", "/products/category-*", "/api/v1/*"]}'
 ```
 
-### WordPress Integration
+### WordPress mu-plugins
 
-Add to your theme's `functions.php` or a custom plugin:
+Sidekick automatically manages WordPress must-use plugins when `wp_mu_plugin_enabled` is set to `true` (default). These plugins provide:
+
+1. **Content Cache Purge**: Automatically purges cache when posts are updated
+2. **Force URL Rewrite**: Ensures proper URL handling for WordPress
+
+The mu-plugins are:
+- Automatically deployed on startup if not present
+- Updated if checksums don't match (ensuring latest version)
+- Removed if the feature is disabled and files match expected checksums
+- Only deployed if the parent directory exists (with warnings otherwise)
+
+To disable automatic mu-plugin management:
+```caddyfile
+sidekick {
+    wp_mu_plugin_enabled false
+}
+```
+
+Or via environment variable:
+```bash
+SIDEKICK_WP_MU_PLUGIN_ENABLED=false
+```
+
+### Manual WordPress Integration
+
+If you prefer manual integration, add to your theme's `functions.php` or a custom plugin:
 
 ```php
 // Purge cache when posts are updated
@@ -434,4 +510,4 @@ MIT License
 
 ## Acknowledgements
 
-This project was originally inspired by FrankenWP and is designed specifically for Caddy web server with PHP/WordPress optimization in mind.
+This project was originally inspired by FrankenWP and it's Sidekick drop-in, and is designed specifically for Caddy web server with PHP/WordPress optimization in mind.

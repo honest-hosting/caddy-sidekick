@@ -3,9 +3,13 @@ package sidekick
 import (
 	"bytes"
 	"crypto/md5"
+	"crypto/sha256"
+	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,6 +26,11 @@ import (
 	"go.uber.org/zap"
 )
 
+var (
+	//go:embed wp-content
+	embeddedWPContent embed.FS
+)
+
 type Sidekick struct {
 	logger             *zap.Logger
 	CacheDir           string   `json:"cache_dir,omitempty"`
@@ -34,6 +43,10 @@ type Sidekick struct {
 	CacheResponseCodes []string `json:"cache_response_codes,omitempty"`
 	CacheTTL           int      `json:"cache_ttl,omitempty"` // TTL in seconds
 	Storage            *Storage
+
+	// WordPress mu-plugin configuration
+	WPMuPluginEnabled bool   `json:"wp_mu_plugin_enabled,omitempty"` // Whether to manage mu-plugins
+	WPMuPluginDir     string `json:"wp_mu_plugin_dir,omitempty"`     // Directory for mu-plugins
 
 	// Size configurations (stored as int64 for byte values)
 	CacheMemoryItemMaxSize      int64 `json:"cache_memory_item_max_size,omitempty"`       // Max size for single item in memory
@@ -140,6 +153,10 @@ func parsePercent(value string) (int, error) {
 }
 
 func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	// Set defaults for WP mu-plugin options
+	s.WPMuPluginEnabled = DefaultWPMuPluginEnabled
+	s.WPMuPluginDir = DefaultWPMuPluginDir
+
 	for d.Next() {
 		for d.NextBlock(0) {
 			key := d.Val()
@@ -312,6 +329,16 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				s.CacheKeyCookies = cookies
 
+			case "wp_mu_plugin_enabled":
+				b, err := strconv.ParseBool(value)
+				if err != nil {
+					return d.Errf("wp_mu_plugin_enabled must be true or false")
+				}
+				s.WPMuPluginEnabled = b
+
+			case "wp_mu_plugin_dir":
+				s.WPMuPluginDir = value
+
 			default:
 				return d.Errf("unknown subdirective: %s", key)
 			}
@@ -334,11 +361,13 @@ const (
 	CacheHeaderName            = "X-Sidekick-Cache" // Not configurable
 	DefaultNoCacheRegex        = `\.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot|otf|mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe|doc|docx|xls|xlsx|ppt|pptx)$`
 	DefaultTTL                 = 6000
-	DefaultDiskItemMaxSize     = 100 * 1024 * 1024       // 100MB
-	DefaultDiskMaxSize         = 10 * 1024 * 1024 * 1024 // 10GB
-	DefaultDiskMaxCount        = 100000                  // 100K items on disk
-	DefaultStreamToDiskSize    = 10 * 1024 * 1024        // 10MB
-	DefaultBufferSize          = 32 * 1024               // 32KB buffer size
+	DefaultDiskItemMaxSize     = 100 * 1024 * 1024                     // 100MB
+	DefaultDiskMaxSize         = 10 * 1024 * 1024 * 1024               // 10GB
+	DefaultDiskMaxCount        = 100000                                // 100K items on disk
+	DefaultStreamToDiskSize    = 10 * 1024 * 1024                      // 10MB
+	DefaultBufferSize          = 32 * 1024                             // 32KB buffer size
+	DefaultWPMuPluginEnabled   = true                                  // Enable mu-plugin management by default
+	DefaultWPMuPluginDir       = "/var/www/html/wp-content/mu-plugins" // Default mu-plugins directory
 )
 
 func (s *Sidekick) Provision(ctx caddy.Context) error {
@@ -593,6 +622,42 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 			zap.Int64("bytes", s.CacheMemoryStreamToDiskSize))
 	}
 
+	// Load WP mu-plugin configuration
+	// If not set by Caddyfile (which sets defaults in UnmarshalCaddyfile), set defaults
+	if s.WPMuPluginDir == "" {
+		s.WPMuPluginDir = DefaultWPMuPluginDir
+	}
+
+	// For the boolean, we need to check if it was explicitly set
+	// Since Go initializes bools to false, we can't tell if false was set explicitly
+	// or is just the zero value. So we'll use a special approach:
+	// 1. If UnmarshalCaddyfile was called, it already set the default
+	// 2. If not (direct struct creation), we need to set default
+	// 3. Environment variable always overrides
+
+	wpEnabledEnv := os.Getenv("SIDEKICK_WP_MU_PLUGIN_ENABLED")
+	if wpEnabledEnv != "" {
+		// Environment variable takes precedence
+		enabled, err := strconv.ParseBool(wpEnabledEnv)
+		if err != nil {
+			s.logger.Warn("Invalid SIDEKICK_WP_MU_PLUGIN_ENABLED value, using default",
+				zap.String("value", wpEnabledEnv),
+				zap.Bool("default", DefaultWPMuPluginEnabled))
+			s.WPMuPluginEnabled = DefaultWPMuPluginEnabled
+		} else {
+			s.WPMuPluginEnabled = enabled
+		}
+	} else if s.WPMuPluginDir == DefaultWPMuPluginDir && !s.WPMuPluginEnabled {
+		// If dir is default and enabled is false, this likely means struct was created
+		// directly without UnmarshalCaddyfile, so set the default
+		s.WPMuPluginEnabled = DefaultWPMuPluginEnabled
+	}
+
+	// Load WP mu-plugin directory from environment (overrides if set)
+	if wpDir := os.Getenv("SIDEKICK_WP_MU_PLUGIN_DIR"); wpDir != "" {
+		s.WPMuPluginDir = wpDir
+	}
+
 	// Load cache key configuration from environment
 	if len(s.CacheKeyHeaders) == 0 {
 		if envVal := os.Getenv("SIDEKICK_CACHE_KEY_HEADERS"); envVal != "" {
@@ -747,6 +812,12 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 
 	s.Storage = NewStorage(s.CacheDir, s.CacheTTL, memMaxSize, memMaxCount,
 		int(s.CacheDiskItemMaxSize), diskMaxSize, diskMaxCount, s.logger)
+
+	// Handle WordPress mu-plugins
+	if err := s.manageMuPlugins(); err != nil {
+		s.logger.Error("Failed to manage WordPress mu-plugins", zap.Error(err))
+		// Non-fatal error, continue
+	}
 
 	return nil
 }
@@ -1273,4 +1344,141 @@ func (nop *NopResponseWriter) Write(buf []byte) (int, error) {
 
 func (nop *NopResponseWriter) Header() http.Header {
 	return http.Header(*nop)
+}
+
+// manageMuPlugins handles the WordPress mu-plugin deployment/removal
+func (s *Sidekick) manageMuPlugins() error {
+	// Get list of embedded files
+	entries, err := fs.ReadDir(embeddedWPContent, "wp-content/mu-plugins")
+	if err != nil {
+		return fmt.Errorf("failed to read embedded mu-plugins: %w", err)
+	}
+
+	if s.WPMuPluginEnabled {
+		// Check if parent directory exists
+		parentDir := filepath.Dir(s.WPMuPluginDir)
+		if _, err := os.Stat(parentDir); os.IsNotExist(err) {
+			s.logger.Error("Cannot deploy mu-plugins: parent directory does not exist",
+				zap.String("parent_dir", parentDir),
+				zap.String("mu_plugin_dir", s.WPMuPluginDir))
+			return nil // Non-fatal
+		}
+
+		// Create mu-plugins directory if it doesn't exist
+		if _, err := os.Stat(s.WPMuPluginDir); os.IsNotExist(err) {
+			s.logger.Warn("Creating mu-plugins directory",
+				zap.String("path", s.WPMuPluginDir))
+			if err := os.MkdirAll(s.WPMuPluginDir, 0755); err != nil {
+				s.logger.Error("Failed to create mu-plugins directory",
+					zap.String("path", s.WPMuPluginDir),
+					zap.Error(err))
+				return nil // Non-fatal
+			}
+		}
+
+		// Deploy each file
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+
+			fileName := entry.Name()
+			srcPath := filepath.Join("wp-content/mu-plugins", fileName)
+			dstPath := filepath.Join(s.WPMuPluginDir, fileName)
+
+			// Read embedded file
+			embeddedData, err := fs.ReadFile(embeddedWPContent, srcPath)
+			if err != nil {
+				s.logger.Error("Failed to read embedded file",
+					zap.String("file", srcPath),
+					zap.Error(err))
+				continue
+			}
+
+			// Calculate embedded file checksum
+			embeddedHash := sha256.Sum256(embeddedData)
+			embeddedHashStr := hex.EncodeToString(embeddedHash[:])
+
+			// Check if file exists and compare checksums
+			shouldCopy := false
+			if diskData, err := os.ReadFile(dstPath); err == nil {
+				// File exists, check checksum
+				diskHash := sha256.Sum256(diskData)
+				diskHashStr := hex.EncodeToString(diskHash[:])
+
+				if embeddedHashStr != diskHashStr {
+					s.logger.Info("Updating mu-plugin file (checksum mismatch)",
+						zap.String("file", fileName),
+						zap.String("path", dstPath),
+						zap.String("embedded_hash", embeddedHashStr),
+						zap.String("disk_hash", diskHashStr))
+					shouldCopy = true
+				}
+			} else if os.IsNotExist(err) {
+				// File doesn't exist
+				s.logger.Info("Installing mu-plugin file",
+					zap.String("file", fileName),
+					zap.String("path", dstPath))
+				shouldCopy = true
+			} else {
+				// Other error reading file
+				s.logger.Error("Failed to read existing file",
+					zap.String("path", dstPath),
+					zap.Error(err))
+				continue
+			}
+
+			// Copy file if needed
+			if shouldCopy {
+				if err := os.WriteFile(dstPath, embeddedData, 0644); err != nil {
+					s.logger.Error("Failed to write mu-plugin file",
+						zap.String("path", dstPath),
+						zap.Error(err))
+					continue
+				}
+			}
+		}
+	} else {
+		// Option is disabled, check if we should remove files
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+
+			fileName := entry.Name()
+			srcPath := filepath.Join("wp-content/mu-plugins", fileName)
+			dstPath := filepath.Join(s.WPMuPluginDir, fileName)
+
+			// Read embedded file for checksum
+			embeddedData, err := fs.ReadFile(embeddedWPContent, srcPath)
+			if err != nil {
+				continue // Skip if we can't read embedded file
+			}
+
+			embeddedHash := sha256.Sum256(embeddedData)
+			embeddedHashStr := hex.EncodeToString(embeddedHash[:])
+
+			// Check if file exists on disk
+			if diskData, err := os.ReadFile(dstPath); err == nil {
+				// File exists, check if it matches our embedded version
+				diskHash := sha256.Sum256(diskData)
+				diskHashStr := hex.EncodeToString(diskHash[:])
+
+				if embeddedHashStr == diskHashStr {
+					// File matches, we created it, so remove it
+					s.logger.Warn("Removing mu-plugin file (option disabled)",
+						zap.String("file", fileName),
+						zap.String("path", dstPath))
+
+					if err := os.Remove(dstPath); err != nil {
+						s.logger.Error("Failed to remove mu-plugin file",
+							zap.String("path", dstPath),
+							zap.Error(err))
+					}
+				}
+			}
+		}
+	}
+
+	return nil
 }

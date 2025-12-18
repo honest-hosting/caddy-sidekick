@@ -23,7 +23,7 @@ build: lint ## Run 'docker composer build' to build caddy with plugin
 		docker rm $$CID >/dev/null
 .PHONY: build
 
-test: export TEST       ?= .*
+test: export TEST       ?= Test[^I]
 test: export TEST_DIR   ?= ./...
 test: export TEST_COUNT ?= 1
 test: test-setup ## Run basic unit tests: TEST=.* TEST_DIR=./... TEST_COUNT=1 make test
