@@ -6,8 +6,8 @@ services:
     image: caddy-sidekick-integration-test:latest
     container_name: sidekick-integration-test
     ports:
-      - "8080:80"
-      - "8443:443"
+      - "8989:80"
+      - "9443:443"
     volumes:
       - ./integration-test/cache:/var/www/cache
       - ./integration-test/html:/var/www/html:ro

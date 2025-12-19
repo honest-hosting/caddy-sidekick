@@ -6,6 +6,8 @@ require (
 	github.com/andybalholm/brotli v1.0.6
 	github.com/caddyserver/caddy/v2 v2.10.2
 	github.com/dustin/go-humanize v1.0.1
+	github.com/google/go-cmp v0.7.0
+	github.com/klauspost/compress v1.18.0
 	go.uber.org/zap v1.27.1
 )
 
@@ -57,7 +59,6 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a // indirect
 	github.com/jackc/pgx/v5 v5.6.0 // indirect
 	github.com/jackc/puddle/v2 v2.2.1 // indirect
-	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/libdns/libdns v1.1.1 // indirect
 	github.com/manifoldco/promptui v0.9.0 // indirect

@@ -12,7 +12,7 @@ import (
 var (
 	hdrResCacheList = []string{
 		"Accept-Ranges",
-		// "Content-Encoding",
+		"Content-Encoding",
 		"Content-Length",
 		"Content-Type",
 		"Location",

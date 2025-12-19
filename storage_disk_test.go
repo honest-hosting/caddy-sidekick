@@ -31,7 +31,7 @@ func TestDiskCacheStorage(t *testing.T) {
 	}
 
 	// Retrieve data
-	retrievedData, retrievedMetadata, err := storage.Get(key, "none")
+	retrievedData, retrievedMetadata, err := storage.Get(key)
 	if err != nil {
 		t.Fatalf("Failed to get data: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestDiskCacheEvictionByCount(t *testing.T) {
 	// First two items should be evicted
 	for i := 0; i < 2; i++ {
 		key := fmt.Sprintf("count-test-%d", i)
-		_, _, err := storage.Get(key, "none")
+		_, _, err := storage.Get(key)
 		if err != ErrCacheNotFound {
 			t.Errorf("Expected item %s to be evicted", key)
 		}
@@ -102,7 +102,7 @@ func TestDiskCacheEvictionByCount(t *testing.T) {
 	// Last three items should still exist
 	for i := 2; i < 5; i++ {
 		key := fmt.Sprintf("count-test-%d", i)
-		_, _, err := storage.Get(key, "none")
+		_, _, err := storage.Get(key)
 		if err != nil {
 			t.Errorf("Expected item %s to exist, got error: %v", key, err)
 		}
@@ -162,7 +162,7 @@ func TestDiskCacheEvictionBySize(t *testing.T) {
 
 	// At least the most recent item should exist
 	key := "size-test-4"
-	_, _, err := storage.Get(key, "none")
+	_, _, err := storage.Get(key)
 	if err != nil {
 		t.Errorf("Most recent item should exist, got error: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestMaxItemSizeDisk(t *testing.T) {
 	}
 
 	// Item should not be stored
-	_, _, err = storage.Get("too-large", "none")
+	_, _, err = storage.Get("too-large")
 	if err != ErrCacheNotFound {
 		t.Errorf("Expected ErrCacheNotFound, got %v", err)
 	}
@@ -199,7 +199,7 @@ func TestMaxItemSizeDisk(t *testing.T) {
 	}
 
 	// Should be retrievable
-	_, _, err = storage.Get("normal-size", "none")
+	_, _, err = storage.Get("normal-size")
 	if err != nil {
 		t.Errorf("Failed to retrieve normal-sized item: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestConcurrentDiskAccess(t *testing.T) {
 	for i := 0; i < numGoroutines; i++ {
 		for j := 0; j < numOperations; j++ {
 			key := fmt.Sprintf("concurrent-%d-%d", i, j)
-			if _, _, err := storage.Get(key, "none"); err == nil {
+			if _, _, err := storage.Get(key); err == nil {
 				successCount++
 			}
 		}
@@ -257,7 +257,7 @@ func TestConcurrentDiskAccess(t *testing.T) {
 			defer wg.Done()
 			key := fmt.Sprintf("concurrent-%d-0", id) // Read first item from each goroutine
 			for j := 0; j < 10; j++ {
-				_, _, _ = storage.Get(key, "none")
+				_, _, _ = storage.Get(key)
 			}
 		}(i)
 	}
@@ -335,7 +335,7 @@ func TestDiskCacheStartupPerformance(t *testing.T) {
 	// Verify some items can be retrieved
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("startup-test-%d", i)
-		if _, _, err := storage2.Get(key, "none"); err != nil {
+		if _, _, err := storage2.Get(key); err != nil {
 			t.Errorf("Failed to retrieve item after reload: %v", err)
 		}
 	}
@@ -401,7 +401,7 @@ func TestDiskSpacePressure(t *testing.T) {
 	// Most recent items should still be accessible
 	for i := 5; i < 10; i++ {
 		key := fmt.Sprintf("pressure-%d", i)
-		if _, _, err := storage.Get(key, "none"); err != nil {
+		if _, _, err := storage.Get(key); err != nil {
 			t.Logf("Recent item %s might have been evicted (this is acceptable)", key)
 		}
 	}
@@ -426,17 +426,17 @@ func TestLRUEvictionOrder(t *testing.T) {
 	}
 
 	// Access the first item to make it recently used
-	_, _, _ = storage.Get("lru-0", "none")
+	_, _, _ = storage.Get("lru-0")
 	time.Sleep(10 * time.Millisecond)
 
 	// Add a 4th item, should evict lru-1 (least recently used)
 	_ = storage.SetWithKey("lru-3", createTestMetadata(), generateTestData(smallDataSize))
 
 	// Check what's in cache
-	_, _, err0 := storage.Get("lru-0", "none")
-	_, _, err1 := storage.Get("lru-1", "none")
-	_, _, err2 := storage.Get("lru-2", "none")
-	_, _, err3 := storage.Get("lru-3", "none")
+	_, _, err0 := storage.Get("lru-0")
+	_, _, err1 := storage.Get("lru-1")
+	_, _, err2 := storage.Get("lru-2")
+	_, _, err3 := storage.Get("lru-3")
 
 	if err0 != nil {
 		t.Error("lru-0 should exist (was accessed recently)")
@@ -494,7 +494,7 @@ func TestCompressionStorage(t *testing.T) {
 	}
 
 	// Retrieve and verify data
-	retrievedData, _, err := storage.Get(key, "none")
+	retrievedData, _, err := storage.Get(key)
 	if err != nil {
 		t.Fatalf("Failed to retrieve compressed data: %v", err)
 	}
@@ -524,7 +524,7 @@ func TestCompressionStorage(t *testing.T) {
 	}
 
 	// Random data should not benefit from compression
-	retrievedRandom, _, err := storage.Get(key2, "none")
+	retrievedRandom, _, err := storage.Get(key2)
 	if err != nil {
 		t.Fatalf("Failed to retrieve random data: %v", err)
 	}
@@ -563,7 +563,7 @@ func TestDiskCacheMetadataHandling(t *testing.T) {
 	}
 
 	// Retrieve
-	retrievedData, retrievedMetadata, err := storage.Get(key, "none")
+	retrievedData, retrievedMetadata, err := storage.Get(key)
 	if err != nil {
 		t.Fatalf("Failed to retrieve data: %v", err)
 	}
@@ -605,7 +605,7 @@ func TestDiskCacheMetadataHandling(t *testing.T) {
 	storage2 := NewStorage(testCacheDir, testTTL, smallDataSize, 10, largeDataSize, largeDataSize*10, 100, logger)
 	// Wait for async index loading to complete
 	storage2.WaitForAsyncOps()
-	retrievedData2, retrievedMetadata2, err := storage2.Get(key, "none")
+	retrievedData2, retrievedMetadata2, err := storage2.Get(key)
 	if err != nil {
 		t.Fatalf("Failed to retrieve data after restart: %v", err)
 	}
@@ -663,7 +663,7 @@ func BenchmarkDiskCacheGet(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("bench-disk-%d", i%numKeys)
-		_, _, err := storage.Get(key, "none")
+		_, _, err := storage.Get(key)
 		if err != nil {
 			b.Fatalf("Failed to get data: %v", err)
 		}

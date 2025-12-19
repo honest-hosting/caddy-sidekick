@@ -305,17 +305,17 @@ func TestPurgeHandler(t *testing.T) {
 				key4 := generateCacheKey("/blog/post-2")
 
 				// These should be purged (matched by path in metadata)
-				if _, _, err := storage.Get(key1, "none"); err == nil {
+				if _, _, err := storage.Get(key1); err == nil {
 					t.Error("Expected /test-path-1 to be purged")
 				}
-				if _, _, err := storage.Get(key3, "none"); err == nil {
+				if _, _, err := storage.Get(key3); err == nil {
 					t.Error("Expected /blog/post-1 to be purged")
 				}
 				// These should remain
-				if _, _, err := storage.Get(key2, "none"); err != nil {
+				if _, _, err := storage.Get(key2); err != nil {
 					t.Error("Expected /test-path-2 to remain in cache")
 				}
-				if _, _, err := storage.Get(key4, "none"); err != nil {
+				if _, _, err := storage.Get(key4); err != nil {
 					t.Error("Expected /blog/post-2 to remain in cache")
 				}
 			},
@@ -339,17 +339,17 @@ func TestPurgeHandler(t *testing.T) {
 				key4 := generateCacheKey("/blog/post-2")
 
 				// Blog posts should be purged (matched by wildcard pattern in metadata)
-				if _, _, err := storage.Get(key3, "none"); err == nil {
+				if _, _, err := storage.Get(key3); err == nil {
 					t.Error("Expected /blog/post-1 to be purged")
 				}
-				if _, _, err := storage.Get(key4, "none"); err == nil {
+				if _, _, err := storage.Get(key4); err == nil {
 					t.Error("Expected /blog/post-2 to be purged")
 				}
 				// Test paths should remain
-				if _, _, err := storage.Get(key1, "none"); err != nil {
+				if _, _, err := storage.Get(key1); err != nil {
 					t.Error("Expected /test-path-1 to remain in cache")
 				}
-				if _, _, err := storage.Get(key2, "none"); err != nil {
+				if _, _, err := storage.Get(key2); err != nil {
 					t.Error("Expected /test-path-2 to remain in cache")
 				}
 			},
@@ -393,16 +393,16 @@ func TestPurgeHandler(t *testing.T) {
 				key3 := generateCacheKey("/blog/post-1")
 				key4 := generateCacheKey("/blog/post-2")
 
-				if _, _, err := storage.Get(key1, "none"); err != nil {
+				if _, _, err := storage.Get(key1); err != nil {
 					t.Error("Expected /test-path-1 to remain in cache")
 				}
-				if _, _, err := storage.Get(key2, "none"); err != nil {
+				if _, _, err := storage.Get(key2); err != nil {
 					t.Error("Expected /test-path-2 to remain in cache")
 				}
-				if _, _, err := storage.Get(key3, "none"); err != nil {
+				if _, _, err := storage.Get(key3); err != nil {
 					t.Error("Expected /blog/post-1 to remain in cache")
 				}
-				if _, _, err := storage.Get(key4, "none"); err != nil {
+				if _, _, err := storage.Get(key4); err != nil {
 					t.Error("Expected /blog/post-2 to remain in cache")
 				}
 			},
@@ -426,17 +426,17 @@ func TestPurgeHandler(t *testing.T) {
 				key4 := generateCacheKey("/blog/post-2")
 
 				// test-path-* and /blog/post-1 should be purged
-				if _, _, err := storage.Get(key1, "none"); err == nil {
+				if _, _, err := storage.Get(key1); err == nil {
 					t.Error("Expected /test-path-1 to be purged")
 				}
-				if _, _, err := storage.Get(key2, "none"); err == nil {
+				if _, _, err := storage.Get(key2); err == nil {
 					t.Error("Expected /test-path-2 to be purged")
 				}
-				if _, _, err := storage.Get(key3, "none"); err == nil {
+				if _, _, err := storage.Get(key3); err == nil {
 					t.Error("Expected /blog/post-1 to be purged")
 				}
 				// /blog/post-2 should remain
-				if _, _, err := storage.Get(key4, "none"); err != nil {
+				if _, _, err := storage.Get(key4); err != nil {
 					t.Error("Expected /blog/post-2 to remain in cache")
 				}
 			},
@@ -625,11 +625,11 @@ func TestPurgePathVariations(t *testing.T) {
 
 	// Verify all variations are in cache
 	for i, key := range storedKeys {
-		if _, _, err := s.Storage.Get(key, "none"); err != nil {
+		if _, _, err := s.Storage.Get(key); err != nil {
 			t.Errorf("Expected variation %d (%s) to be in cache before purge", i, variations[i].desc)
 		}
 	}
-	if _, _, err := s.Storage.Get(otherKey, "none"); err != nil {
+	if _, _, err := s.Storage.Get(otherKey); err != nil {
 		t.Error("Expected /api/posts to be in cache before purge")
 	}
 
@@ -650,13 +650,13 @@ func TestPurgePathVariations(t *testing.T) {
 
 	// Check that all variations of /api/users are purged
 	for i, key := range storedKeys {
-		if _, _, err := s.Storage.Get(key, "none"); err == nil {
+		if _, _, err := s.Storage.Get(key); err == nil {
 			t.Errorf("Expected variation %d (%s) to be purged", i, variations[i].desc)
 		}
 	}
 
 	// Check that /api/posts remains
-	if _, _, err := s.Storage.Get(otherKey, "none"); err != nil {
+	if _, _, err := s.Storage.Get(otherKey); err != nil {
 		t.Error("Expected /api/posts to remain in cache after purging /api/users")
 	}
 
@@ -748,16 +748,16 @@ func TestPurgeBackwardCompatibility(t *testing.T) {
 	_ = s.Storage.SetWithKey(withoutPathKey2, withoutPathMetadata2, []byte("data without path 2"))
 
 	// Verify all entries are in cache before purge
-	if _, _, err := s.Storage.Get(withPathKey1, "none"); err != nil {
+	if _, _, err := s.Storage.Get(withPathKey1); err != nil {
 		t.Error("Expected entry with path 1 to be in cache")
 	}
-	if _, _, err := s.Storage.Get(withPathKey2, "none"); err != nil {
+	if _, _, err := s.Storage.Get(withPathKey2); err != nil {
 		t.Error("Expected entry with path 2 to be in cache")
 	}
-	if _, _, err := s.Storage.Get(withoutPathKey1, "none"); err != nil {
+	if _, _, err := s.Storage.Get(withoutPathKey1); err != nil {
 		t.Error("Expected entry without path 1 to be in cache")
 	}
-	if _, _, err := s.Storage.Get(withoutPathKey2, "none"); err != nil {
+	if _, _, err := s.Storage.Get(withoutPathKey2); err != nil {
 		t.Error("Expected entry without path 2 to be in cache")
 	}
 
@@ -778,20 +778,20 @@ func TestPurgeBackwardCompatibility(t *testing.T) {
 
 	// Check results:
 	// - Entry with path="/api/users" should be purged
-	if _, _, err := s.Storage.Get(withPathKey1, "none"); err == nil {
+	if _, _, err := s.Storage.Get(withPathKey1); err == nil {
 		t.Error("Expected entry with path=/api/users to be purged")
 	}
 
 	// - Entry with path="/api/posts" should remain
-	if _, _, err := s.Storage.Get(withPathKey2, "none"); err != nil {
+	if _, _, err := s.Storage.Get(withPathKey2); err != nil {
 		t.Error("Expected entry with path=/api/posts to remain in cache")
 	}
 
 	// - Entries without Path should remain (backward compatibility)
-	if _, _, err := s.Storage.Get(withoutPathKey1, "none"); err != nil {
+	if _, _, err := s.Storage.Get(withoutPathKey1); err != nil {
 		t.Error("Expected entry without path 1 to remain in cache (backward compatibility)")
 	}
-	if _, _, err := s.Storage.Get(withoutPathKey2, "none"); err != nil {
+	if _, _, err := s.Storage.Get(withoutPathKey2); err != nil {
 		t.Error("Expected entry without path 2 to remain in cache (backward compatibility)")
 	}
 
@@ -813,18 +813,18 @@ func TestPurgeBackwardCompatibility(t *testing.T) {
 	}
 
 	// Both /api/users and /api/posts should be purged
-	if _, _, err := s.Storage.Get(withPathKey1, "none"); err == nil {
+	if _, _, err := s.Storage.Get(withPathKey1); err == nil {
 		t.Error("Expected entry with path=/api/users to be purged by wildcard")
 	}
-	if _, _, err := s.Storage.Get(withPathKey2, "none"); err == nil {
+	if _, _, err := s.Storage.Get(withPathKey2); err == nil {
 		t.Error("Expected entry with path=/api/posts to be purged by wildcard")
 	}
 
 	// Entries without Path should still remain
-	if _, _, err := s.Storage.Get(withoutPathKey1, "none"); err != nil {
+	if _, _, err := s.Storage.Get(withoutPathKey1); err != nil {
 		t.Error("Expected entry without path 1 to remain after wildcard purge")
 	}
-	if _, _, err := s.Storage.Get(withoutPathKey2, "none"); err != nil {
+	if _, _, err := s.Storage.Get(withoutPathKey2); err != nil {
 		t.Error("Expected entry without path 2 to remain after wildcard purge")
 	}
 

@@ -119,6 +119,13 @@ func (r *ResponseWriter) Close() error {
 				return
 			}
 
+			// Debug logging for caching
+			contentEncoding := hdr.Get("Content-Encoding")
+			r.Debug("Preparing to cache response",
+				zap.String("path", r.origUrl.Path),
+				zap.String("contentEncoding", contentEncoding),
+				zap.Int("status", int(atomic.LoadInt32(&r.status))))
+
 			// Get the data to cache
 			var dataToCache []byte
 			if r.isStreaming && r.tempFile != nil {
@@ -140,6 +147,12 @@ func (r *ResponseWriter) Close() error {
 				copy(dataToCache, r.buffer.Bytes())
 				r.bufMu.Unlock()
 			}
+
+			// Debug what we're caching
+			r.Debug("Storing data in cache",
+				zap.String("key", r.cacheKey),
+				zap.Int("dataSize", len(dataToCache)),
+				zap.Bool("isStreaming", r.isStreaming))
 
 			// Store in cache using the cache key we built
 			cacheErr = r.SetWithKey(r.cacheKey, meta, dataToCache)

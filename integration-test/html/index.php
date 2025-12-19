@@ -57,7 +57,7 @@ switch ($path) {
 </head>
 <body>
     <h1>Caddy Sidekick Integration Test</h1>
-    <p>Timestamp: ' . date('Y-m-d H:i:s') . '</p>
+    <p>Timestamp: ' . date('Y-m-d H:i:s.u') . '</p>
     <p>Request ID: ' . uniqid() . '</p>
     <ul>
         <li><a href="/cacheable">Cacheable Content</a></li>
@@ -171,7 +171,7 @@ switch ($path) {
         // Dynamic content based on query parameters
         $name = isset($query['name']) ? htmlspecialchars($query['name']) : 'Guest';
         $page = isset($query['page']) ? intval($query['page']) : 1;
-        
+
         htmlResponse('<!DOCTYPE html>
 <html>
 <head>
@@ -244,7 +244,7 @@ switch ($path) {
         // Support for conditional requests (ETag/Last-Modified)
         $etag = '"resource-v1-' . date('Ymd') . '"';
         $lastModified = gmdate('D, d M Y 00:00:00') . ' GMT';
-        
+
         // Check If-None-Match
         if (isset($_SERVER['HTTP_IF_NONE_MATCH']) && $_SERVER['HTTP_IF_NONE_MATCH'] === $etag) {
             http_response_code(304);
@@ -252,7 +252,7 @@ switch ($path) {
             header('Cache-Control: public, max-age=3600');
             exit;
         }
-        
+
         // Check If-Modified-Since
         if (isset($_SERVER['HTTP_IF_MODIFIED_SINCE']) && $_SERVER['HTTP_IF_MODIFIED_SINCE'] === $lastModified) {
             http_response_code(304);
@@ -260,7 +260,7 @@ switch ($path) {
             header('Cache-Control: public, max-age=3600');
             exit;
         }
-        
+
         htmlResponse('<!DOCTYPE html>
 <html>
 <head>

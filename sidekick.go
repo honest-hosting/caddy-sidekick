@@ -865,25 +865,12 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	// Build cache key with configurable components
 	cacheKey := s.buildCacheKey(r)
 
-	requestEncoding := strings.Split(strings.Join(reqHdr["Accept-Encoding"], ""), ",")
-	if len(requestEncoding) == 1 && len(requestEncoding[0]) == 0 {
-		requestEncoding = nil
-	}
-	requestEncoding = append(requestEncoding, "none")
+	// Parse Accept-Encoding header
+	requestEncoding := strings.Split(strings.Join(reqHdr["Accept-Encoding"], ","), ",")
 
 	// Try to get from cache with read lock
 	s.syncHandler.cacheMu.RLock()
-	var cacheData []byte
-	var cacheMeta *Metadata
-	var err error
-	ce := ""
-	for _, re := range requestEncoding {
-		ce = strings.TrimSpace(re)
-		cacheData, cacheMeta, err = storage.Get(cacheKey, ce)
-		if err == nil {
-			break
-		}
-	}
+	cacheData, cacheMeta, err := storage.Get(cacheKey)
 	s.syncHandler.cacheMu.RUnlock()
 
 	if err == nil {
@@ -893,23 +880,134 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 			return nil
 		}
 
+		// Check if the cached data already has Content-Encoding
+		var cachedEncoding string
+		for _, kv := range cacheMeta.Header {
+			if len(kv) == 2 && kv[0] == "Content-Encoding" {
+				cachedEncoding = kv[1]
+				break
+			}
+		}
+
+		var selectedEncoding string
+		dataToServe := cacheData
+
+		// Debug logging
+		s.logger.Debug("Processing cached response",
+			zap.String("path", r.URL.Path),
+			zap.String("cachedEncoding", cachedEncoding),
+			zap.Strings("requestedEncodings", requestEncoding),
+			zap.Int("cacheDataSize", len(cacheData)))
+
+		// If cached data already has an encoding
+		if cachedEncoding != "" && cachedEncoding != "identity" {
+			// Check if client accepts this encoding
+			clientAccepts := false
+			for _, enc := range requestEncoding {
+				enc = strings.TrimSpace(enc)
+				if idx := strings.Index(enc, ";"); idx != -1 {
+					enc = enc[:idx]
+				}
+				if enc == cachedEncoding || enc == "*" {
+					clientAccepts = true
+					break
+				}
+			}
+
+			if clientAccepts {
+				// Client accepts the cached encoding, serve as-is
+				selectedEncoding = cachedEncoding
+				dataToServe = cacheData
+				s.logger.Debug("Serving cached data with existing encoding",
+					zap.String("encoding", cachedEncoding))
+			} else {
+				// Client doesn't accept the cached encoding
+				// For now, serve uncompressed (we'd need to decompress first to recompress)
+				// This is a rare edge case
+				selectedEncoding = ""
+				dataToServe = cacheData
+				s.logger.Debug("Client doesn't accept cached encoding, serving anyway",
+					zap.String("cachedEncoding", cachedEncoding))
+			}
+		} else {
+			// Cached data is not compressed, compress based on client preference
+			for _, enc := range requestEncoding {
+				enc = strings.TrimSpace(enc)
+				if idx := strings.Index(enc, ";"); idx != -1 {
+					enc = enc[:idx]
+				}
+
+				switch enc {
+				case "br", "gzip", "zstd":
+					// Try to compress with this encoding
+					if compressed, err := CompressForClient(cacheData, enc); err == nil {
+						dataToServe = compressed
+						selectedEncoding = enc
+						s.logger.Debug("Compressed cached data",
+							zap.String("encoding", enc),
+							zap.Int("originalSize", len(cacheData)),
+							zap.Int("compressedSize", len(compressed)))
+						goto serveResponse
+					}
+				case "identity", "*":
+					// Client accepts uncompressed
+					selectedEncoding = ""
+					goto serveResponse
+				}
+			}
+			// If no encoding matched, serve uncompressed
+			selectedEncoding = ""
+		}
+
+	serveResponse:
 		// Serve from cache
 		hdr.Set(CacheHeaderName, "HIT")
 		hdr.Set("Vary", "Accept-Encoding")
-		if ce != "none" {
-			hdr.Set("Content-Encoding", ce)
+		if selectedEncoding != "" {
+			hdr.Set("Content-Encoding", selectedEncoding)
 		}
-		// set header back
+
+		s.logger.Debug("Serving cached response",
+			zap.String("path", r.URL.Path),
+			zap.String("selectedEncoding", selectedEncoding),
+			zap.Int("dataSize", len(dataToServe)),
+			zap.Bool("isCompressed", selectedEncoding != ""))
+
+		// Log first few bytes to debug compression
+		if len(dataToServe) > 0 {
+			preview := dataToServe
+			if len(preview) > 20 {
+				preview = preview[:20]
+			}
+			s.logger.Debug("Response data preview",
+				zap.String("encoding", selectedEncoding),
+				zap.ByteString("first_bytes", preview),
+				zap.String("hex", fmt.Sprintf("%x", preview)))
+		}
+
+		// Set headers from cache metadata
 		for _, kv := range cacheMeta.Header {
 			if len(kv) != 2 {
 				continue
 			}
+			// Skip Content-Encoding and Content-Length as we handle them
+			if kv[0] == "Content-Encoding" || kv[0] == "Content-Length" {
+				continue
+			}
 			hdr.Set(kv[0], kv[1])
 		}
+
+		// Set correct Content-Length for the data we're sending
+		hdr.Set("Content-Length", strconv.Itoa(len(dataToServe)))
+
 		w.WriteHeader(cacheMeta.StateCode)
-		_, writeErr := w.Write(cacheData)
+		bytesWritten, writeErr := w.Write(dataToServe)
 		if writeErr != nil {
 			s.logger.Error("Error writing cached response", zap.Error(writeErr))
+		} else {
+			s.logger.Debug("Wrote response",
+				zap.Int("bytesWritten", bytesWritten),
+				zap.Int("expectedBytes", len(dataToServe)))
 		}
 
 		return nil

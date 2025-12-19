@@ -13,6 +13,12 @@
 }
 
 :80 {
+	# Set up root directory
+	root * /var/www/html
+	encode br zstd gzip {
+		minimum_length 100
+	}
+
 	# Enable sidekick caching with test configuration
 	sidekick {
 		# Cache storage location
@@ -56,8 +62,6 @@
 		cache_key_cookies test_session wordpress_logged_in_*
 	}
 
-	# Set up root directory
-	root * /var/www/html
 	php_server
 	file_server
 

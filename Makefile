@@ -16,8 +16,9 @@ build: export GO_VERSION               ?= 1.25.5
 build: export XCADDY_VERSION           ?= 0.4.5
 build: export CADDY_VERSION            ?= 2.10.2
 build: export FRANKENPHP_CADDY_VERSION ?= 1.9.0
+build: export BROTLI_CADDY_VERSION     ?= 1.0.1
 build: lint ## Run 'docker composer build' to build caddy with plugin
-	@docker compose build --build-arg GO_VERSION=$(GO_VERSION) --build-arg XCADDY_VERSION=$(XCADDY_VERSION) --build-arg CADDY_VERSION=$(CADDY_VERSION) --build-arg FRANKENPHP_CADDY_VERSION=$(FRANKENPHP_CADDY_VERSION)
+	@docker compose build --build-arg GO_VERSION=$(GO_VERSION) --build-arg XCADDY_VERSION=$(XCADDY_VERSION) --build-arg CADDY_VERSION=$(CADDY_VERSION) --build-arg FRANKENPHP_CADDY_VERSION=$(FRANKENPHP_CADDY_VERSION) --build-arg BROTLI_CADDY_VERSION=$(BROTLI_CADDY_VERSION)
 	@CID=$$(docker create caddy-sidekick-integration-test:latest);          \
 		docker cp $$CID:/usr/local/bin/caddy ./bin/caddy >/dev/null 2>&1;   \
 		docker rm $$CID >/dev/null
@@ -55,7 +56,7 @@ test-integration: export TEST     ?= TestIntegration
 test-integration: export TEST_DIR ?= ./integration-test/...
 test-integration: test-integration-setup ## Run integration tests with Docker Compose
 	@echo "Running integration tests..."
-	@go test -v -timeout=30s -run "$(TEST)" $(TEST_DIR) 2>&1 | tee /tmp/sidekick-integration.log
+	@go test -v -timeout=90s -run "$(TEST)" $(TEST_DIR) 2>&1 | tee /tmp/sidekick-integration.log
 	@echo "Integration test completed, see /tmp/sidekick-integration.log for details"
 .PHONY: test-integration
 

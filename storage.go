@@ -135,7 +135,7 @@ func (s *Storage) cleanupKeyMutex(key string) {
 	delete(s.keyMutexes, key)
 }
 
-func (s *Storage) Get(key string, ce string) ([]byte, *Metadata, error) {
+func (s *Storage) Get(key string) ([]byte, *Metadata, error) {
 	// Get key-specific lock for reading
 	keyMu := s.getKeyMutex(key)
 	keyMu.RLock()

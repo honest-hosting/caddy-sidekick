@@ -73,7 +73,7 @@ func TestMemoryCacheStorage(t *testing.T) {
 	}
 
 	// Retrieve data
-	retrievedData, retrievedMetadata, err := storage.Get(key, "none")
+	retrievedData, retrievedMetadata, err := storage.Get(key)
 	if err != nil {
 		t.Fatalf("Failed to get data: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestStorageMemoryCacheEvictionByCount(t *testing.T) {
 	// First items should be evicted (LRU)
 	for i := 0; i < 2; i++ {
 		key := fmt.Sprintf("count-test-%d", i)
-		_, _, err := storage.Get(key, "none")
+		_, _, err := storage.Get(key)
 		if err != ErrCacheNotFound {
 			t.Errorf("Expected item %s to be evicted from memory", key)
 		}
@@ -130,7 +130,7 @@ func TestStorageMemoryCacheEvictionByCount(t *testing.T) {
 	// Last items should still be in memory
 	for i := 2; i < 5; i++ {
 		key := fmt.Sprintf("count-test-%d", i)
-		_, _, err := storage.Get(key, "none")
+		_, _, err := storage.Get(key)
 		if err != nil {
 			t.Errorf("Expected item %s to be in cache, got error: %v", key, err)
 		}
@@ -170,7 +170,7 @@ func TestMemoryCacheEvictionBySize(t *testing.T) {
 
 	// At least the most recent item should be in memory
 	key := "size-test-4"
-	_, _, err := storage.Get(key, "none")
+	_, _, err := storage.Get(key)
 	if err != nil {
 		t.Errorf("Most recent item should be accessible, got error: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestCacheLifetime(t *testing.T) {
 	}
 
 	// Should be retrievable immediately
-	_, _, err = storage.Get(key, "none")
+	_, _, err = storage.Get(key)
 	if err != nil {
 		t.Errorf("Data should be retrievable immediately after setting: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestCacheLifetime(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Should return expired error
-	_, _, err = storage.Get(key, "none")
+	_, _, err = storage.Get(key)
 	if err != ErrCacheExpired {
 		t.Errorf("Expected ErrCacheExpired after TTL, got: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestCacheLifetime(t *testing.T) {
 	storage.WaitForAsyncOps()
 
 	// Should be completely gone now
-	_, _, err = storage.Get(key, "none")
+	_, _, err = storage.Get(key)
 	if err != ErrCacheNotFound {
 		t.Errorf("Expected ErrCacheNotFound after cleanup, got: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestMaxItemSizeMemory(t *testing.T) {
 	}
 
 	// Should be retrievable
-	_, _, err = storage.Get("normal-size", "none")
+	_, _, err = storage.Get("normal-size")
 	if err != nil {
 		t.Errorf("Failed to retrieve normal-sized item: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestConcurrentMemoryAccess(t *testing.T) {
 	for i := 0; i < numGoroutines; i++ {
 		for j := 0; j < numOperations; j++ {
 			key := fmt.Sprintf("concurrent-%d-%d", i, j)
-			if _, _, err := storage.Get(key, "none"); err == nil {
+			if _, _, err := storage.Get(key); err == nil {
 				successCount++
 			}
 		}
@@ -303,7 +303,7 @@ func TestConcurrentMemoryAccess(t *testing.T) {
 			defer wg.Done()
 			key := fmt.Sprintf("concurrent-%d-0", id)
 			for j := 0; j < 10; j++ {
-				_, _, _ = storage.Get(key, "none")
+				_, _, _ = storage.Get(key)
 			}
 		}(i)
 	}
@@ -432,7 +432,7 @@ func BenchmarkStorageMemoryCacheGet(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("bench-%d", i%numKeys)
-		_, _, err := storage.Get(key, "none")
+		_, _, err := storage.Get(key)
 		if err != nil {
 			b.Fatalf("Failed to get data: %v", err)
 		}
@@ -465,7 +465,7 @@ func BenchmarkConcurrentMixedOperations(b *testing.B) {
 				_ = storage.SetWithKey(key, metadata, data)
 			} else {
 				// Get operation
-				_, _, _ = storage.Get(key, "none")
+				_, _, _ = storage.Get(key)
 			}
 			i++
 		}
@@ -570,7 +570,7 @@ func TestMemoryLeaks(t *testing.T) {
 		// Read items
 		for i := 0; i < 100; i++ {
 			key := fmt.Sprintf("leak-test-%d-%d", cycle, i)
-			_, _, _ = storage.Get(key, "none")
+			_, _, _ = storage.Get(key)
 		}
 
 		// Delete some items
@@ -644,7 +644,7 @@ func TestEdgeCases(t *testing.T) {
 	}
 
 	// Test Get non-existent key
-	_, _, err = storage.Get("non-existent-key", "none")
+	_, _, err = storage.Get("non-existent-key")
 	if err != ErrCacheNotFound {
 		t.Errorf("Expected ErrCacheNotFound for non-existent key, got: %v", err)
 	}
@@ -683,7 +683,7 @@ func BenchmarkHighConcurrency(b *testing.B) {
 			case 1: // 10% deletes
 				_ = storage.Purge(key)
 			default: // 80% reads
-				_, _, _ = storage.Get(key, "none")
+				_, _, _ = storage.Get(key)
 			}
 			i++
 		}

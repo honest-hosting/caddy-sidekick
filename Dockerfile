@@ -1,10 +1,11 @@
 # Multi-stage build for Caddy with FrankenPHP and Sidekick module
-FROM dunglas/frankenphp:php8.3-bookworm AS builder
+FROM dunglas/frankenphp:builder-php8.3-bookworm AS builder
 
 ARG GO_VERSION
 ARG XCADDY_VERSION
 ARG CADDY_VERSION
 ARG FRANKENPHP_CADDY_VERSION
+ARG BROTLI_CADDY_VERSION
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -45,6 +46,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Build Caddy with FrankenPHP and Sidekick module
 RUN CGO_ENABLED=1 XCADDY_SETCAP=1 XCADDY_GO_BUILD_FLAGS='-ldflags="-w -s" -tags=nobadger,nomysql,nopgx,nowatcher' CGO_CFLAGS=$(php-config --includes) CGO_LDFLAGS="$(php-config --ldflags) $(php-config --libs)" xcaddy build v${CADDY_VERSION} \
     --with github.com/dunglas/frankenphp/caddy@v${FRANKENPHP_CADDY_VERSION} \
+    --with github.com/dunglas/caddy-cbrotli@v${BROTLI_CADDY_VERSION}        \
     --with github.com/honest-hosting/caddy-sidekick=/sidekick               \
     --output /usr/local/bin/caddy
 
