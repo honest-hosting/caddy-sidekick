@@ -5,11 +5,21 @@ import (
 	"net/http"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"go.uber.org/zap"
 )
 
 func init() {
 	caddy.RegisterModule(AdminMetrics{})
+	httpcaddyfile.RegisterGlobalOption("sidekick_metrics", parseSidekickMetrics)
+}
+
+// parseSidekickMetrics parses the global sidekick_metrics option in Caddyfile
+func parseSidekickMetrics(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) {
+	// This global option enables the admin metrics module
+	// The actual configuration happens in the sidekick handler
+	return true, nil
 }
 
 // AdminMetrics is a Caddy admin module that exposes sidekick metrics
@@ -29,18 +39,17 @@ func (AdminMetrics) CaddyModule() caddy.ModuleInfo {
 func (am *AdminMetrics) Provision(ctx caddy.Context) error {
 	am.logger = ctx.Logger(am)
 
-	// Ensure metrics collector is initialized
-	metrics := GetOrCreateGlobalMetrics(am.logger)
-	if metrics != nil {
-		am.logger.Info("Sidekick metrics admin endpoint provisioned at /metrics/sidekick")
-	}
+	// Admin routes will be registered, but will check metrics availability when serving
+	am.logger.Info("Sidekick metrics admin endpoints registered",
+		zap.String("prometheus", "/metrics/sidekick"),
+		zap.String("stats", "/metrics/sidekick/stats"))
 
 	return nil
 }
 
 // Routes returns the routes for the admin API.
 func (am *AdminMetrics) Routes() []caddy.AdminRoute {
-	// Always return routes when the module is loaded
+	// Always register routes - we'll check if metrics are initialized when serving
 	return []caddy.AdminRoute{
 		{
 			Pattern: "/metrics/sidekick",
@@ -65,8 +74,8 @@ func (am *AdminMetrics) serveMetrics(w http.ResponseWriter, r *http.Request) err
 	metrics := GetMetrics()
 	if metrics == nil {
 		return caddy.APIError{
-			HTTPStatus: http.StatusServiceUnavailable,
-			Message:    "metrics not initialized",
+			HTTPStatus: http.StatusNotFound,
+			Message:    "metrics not enabled - add 'metrics /metrics/sidekick' to your sidekick configuration",
 		}
 	}
 
@@ -87,8 +96,8 @@ func (am *AdminMetrics) serveStats(w http.ResponseWriter, r *http.Request) error
 	metrics := GetMetrics()
 	if metrics == nil {
 		return caddy.APIError{
-			HTTPStatus: http.StatusServiceUnavailable,
-			Message:    "metrics not initialized",
+			HTTPStatus: http.StatusNotFound,
+			Message:    "metrics not enabled - add 'metrics /metrics/sidekick' to your sidekick configuration",
 		}
 	}
 

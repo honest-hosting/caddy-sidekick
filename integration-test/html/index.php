@@ -6,6 +6,7 @@
 
 // Set default timezone
 date_default_timezone_set('UTC');
+$now = DateTime::createFromFormat('U.u', microtime(true));
 
 // Get request path and method
 $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
@@ -57,7 +58,7 @@ switch ($path) {
 </head>
 <body>
     <h1>Caddy Sidekick Integration Test</h1>
-    <p>Timestamp: ' . date('Y-m-d H:i:s.u') . '</p>
+    <p>Timestamp: ' . $now->format('Y-m-d H:i:s.u') . '</p>
     <p>Request ID: ' . uniqid() . '</p>
     <ul>
         <li><a href="/cacheable">Cacheable Content</a></li>
@@ -84,7 +85,7 @@ switch ($path) {
 </head>
 <body>
     <h1>This content is cacheable</h1>
-    <p>Generated at: ' . date('Y-m-d H:i:s.u') . '</p>
+    <p>Generated at: ' . $now->format('Y-m-d H:i:s.u') . '</p>
     <p>Unique ID: ' . uniqid() . '</p>
     <p>This page should be cached and subsequent requests should show the same timestamp and ID.</p>
 </body>
@@ -103,7 +104,7 @@ switch ($path) {
 </head>
 <body>
     <h1>This content is NOT cacheable</h1>
-    <p>Generated at: ' . date('Y-m-d H:i:s.u') . '</p>
+    <p>Generated at: ' . $now->format('Y-m-d H:i:s.u') . '</p>
     <p>Unique ID: ' . uniqid() . '</p>
     <p>This page should never be cached. Each request should show a different timestamp and ID.</p>
 </body>
@@ -119,7 +120,7 @@ switch ($path) {
         // JSON API endpoint - cacheable
         jsonResponse([
             'timestamp' => time(),
-            'date' => date('Y-m-d H:i:s.u'),
+            'date' => $now->format('Y-m-d H:i:s.u'),
             'data' => [
                 'id' => uniqid(),
                 'value' => rand(1, 1000),
@@ -135,7 +136,7 @@ switch ($path) {
         // JSON API endpoint - non-cacheable
         jsonResponse([
             'timestamp' => microtime(true),
-            'date' => date('Y-m-d H:i:s.u'),
+            'date' => $now->format('Y-m-d H:i:s.u'),
             'realtime' => [
                 'id' => uniqid(),
                 'random' => rand(1, 1000000),
@@ -157,7 +158,7 @@ switch ($path) {
 <body>
     <h1>Static Content Page</h1>
     <p>This page simulates static content that rarely changes.</p>
-    <p>Generated: ' . date('Y-m-d H:i:s.u') . '</p>
+    <p>Generated: ' . $now->format('Y-m-d H:i:s.u') . '</p>
     <p>Version: 1.0.0</p>
 </body>
 </html>', 200, [
@@ -180,7 +181,7 @@ switch ($path) {
 <body>
     <h1>Hello, ' . $name . '!</h1>
     <p>You are viewing page ' . $page . '</p>
-    <p>Generated at: ' . date('Y-m-d H:i:s.u') . '</p>
+    <p>Generated at: ' . $now->format('Y-m-d H:i:s.u') . '</p>
     <p>Session: ' . uniqid() . '</p>
 </body>
 </html>', 200, [
@@ -202,7 +203,7 @@ switch ($path) {
 <body>
     <h1>404 - Page Not Found</h1>
     <p>The page you requested does not exist.</p>
-    <p>Error generated at: ' . date('Y-m-d H:i:s.u') . '</p>
+    <p>Error generated at: ' . $now->format('Y-m-d H:i:s.u') . '</p>
 </body>
 </html>', 404, [
             'Cache-Control' => 'public, max-age=300',
@@ -221,7 +222,7 @@ switch ($path) {
     <h1>500 - Internal Server Error</h1>
     <p>Something went wrong on the server.</p>
     <p>Error ID: ' . uniqid() . '</p>
-    <p>Time: ' . date('Y-m-d H:i:s.u') . '</p>
+    <p>Time: ' . $now->format('Y-m-d H:i:s.u') . '</p>
 </body>
 </html>', 500, [
             'Cache-Control' => 'no-cache, no-store',
@@ -313,7 +314,7 @@ switch ($path) {
 <body>
     <h1>WordPress Admin Area</h1>
     <p>This should never be cached (nocache path).</p>
-    <p>Time: ' . date('Y-m-d H:i:s.u') . '</p>
+    <p>Time: ' . $now->format('Y-m-d H:i:s.u') . '</p>
 </body>
 </html>', 200, [
             'Cache-Control' => 'no-cache, no-store',
@@ -327,7 +328,7 @@ switch ($path) {
                 ['id' => 1, 'title' => 'Post 1', 'time' => microtime(true)],
                 ['id' => 2, 'title' => 'Post 2', 'time' => microtime(true)]
             ],
-            'generated' => date('Y-m-d H:i:s.u')
+            'generated' => $now->format('Y-m-d H:i:s.u')
         ], 200, [
             'Cache-Control' => 'no-cache',
             'X-Test-Type' => 'wp-json'
@@ -352,7 +353,7 @@ switch ($path) {
 <body>
     <h1>Large File Test</h1>
     <p>This is a test file of approximately ' . $sizeMB . 'MB (' . number_format($sizeBytes) . ' bytes)</p>
-    <p>Generated at: ' . date('Y-m-d H:i:s.u') . '</p>
+    <p>Generated at: ' . $now->format('Y-m-d H:i:s.u') . '</p>
     <p>Unique ID: ' . uniqid() . '</p>
     <hr>
     <div id="content">
@@ -396,7 +397,7 @@ switch ($path) {
     default:
         // Handle paths starting with /path/ for testing wildcard purging
         if (strpos($path, '/path/') === 0) {
-            textResponse('Dynamic path content: ' . $path . ' at ' . date('Y-m-d H:i:s.u'), 200, [
+            textResponse('Dynamic path content: ' . $path . ' at ' . $now->format('Y-m-d H:i:s.u'), 200, [
                 'Cache-Control' => 'public, max-age=600',
                 'X-Test-Type' => 'dynamic-path',
                 'X-Test-Path' => $path

@@ -38,6 +38,7 @@ type Sidekick struct {
 	PurgeURI           string   `json:"purge_uri,omitempty"`
 	PurgeHeader        string   `json:"purge_header,omitempty"`
 	PurgeToken         string   `json:"purge_token,omitempty"`
+	Metrics            string   `json:"metrics,omitempty"`       // Admin API path to expose metrics (e.g., "/metrics/sidekick")
 	NoCache            []string `json:"nocache,omitempty"`       // Path prefixes to bypass
 	NoCacheRegex       string   `json:"nocache_regex,omitempty"` // Regex pattern to bypass
 	NoCacheHome        bool     `json:"nocache_home,omitempty"`  // Whether to skip caching home page
@@ -87,10 +88,6 @@ type SyncHandler struct {
 func init() {
 	caddy.RegisterModule(Sidekick{})
 	httpcaddyfile.RegisterHandlerDirective("sidekick", parseCaddyfileHandler)
-
-	// Initialize metrics early so they're registered with Caddy's default registry
-	// This ensures they appear in Caddy's /metrics endpoint on the admin port
-	_ = GetOrCreateGlobalMetrics(zap.NewNop())
 }
 
 func parseCaddyfileHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler,
@@ -344,6 +341,17 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			case "wp_mu_plugin_dir":
 				s.WPMuPluginDir = value
 
+			case "metrics":
+				// Validate that it's an absolute path with only allowed chars
+				if !strings.HasPrefix(value, "/") {
+					return d.Errf("metrics path must be an absolute path starting with /")
+				}
+				metricsURIRegex := regexp.MustCompile(`^/[a-z0-9\-/_]*$`)
+				if !metricsURIRegex.MatchString(value) {
+					return d.Errf("metrics path can only contain lowercase letters, numbers, hyphens, underscores, and forward slashes")
+				}
+				s.Metrics = value
+
 			default:
 				return d.Errf("unknown subdirective: %s", key)
 			}
@@ -381,13 +389,6 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 		inFlight: make(map[string]*sync.Once),
 	}
 
-	// Initialize global metrics collector
-	// The admin.api.sidekick_metrics module will expose these at /metrics/sidekick
-	metrics := GetOrCreateGlobalMetrics(s.logger)
-	if metrics != nil {
-		s.logger.Info("Sidekick cache metrics initialized - available at admin API /metrics/sidekick")
-	}
-
 	// Validate mutually exclusive options
 	if s.CacheMemoryMaxSize != 0 && s.CacheMemoryMaxPercent != 0 {
 		return fmt.Errorf("cache_memory_max_size and cache_memory_max_percent are mutually exclusive")
@@ -404,6 +405,20 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 	}
 
 	// Load from environment variables with SIDEKICK_ prefix
+	if s.Metrics == "" {
+		s.Metrics = os.Getenv("SIDEKICK_METRICS")
+		// Validate metrics path if provided via environment
+		if s.Metrics != "" {
+			if !strings.HasPrefix(s.Metrics, "/") {
+				return fmt.Errorf("metrics path from SIDEKICK_METRICS must be an absolute path starting with /")
+			}
+			metricsURIRegex := regexp.MustCompile(`^/[a-z0-9\-/_]*$`)
+			if !metricsURIRegex.MatchString(s.Metrics) {
+				return fmt.Errorf("metrics path from SIDEKICK_METRICS can only contain lowercase letters, numbers, hyphens, underscores, and forward slashes")
+			}
+		}
+	}
+
 	if s.CacheDir == "" {
 		s.CacheDir = os.Getenv("SIDEKICK_CACHE_DIR")
 		if s.CacheDir == "" {
@@ -824,6 +839,19 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 
 	s.Storage = NewStorage(s.CacheDir, s.CacheTTL, int(s.CacheMemoryItemMaxSize), memMaxSize, memMaxCount,
 		int(s.CacheDiskItemMaxSize), diskMaxSize, diskMaxCount, s.logger)
+
+	// Initialize global metrics collector only if metrics path is configured
+	if s.Metrics != "" {
+		metrics := GetOrCreateGlobalMetrics(s.logger)
+		if metrics != nil {
+			s.logger.Info("Sidekick cache metrics initialized",
+				zap.String("configured_path", s.Metrics),
+				zap.String("admin_api_endpoint", "/metrics/sidekick"),
+				zap.String("caddy_metrics_endpoint", "/metrics"))
+		}
+	} else {
+		s.logger.Debug("Sidekick metrics disabled - no metrics path configured")
+	}
 
 	// Start metrics updater if metrics are enabled
 	metricsCollector := GetMetrics()

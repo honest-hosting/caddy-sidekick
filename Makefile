@@ -17,7 +17,7 @@ build: export XCADDY_VERSION           ?= 0.4.5
 build: export CADDY_VERSION            ?= 2.10.2
 build: export FRANKENPHP_CADDY_VERSION ?= 1.9.0
 build: export BROTLI_CADDY_VERSION     ?= 1.0.1
-build: lint ## Run 'docker composer build' to build caddy with plugin
+build: lint ## Run 'docker composer build' to build caddy with plugin, copy output binary to ./bin/caddy
 	@docker compose build --build-arg GO_VERSION=$(GO_VERSION) --build-arg XCADDY_VERSION=$(XCADDY_VERSION) --build-arg CADDY_VERSION=$(CADDY_VERSION) --build-arg FRANKENPHP_CADDY_VERSION=$(FRANKENPHP_CADDY_VERSION) --build-arg BROTLI_CADDY_VERSION=$(BROTLI_CADDY_VERSION)
 	@CID=$$(docker create caddy-sidekick-integration-test:latest);          \
 		docker cp $$CID:/usr/local/bin/caddy ./bin/caddy >/dev/null 2>&1;   \
@@ -37,7 +37,7 @@ test-bench: export TEST_BENCH ?= .
 test-bench: export TEST_DIR   ?= ./...
 test-bench: test-setup ## Run bench tests: TEST_BENCH="." TEST_DIR=./... make test-benchm
 	@go test -run="$(TEST)" -bench="$(TEST_BENCH)" -benchmem -benchtime=10s -timeout=5m $(TEST_DIR) 2>&1 | tee /tmp/sidekick-bench.log
-	@echo "Test completed, see /tmp/sidekick-bench.log for details"
+	@echo "BenchTest completed, see /tmp/sidekick-bench.log for details"
 .PHONY: test-bench
 
 test-stress: export TEST       ?= TestConcurrent
@@ -45,7 +45,7 @@ test-stress: export TEST_DIR   ?= ./...
 test-stress: export TEST_COUNT ?= 100
 test-stress: test-setup ## Run stress tests: TEST=TestConcurrent TEST_DIR=./... TEST_COUNT=100 make test-stress
 	@go test -v -race -count=$(TEST_COUNT) -run "$(TEST)" $(TEST_DIR) 2>&1 | tee /tmp/sidekick-stress.log
-	@echo "Test completed, see /tmp/sidekick-stress.log for details"
+	@echo "StressTest completed, see /tmp/sidekick-stress.log for details"
 .PHONY: test-stress
 
 test-setup:
@@ -54,10 +54,10 @@ test-setup:
 
 test-integration: export TEST     ?= TestIntegration
 test-integration: export TEST_DIR ?= ./integration-test/...
-test-integration: test-integration-setup ## Run integration tests with Docker Compose
+test-integration: test-setup test-integration-setup ## Run integration tests with Docker Compose
 	@echo "Running integration tests..."
 	@go test -v -timeout=90s -run "$(TEST)" $(TEST_DIR) 2>&1 | tee /tmp/sidekick-integration.log
-	@echo "Integration test completed, see /tmp/sidekick-integration.log for details"
+	@echo "IntegrationTest completed, see /tmp/sidekick-integration.log for details"
 .PHONY: test-integration
 
 test-integration-setup:

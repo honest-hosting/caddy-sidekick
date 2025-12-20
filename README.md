@@ -39,6 +39,7 @@ All environment variables use the `SIDEKICK_` prefix for namespace isolation:
 | Environment Variable | Description | Default |
 |---------------------|-------------|---------|
 | `SIDEKICK_CACHE_DIR` | Cache storage directory | `/var/www/html/wp-content/cache` |
+| `SIDEKICK_METRICS` | Enable metrics and set admin API path (e.g., `/metrics/sidekick`) | _(disabled)_ |
 | `SIDEKICK_CACHE_RESPONSE_CODES` | HTTP status codes to cache (comma-separated) | `200,404,405` |
 | `SIDEKICK_NOCACHE` | Path prefixes to bypass cache (comma-separated) | `/wp-admin,/wp-json` |
 | `SIDEKICK_NOCACHE_HOME` | Skip caching home page | `false` |
@@ -75,6 +76,9 @@ Minimal configuration for a WordPress site:
 
 example.com {
     sidekick {
+        # Optional: Enable metrics collection (disabled by default to save resources)
+        # metrics /metrics/sidekick
+        
         cache_dir /var/www/cache
         cache_ttl 3600
         
@@ -96,7 +100,8 @@ Full configuration with all options for a production WordPress site:
 ```caddyfile
 {
     # Global options
-    admin off
+    # Enable admin API for metrics (comment out to disable)
+    admin localhost:2019
     
     # FrankenPHP configuration
     frankenphp
@@ -111,6 +116,12 @@ Full configuration with all options for a production WordPress site:
 example.com {
     # Enable Sidekick caching
     sidekick {
+        # Enable metrics collection and expose on admin API
+        # Metrics will be available at:
+        # - Admin API: http://localhost:2019/metrics/sidekick (detailed sidekick metrics)
+        # - Caddy metrics: http://localhost:2019/metrics (includes sidekick metrics in Prometheus format)
+        metrics /metrics/sidekick
+        
         # Cache storage location
         cache_dir /var/www/cache
         
@@ -198,6 +209,9 @@ example.com {
 
 ```json
 {
+  "admin": {
+    "listen": "localhost:2019"
+  },
   "apps": {
     "http": {
       "servers": {
@@ -219,6 +233,7 @@ example.com {
                       "handle": [
                         {
                           "handler": "sidekick",
+                          "metrics": "/metrics/sidekick",
                           "cache_dir": "/var/www/cache",
                           "cache_ttl": 3600,
                           "cache_response_codes": ["200", "301", "302"],
@@ -479,29 +494,52 @@ Special values: `0` = disabled, `-1` = unlimited, `>0` = actual limit
 
 #### Enabling Metrics
 
-1. Add to your Caddyfile global configuration:
+Sidekick metrics can be enabled by adding the `metrics` option to your sidekick configuration.
+
+**Important:** The admin API must be enabled in your Caddyfile for the metrics endpoints to work:
+
 ```caddyfile
 {
-    servers {
-        metrics  # Enable metrics collection
-    }
+    # Enable admin API (required for sidekick metrics endpoints)
+    admin localhost:2019
 }
-```
 
-2. Expose the metrics endpoint:
-```caddyfile
 example.com {
-    handle /metrics {
-        metrics
-    }
-    
     sidekick {
-        # Your cache configuration
+        # Enable metrics collection
+        metrics /metrics/sidekick
+        
+        # Other cache configuration
+        cache_dir /var/www/cache
+        # ... other settings ...
     }
 }
 ```
 
-Metrics are automatically available at `https://example.com/metrics` in Prometheus format.
+When metrics are enabled, they are available in two locations:
+
+1. **Admin API endpoint** (detailed sidekick-specific metrics):
+   - URL: `http://localhost:2019/metrics/sidekick` (Prometheus format)
+   - URL: `http://localhost:2019/metrics/sidekick/stats` (JSON format)
+   - Note: The admin API listens on localhost:2019 by default. Replace with your configured admin address if different.
+
+2. **Caddy's standard metrics endpoint** (includes sidekick metrics):
+   ```caddyfile
+   {
+       servers {
+           metrics  # Enable Caddy's metrics collection
+       }
+   }
+   
+   example.com {
+       handle /metrics {
+           metrics  # Expose metrics publicly
+       }
+   }
+   ```
+   - URL: `https://example.com/metrics` (all Caddy metrics including sidekick)
+
+**Note:** If the `metrics` option is not specified in the sidekick configuration, metrics collection is disabled to save resources. The admin API endpoints will not be available, and sidekick metrics will not appear in Caddy's standard metrics endpoint.
 
 #### Example Prometheus Queries
 
@@ -540,11 +578,11 @@ rate(caddy_sidekick_response_time_ms_count[5m])
 3. **Prometheus Scrape Configuration:**
 ```yaml
 scrape_configs:
-  - job_name: 'caddy-sidekick'
+  - job_name: 'caddy_sidekick'
     static_configs:
-      - targets: ['your-domain.com:443']
-    scheme: https
-    metrics_path: /metrics
+      - targets: ['localhost:2019']  # Replace with your admin port
+    scheme: http  # Use https if admin uses TLS
+    metrics_path: /metrics/sidekick
 ```
 
 Performance impact is minimal (<1% CPU overhead, ~10KB per metric series).
@@ -563,6 +601,7 @@ services:
     ports:
       - "80:80"
       - "443:443"
+      - "443:443/udp"
       - "2019:2019"  # Admin API for metrics
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
@@ -606,13 +645,13 @@ global:
 scrape_configs:
   - job_name: 'caddy'
     static_configs:
-      - targets: ['caddy:2019']  # Caddy admin API
+      - targets: ['caddy:2019']  # Replace 2019 with your admin port
     metrics_path: /metrics
-    
-  - job_name: 'caddy-sidekick'
+  
+  - job_name: 'caddy_sidekick'
     static_configs:
-      - targets: ['caddy:80']    # Your site with metrics endpoint
-    metrics_path: /metrics
+      - targets: ['caddy:2019']  # Replace 2019 with your admin port
+    metrics_path: /metrics/sidekick
 ```
 
 **Note:** Metrics are only collected when Caddy's metrics module is enabled. If metrics are not enabled in Caddy, Sidekick will operate normally without collecting metrics.

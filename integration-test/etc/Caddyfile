@@ -1,6 +1,8 @@
 {
 	admin 0.0.0.0:8443
 
+	metrics /metrics
+
 	log {
 		level DEBUG
 	}
@@ -61,6 +63,9 @@
 		cache_key_queries name page size
 		cache_key_headers Accept-Language X-Test-Header
 		cache_key_cookies test_session wordpress_logged_in_*
+
+		# Enable prom at /metrics/sidekick, JSON at /metrics/sidekick/stats
+		metrics /metrics/sidekick
 	}
 
 	php_server
