@@ -7,6 +7,10 @@ help: ## Display this help screen (default)
 	@grep -h "##" $(MAKEFILE_LIST) | grep -vE '^#|grep' | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}' | sort
 .PHONY: help
 
+all: clean build test test-bench test-stress test-integration ## Run all steps: clean, build, test, test-bench, test-stress, test-integration
+	@grep -ci 'FAIL:' /tmp/sidekick-*
+.PHONY: all
+
 lint: ## Run linter against codebase
 	@golangci-lint -v run
 .PHONY: lint

@@ -302,34 +302,85 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				s.CacheMemoryStreamToDiskSize = size
 
 			case "cache_key_headers":
-				headers := strings.Split(value, ",")
-				for d.NextArg() {
-					headers = append(headers, strings.Split(d.Val(), ",")...)
+				// Ignore empty values
+				if value != "" {
+					headers := strings.Split(value, ",")
+					for d.NextArg() {
+						headers = append(headers, strings.Split(d.Val(), ",")...)
+					}
+					for i := range headers {
+						headers[i] = strings.TrimSpace(headers[i])
+					}
+					// Filter out empty strings
+					var nonEmptyHeaders []string
+					for _, h := range headers {
+						if h != "" {
+							nonEmptyHeaders = append(nonEmptyHeaders, h)
+						}
+					}
+					if len(nonEmptyHeaders) > 0 {
+						s.CacheKeyHeaders = nonEmptyHeaders
+					}
+				} else {
+					// Consume any remaining arguments even if value is empty
+					for d.NextArg() {
+						// Skip
+					}
 				}
-				for i := range headers {
-					headers[i] = strings.TrimSpace(headers[i])
-				}
-				s.CacheKeyHeaders = headers
 
 			case "cache_key_queries":
-				queries := strings.Split(value, ",")
-				for d.NextArg() {
-					queries = append(queries, strings.Split(d.Val(), ",")...)
+				// Ignore empty values
+				if value != "" {
+					queries := strings.Split(value, ",")
+					for d.NextArg() {
+						queries = append(queries, strings.Split(d.Val(), ",")...)
+					}
+					for i := range queries {
+						queries[i] = strings.TrimSpace(queries[i])
+					}
+					// Filter out empty strings
+					var nonEmptyQueries []string
+					for _, q := range queries {
+						if q != "" {
+							nonEmptyQueries = append(nonEmptyQueries, q)
+						}
+					}
+					if len(nonEmptyQueries) > 0 {
+						s.CacheKeyQueries = nonEmptyQueries
+					}
+				} else {
+					// Consume any remaining arguments even if value is empty
+					for d.NextArg() {
+						// Skip
+					}
 				}
-				for i := range queries {
-					queries[i] = strings.TrimSpace(queries[i])
-				}
-				s.CacheKeyQueries = queries
 
 			case "cache_key_cookies":
-				cookies := strings.Split(value, ",")
-				for d.NextArg() {
-					cookies = append(cookies, strings.Split(d.Val(), ",")...)
+				// Ignore empty values
+				if value != "" {
+					cookies := strings.Split(value, ",")
+					for d.NextArg() {
+						cookies = append(cookies, strings.Split(d.Val(), ",")...)
+					}
+					for i := range cookies {
+						cookies[i] = strings.TrimSpace(cookies[i])
+					}
+					// Filter out empty strings
+					var nonEmptyCookies []string
+					for _, c := range cookies {
+						if c != "" {
+							nonEmptyCookies = append(nonEmptyCookies, c)
+						}
+					}
+					if len(nonEmptyCookies) > 0 {
+						s.CacheKeyCookies = nonEmptyCookies
+					}
+				} else {
+					// Consume any remaining arguments even if value is empty
+					for d.NextArg() {
+						// Skip
+					}
 				}
-				for i := range cookies {
-					cookies[i] = strings.TrimSpace(cookies[i])
-				}
-				s.CacheKeyCookies = cookies
 
 			case "wp_mu_plugin_enabled":
 				b, err := strconv.ParseBool(value)
@@ -688,27 +739,48 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 	// Load cache key configuration from environment
 	if len(s.CacheKeyHeaders) == 0 {
 		if envVal := os.Getenv("SIDEKICK_CACHE_KEY_HEADERS"); envVal != "" {
-			s.CacheKeyHeaders = strings.Split(envVal, ",")
-			for i := range s.CacheKeyHeaders {
-				s.CacheKeyHeaders[i] = strings.TrimSpace(s.CacheKeyHeaders[i])
+			headers := strings.Split(envVal, ",")
+			var nonEmptyHeaders []string
+			for _, h := range headers {
+				h = strings.TrimSpace(h)
+				if h != "" {
+					nonEmptyHeaders = append(nonEmptyHeaders, h)
+				}
+			}
+			if len(nonEmptyHeaders) > 0 {
+				s.CacheKeyHeaders = nonEmptyHeaders
 			}
 		}
 	}
 
 	if len(s.CacheKeyQueries) == 0 {
 		if envVal := os.Getenv("SIDEKICK_CACHE_KEY_QUERIES"); envVal != "" {
-			s.CacheKeyQueries = strings.Split(envVal, ",")
-			for i := range s.CacheKeyQueries {
-				s.CacheKeyQueries[i] = strings.TrimSpace(s.CacheKeyQueries[i])
+			queries := strings.Split(envVal, ",")
+			var nonEmptyQueries []string
+			for _, q := range queries {
+				q = strings.TrimSpace(q)
+				if q != "" {
+					nonEmptyQueries = append(nonEmptyQueries, q)
+				}
+			}
+			if len(nonEmptyQueries) > 0 {
+				s.CacheKeyQueries = nonEmptyQueries
 			}
 		}
 	}
 
 	if len(s.CacheKeyCookies) == 0 {
 		if envVal := os.Getenv("SIDEKICK_CACHE_KEY_COOKIES"); envVal != "" {
-			s.CacheKeyCookies = strings.Split(envVal, ",")
-			for i := range s.CacheKeyCookies {
-				s.CacheKeyCookies[i] = strings.TrimSpace(s.CacheKeyCookies[i])
+			cookies := strings.Split(envVal, ",")
+			var nonEmptyCookies []string
+			for _, c := range cookies {
+				c = strings.TrimSpace(c)
+				if c != "" {
+					nonEmptyCookies = append(nonEmptyCookies, c)
+				}
+			}
+			if len(nonEmptyCookies) > 0 {
+				s.CacheKeyCookies = nonEmptyCookies
 			}
 		}
 	}
