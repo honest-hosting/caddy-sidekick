@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -86,6 +87,10 @@ type SyncHandler struct {
 func init() {
 	caddy.RegisterModule(Sidekick{})
 	httpcaddyfile.RegisterHandlerDirective("sidekick", parseCaddyfileHandler)
+
+	// Initialize metrics early so they're registered with Caddy's default registry
+	// This ensures they appear in Caddy's /metrics endpoint on the admin port
+	_ = GetOrCreateGlobalMetrics(zap.NewNop())
 }
 
 func parseCaddyfileHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler,
@@ -374,6 +379,13 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 	s.logger = ctx.Logger(s)
 	s.syncHandler = &SyncHandler{
 		inFlight: make(map[string]*sync.Once),
+	}
+
+	// Initialize global metrics collector
+	// The admin.api.sidekick_metrics module will expose these at /metrics/sidekick
+	metrics := GetOrCreateGlobalMetrics(s.logger)
+	if metrics != nil {
+		s.logger.Info("Sidekick cache metrics initialized - available at admin API /metrics/sidekick")
 	}
 
 	// Validate mutually exclusive options
@@ -810,8 +822,14 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 		}
 	}
 
-	s.Storage = NewStorage(s.CacheDir, s.CacheTTL, memMaxSize, memMaxCount,
+	s.Storage = NewStorage(s.CacheDir, s.CacheTTL, int(s.CacheMemoryItemMaxSize), memMaxSize, memMaxCount,
 		int(s.CacheDiskItemMaxSize), diskMaxSize, diskMaxCount, s.logger)
+
+	// Start metrics updater if metrics are enabled
+	metricsCollector := GetMetrics()
+	if metricsCollector != nil {
+		metricsCollector.StartMetricsUpdater(s.Storage, "default")
+	}
 
 	// Handle WordPress mu-plugins
 	if err := s.manageMuPlugins(); err != nil {
@@ -834,10 +852,12 @@ func (Sidekick) CaddyModule() caddy.ModuleInfo {
 // ServeHTTP implements the caddy.Handler interface.
 func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	bypass := false
+	startTime := time.Now()
 	s.logger.Debug("HTTP Version", zap.String("Version", r.Proto))
 
 	reqHdr := r.Header
 	storage := s.Storage
+	metrics := GetMetrics()
 
 	// Handle purge requests
 	if strings.HasPrefix(r.URL.Path, s.PurgeURI) {
@@ -855,7 +875,10 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	hdr := w.Header()
 	if bypass {
 		hdr.Set(CacheHeaderName, "BYPASS")
-		return next.ServeHTTP(w, r)
+		metrics.RecordCacheOperation("bypass", "true", "default")
+		err := next.ServeHTTP(w, r)
+		metrics.RecordResponseTime("bypass", "default", time.Since(startTime))
+		return err
 	}
 
 	// Check for conditional requests (If-None-Match, If-Modified-Since)
@@ -874,9 +897,11 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	s.syncHandler.cacheMu.RUnlock()
 
 	if err == nil {
+		// Cache HIT
 		// Check for 304 Not Modified
 		if s.shouldReturn304(cacheMeta, etag, modifiedSince) {
 			w.WriteHeader(http.StatusNotModified)
+			metrics.RecordResponseTime("hit", "default", time.Since(startTime))
 			return nil
 		}
 
@@ -1010,6 +1035,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 				zap.Int("expectedBytes", len(dataToServe)))
 		}
 
+		metrics.RecordResponseTime("hit", "default", time.Since(startTime))
 		return nil
 	}
 
@@ -1030,6 +1056,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	nw := NewResponseWriter(w, r, storage, s.logger, s, once, cacheKey, buf)
 	defer func() {
 		// Return buffer to pool
+		metrics.RecordResponseTime("miss", "default", time.Since(startTime))
 		s.bufferPool.Put(buf)
 		if err := nw.Close(); err != nil {
 			s.logger.Error("Error closing response writer", zap.Error(err))
@@ -1423,7 +1450,18 @@ func (s *Sidekick) shouldReturn304(meta *Metadata, ifNoneMatch, ifModifiedSince 
 	return false
 }
 
-// Interface guards
+// Cleanup implements caddy.CleanerUpper
+func (s *Sidekick) Cleanup() error {
+	// Note: We don't cleanup the global metrics here as they may be shared
+	// across multiple instances and should survive config reloads
+	// The metrics will be cleaned up when the admin module is unloaded
+	if s.logger != nil {
+		s.logger.Debug("Sidekick cleanup called")
+	}
+	return nil
+}
+
+// Interface guard
 var (
 	_ caddy.Provisioner           = (*Sidekick)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Sidekick)(nil)

@@ -7,5 +7,8 @@
  *
  */
 
+if (!defined('ABSPATH')) {
+    exit;
+}
 
 add_filter('got_url_rewrite', function() { return true; });

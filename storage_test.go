@@ -60,7 +60,7 @@ func TestMemoryCacheStorage(t *testing.T) {
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, largeDataSize, 100, 0, 0, 0, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, largeDataSize, 100, 0, 0, 0, logger)
 
 	// Test Set and Get operations
 	testData := generateTestData(smallDataSize)
@@ -95,7 +95,7 @@ func TestStorageMemoryCacheEvictionByCount(t *testing.T) {
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, largeDataSize*10, 3, 0, 0, 0, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, largeDataSize*10, 3, 0, 0, 0, logger)
 
 	// Add items to exceed count limit
 	for i := 0; i < 5; i++ {
@@ -143,7 +143,7 @@ func TestMemoryCacheEvictionBySize(t *testing.T) {
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, smallDataSize*3, 100, 0, 0, 0, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, smallDataSize*3, 100, 0, 0, 0, logger)
 
 	// Add items to exceed size limit
 	for i := 0; i < 5; i++ {
@@ -183,7 +183,7 @@ func TestCacheLifetime(t *testing.T) {
 
 	logger := getTestLogger()
 	// Use a very short TTL for testing
-	storage := NewStorage(testCacheDir, 1, largeDataSize, 100, 0, 0, 0, logger) // 1 second TTL
+	storage := NewStorage(testCacheDir, 1, smallDataSize, largeDataSize, 100, 0, 0, 0, logger) // 1 second TTL
 
 	key := "ttl-test"
 	data := generateTestData(smallDataSize)
@@ -226,7 +226,7 @@ func TestMaxItemSizeMemory(t *testing.T) {
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, mediumDataSize, 100, smallDataSize, largeDataSize, 100, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, mediumDataSize, 100, smallDataSize, largeDataSize, 100, logger)
 
 	// Try to store item larger than disk limit
 	largeData := generateTestData(mediumDataSize)
@@ -257,7 +257,7 @@ func TestConcurrentMemoryAccess(t *testing.T) {
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, largeDataSize*100, 1000, 0, 0, 0, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, largeDataSize*100, 1000, 0, 0, 0, logger)
 
 	numGoroutines := 20
 	numOperations := 50
@@ -316,7 +316,7 @@ func TestCacheKeyMutexCleanup(t *testing.T) {
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, largeDataSize, 100, 0, 0, 0, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, largeDataSize, 100, 0, 0, 0, logger)
 
 	key := "mutex-test"
 	data := generateTestData(smallDataSize)
@@ -347,7 +347,7 @@ func TestMemoryCacheCostAccounting(t *testing.T) {
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, largeDataSize, 100, 0, 0, 0, logger)
+	storage := NewStorage(testCacheDir, testTTL, largeDataSize, largeDataSize, 100, 0, 0, 0, logger)
 
 	memCache := storage.GetMemCache()
 	if memCache == nil {
@@ -375,7 +375,7 @@ func TestMemoryCacheCostAccounting(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to set data for key %s: %v", item.key, err)
 		}
-		totalSize += item.size + 100 // Add some overhead for metadata
+		totalSize += item.size + 500 // Add 500 bytes overhead for metadata (matches storeInMemory)
 	}
 
 	finalCost := memCache.Cost()
@@ -397,7 +397,7 @@ func BenchmarkMemoryCacheSet(b *testing.B) {
 	defer cleanupTestDir(b)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, veryLargeDataSize*100, 100000, 0, 0, 0, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, veryLargeDataSize*100, 100000, 0, 0, 0, logger)
 
 	data := generateTestData(smallDataSize)
 	metadata := createTestMetadata()
@@ -418,7 +418,7 @@ func BenchmarkStorageMemoryCacheGet(b *testing.B) {
 	defer cleanupTestDir(b)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, veryLargeDataSize*100, 100000, 0, 0, 0, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, veryLargeDataSize*100, 100000, 0, 0, 0, logger)
 
 	// Pre-populate cache
 	data := generateTestData(smallDataSize)
@@ -445,7 +445,7 @@ func BenchmarkConcurrentMixedOperations(b *testing.B) {
 	defer cleanupTestDir(b)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, veryLargeDataSize*100, 100000, 0, 0, 0, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, veryLargeDataSize*100, 100000, 0, 0, 0, logger)
 
 	// Pre-populate some data
 	data := generateTestData(smallDataSize)
@@ -478,7 +478,7 @@ func TestMemoryPressure(t *testing.T) {
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, mediumDataSize*5, 100, 0, 0, 0, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, mediumDataSize*5, 100, 0, 0, 0, logger)
 
 	// Fill up the memory cache
 	for i := 0; i < 10; i++ {
@@ -512,7 +512,7 @@ func BenchmarkStorageMemoryCacheEviction(b *testing.B) {
 	defer cleanupTestDir(b)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, mediumDataSize*10, 10, 0, 0, 0, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, mediumDataSize*10, 10, 0, 0, 0, logger)
 
 	data := generateTestData(mediumDataSize)
 	metadata := createTestMetadata()
@@ -549,7 +549,7 @@ func TestMemoryLeaks(t *testing.T) {
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, largeDataSize*10, 100, 0, 0, 0, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, largeDataSize*10, 100, 0, 0, 0, logger)
 
 	// Track memory before operations
 	runtime.GC()
@@ -605,7 +605,7 @@ func TestEdgeCases(t *testing.T) {
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, largeDataSize, 100, 0, 0, 0, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, largeDataSize, 100, 0, 0, 0, logger)
 
 	// Test empty key
 	err := storage.SetWithKey("", createTestMetadata(), generateTestData(smallDataSize))
@@ -656,7 +656,7 @@ func BenchmarkHighConcurrency(b *testing.B) {
 	defer cleanupTestDir(b)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, veryLargeDataSize*100, 100000, 0, 0, 0, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, veryLargeDataSize*100, 100000, 0, 0, 0, logger)
 
 	// Pre-populate cache
 	data := generateTestData(smallDataSize)

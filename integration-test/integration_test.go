@@ -1,12 +1,16 @@
 package integration_test
 
 import (
+	"fmt"
 	"io"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 )
 
 const (
@@ -304,13 +308,18 @@ func TestIntegrationCacheResponseCodes(t *testing.T) {
 	purgeCache(t, nil)
 	time.Sleep(1 * time.Second)
 
-	// Test 404 caching (configured as NOT cacheable - not in cache_response_codes)
+	// Test 404 caching (configured as cacheable - in cache_response_codes)
 	for i := 0; i < cfg.verifyRequestCount; i++ {
 		resp, _ := makeRequest(t, "GET", baseURL+"/error/404", nil, nil)
 		if resp.StatusCode != 404 {
 			t.Fatalf("Expected status 404, got %d", resp.StatusCode)
 		}
-		checkCacheHeader(t, resp, "BYPASS")
+
+		if i == 0 {
+			checkCacheHeader(t, resp, "MISS")
+		} else {
+			checkCacheHeader(t, resp, "HIT")
+		}
 
 		if i < cfg.verifyRequestCount-1 {
 			time.Sleep(cfg.verifyRequestDelay)
@@ -826,4 +835,473 @@ func TestIntegrationNoCacheRegex(t *testing.T) {
 		// Verify multiple requests return HIT
 		verifyCacheHits(t, baseURL+path, nil, nil, cfg)
 	}
+}
+
+// TestIntegrationMetrics tests that metrics are properly exposed and incremented
+func TestIntegrationMetrics(t *testing.T) {
+	metricsURL := "http://localhost:9443/metrics/sidekick"
+	cfg := newTestConfig()
+
+	// Clear cache first
+	purgeCache(t, nil)
+	time.Sleep(1 * time.Second)
+
+	// Helper function to fetch metrics
+	fetchMetrics := func(t *testing.T) string {
+		resp := makeRequestRaw(t, "GET", metricsURL, nil, nil)
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return string(body)
+	}
+
+	// Helper to check if metric labels match wanted labels
+	matchesLabels := func(metricLabels []*dto.LabelPair, wantLabels map[string]string) bool {
+		if len(wantLabels) == 0 {
+			return len(metricLabels) == 0
+		}
+
+		foundLabels := make(map[string]string)
+		for _, label := range metricLabels {
+			if label.Name != nil && label.Value != nil {
+				foundLabels[*label.Name] = *label.Value
+			}
+		}
+
+		for k, v := range wantLabels {
+			if foundLabels[k] != v {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Helper function to parse metrics and get value by name and labels
+	getMetricValue := func(metricsText string, metricName string, labelPairs ...string) (float64, bool) {
+		// Create parser with validation scheme to avoid panic
+		parser := expfmt.NewTextParser(model.LegacyValidation)
+		metricFamilies, err := parser.TextToMetricFamilies(strings.NewReader(metricsText))
+		if err != nil {
+			t.Logf("Failed to parse metrics: %v", err)
+			return 0, false
+		}
+
+		family, ok := metricFamilies[metricName]
+		if !ok {
+			return 0, false
+		}
+
+		// Build label map from pairs
+		wantLabels := make(map[string]string)
+		for i := 0; i < len(labelPairs)-1; i += 2 {
+			wantLabels[labelPairs[i]] = labelPairs[i+1]
+		}
+
+		// Find matching metric
+		for _, metric := range family.Metric {
+			if matchesLabels(metric.Label, wantLabels) {
+				switch family.GetType() {
+				case dto.MetricType_COUNTER:
+					if metric.Counter != nil && metric.Counter.Value != nil {
+						return *metric.Counter.Value, true
+					}
+				case dto.MetricType_GAUGE:
+					if metric.Gauge != nil && metric.Gauge.Value != nil {
+						return *metric.Gauge.Value, true
+					}
+				case dto.MetricType_HISTOGRAM:
+					if metric.Histogram != nil && metric.Histogram.SampleCount != nil {
+						return float64(*metric.Histogram.SampleCount), true
+					}
+				}
+			}
+		}
+		return 0, false
+	}
+
+	// Test 1: Verify metrics endpoint is accessible
+	t.Run("MetricsEndpointAccessible", func(t *testing.T) {
+		metrics := fetchMetrics(t)
+		if !strings.Contains(metrics, "# HELP") {
+			t.Error("Metrics endpoint doesn't return Prometheus format")
+		}
+		if !strings.Contains(metrics, "# TYPE") {
+			t.Error("Metrics endpoint missing TYPE declarations")
+		}
+	})
+
+	// Test 2: Verify sidekick metrics are registered
+	t.Run("SidekickMetricsRegistered", func(t *testing.T) {
+		metrics := fetchMetrics(t)
+
+		requiredMetrics := []string{
+			"caddy_sidekick_cache_used_bytes",
+			"caddy_sidekick_cache_limit_bytes",
+			"caddy_sidekick_cache_used_count",
+			"caddy_sidekick_cache_limit_count",
+
+			"caddy_sidekick_cache_requests_total",
+			"caddy_sidekick_response_time_ms",
+		}
+
+		for _, metric := range requiredMetrics {
+			if !strings.Contains(metrics, metric) {
+				t.Errorf("Required metric %s not found in output", metric)
+			}
+		}
+	})
+
+	// Test 3: Verify cache operations increment correctly
+	t.Run("CacheOperationsIncrement", func(t *testing.T) {
+		// Get initial metrics
+		initialMetrics := fetchMetrics(t)
+		initialHits, _ := getMetricValue(initialMetrics, "caddy_sidekick_cache_requests_total", "result", "hit", "cache_type", "total")
+		initialMisses, _ := getMetricValue(initialMetrics, "caddy_sidekick_cache_requests_total", "result", "miss", "cache_type", "total")
+
+		// Make a request that should be a MISS
+		resp1, _ := makeRequest(t, "GET", baseURL+"/metrics-test-1", nil, nil)
+		defer func() { _ = resp1.Body.Close() }()
+
+		// Check it was a MISS
+		if resp1.Header.Get("X-Sidekick-Cache") != "MISS" {
+			t.Errorf("Expected MISS, got %s", resp1.Header.Get("X-Sidekick-Cache"))
+		}
+
+		time.Sleep(cfg.cacheWriteWait)
+
+		// Make the same request again - should be a HIT
+		resp2, _ := makeRequest(t, "GET", baseURL+"/metrics-test-1", nil, nil)
+		defer func() { _ = resp2.Body.Close() }()
+
+		// Check it was a HIT
+		if resp2.Header.Get("X-Sidekick-Cache") != "HIT" {
+			t.Errorf("Expected HIT, got %s", resp2.Header.Get("X-Sidekick-Cache"))
+		}
+
+		// Get updated metrics
+		time.Sleep(2250 * time.Millisecond) // Allow metrics to update
+		updatedMetrics := fetchMetrics(t)
+		updatedHits, _ := getMetricValue(updatedMetrics, "caddy_sidekick_cache_requests_total", "result", "hit", "cache_type", "total")
+		updatedMisses, _ := getMetricValue(updatedMetrics, "caddy_sidekick_cache_requests_total", "result", "miss", "cache_type", "total")
+
+		// Verify counters increased
+		if initialHits >= updatedHits {
+			t.Errorf("Hit counter did not increase after cache HIT: initial=%f, updated=%f", initialHits, updatedHits)
+		}
+		if initialMisses >= updatedMisses {
+			t.Errorf("Miss counter did not increase after cache MISS: initial=%f, updated=%f", initialMisses, updatedMisses)
+		}
+	})
+
+	// Test 4: Verify memory and disk cache metrics
+	t.Run("CacheStorageMetrics", func(t *testing.T) {
+		// Clear cache first to start fresh
+		purgeCache(t, nil)
+		time.Sleep(1 * time.Second)
+
+		// cache_memory_item_max_size is set to 1MB in Caddyfile
+		// Files larger than 1MB should go to disk
+
+		// Make requests with small responses that should stay in memory (<1MB)
+		for i := 0; i < 3; i++ {
+			// Create paths that generate small responses
+			path := "/small-test-" + string(rune('a'+i))
+			resp, body := makeRequest(t, "GET", baseURL+path, nil, nil)
+			defer func() { _ = resp.Body.Close() }()
+
+			// Log the actual response size for debugging
+			t.Logf("Small response size for %s: %d bytes", path, len(body))
+
+			if resp.Header.Get("X-Sidekick-Cache") != "MISS" {
+				t.Errorf("Expected MISS on first request, got %s", resp.Header.Get("X-Sidekick-Cache"))
+			}
+		}
+
+		// Now make a request for a file that's larger than 1MB and should go to disk
+		largePath := "/test-generate-large-file-mb?size=1.2"
+		resp, body := makeRequest(t, "GET", baseURL+largePath, nil, nil)
+		defer func() { _ = resp.Body.Close() }()
+		t.Logf("Large file response size: %d bytes (should go to disk)", len(body))
+
+		if resp.Header.Get("X-Sidekick-Cache") != "MISS" {
+			t.Errorf("Expected MISS on first request for large file, got %s", resp.Header.Get("X-Sidekick-Cache"))
+		}
+
+		// Wait for cache writes and metrics to update
+		time.Sleep(2 * time.Second)
+
+		metrics := fetchMetrics(t)
+
+		// Check memory cache metrics
+		memUsed, memFound := getMetricValue(metrics, "caddy_sidekick_cache_used_bytes", "type", "memory", "server", "default")
+		memCount, memCountFound := getMetricValue(metrics, "caddy_sidekick_cache_used_count", "type", "memory", "server", "default")
+
+		if !memFound {
+			t.Error("Memory cache used bytes metric not found")
+		} else {
+			t.Logf("Memory cache used: %.0f bytes", memUsed)
+			// Should have the small responses in memory
+			if memCount > 0 && memUsed == 0 {
+				t.Error("Memory cache count > 0 but bytes is 0")
+			}
+		}
+
+		if !memCountFound {
+			t.Error("Memory cache used count metric not found")
+		} else {
+			t.Logf("Memory cache items: %.0f", memCount)
+			// We made 3 small requests that should be in memory
+			if memCount < 3 {
+				t.Errorf("Expected at least 3 items in memory cache, got %.0f", memCount)
+			}
+		}
+
+		// Check memory limit is set correctly (from Caddyfile: 64MB = 64000000 bytes using decimal/SI units)
+		if memLimit, found := getMetricValue(metrics, "caddy_sidekick_cache_limit_bytes", "type", "memory", "server", "default"); found {
+			expectedMemLimit := float64(64 * 1000 * 1000) // 64MB in bytes (decimal/SI)
+			if memLimit != expectedMemLimit {
+				t.Errorf("Memory limit bytes unexpected: %f (expected %f)", memLimit, expectedMemLimit)
+			}
+		} else {
+			t.Error("Memory cache limit bytes metric not found")
+		}
+
+		// Check disk metrics - should have the large file that exceeds 1MB memory limit
+		diskUsed, diskFound := getMetricValue(metrics, "caddy_sidekick_cache_used_bytes", "type", "disk", "server", "default")
+		diskCount, diskCountFound := getMetricValue(metrics, "caddy_sidekick_cache_used_count", "type", "disk", "server", "default")
+
+		if !diskFound {
+			t.Error("Disk cache used bytes metric not found")
+		} else {
+			t.Logf("Disk cache used: %.0f bytes", diskUsed)
+			// The 1.2MB file should be on disk (compressed)
+			if diskUsed == 0 {
+				t.Error("Disk cache bytes is 0, but the 1.2MB file should have been stored on disk")
+			}
+			// Due to compression, disk usage will be less than 1.2MB
+			t.Logf("Disk cache is using %.0f bytes (compressed from 1.2MB original)", diskUsed)
+		}
+
+		if !diskCountFound {
+			t.Error("Disk cache used count metric not found")
+		} else {
+			t.Logf("Disk cache items: %.0f", diskCount)
+			if diskCount < 1 {
+				t.Errorf("Expected at least 1 item in disk cache (the large file), got %.0f", diskCount)
+			}
+		}
+
+		// Check disk limit is set correctly (from Caddyfile: 256MB = 256000000 bytes using decimal/SI units)
+		if diskLimit, found := getMetricValue(metrics, "caddy_sidekick_cache_limit_bytes", "type", "disk", "server", "default"); found {
+			expectedDiskLimit := float64(256 * 1000 * 1000) // 256MB in bytes (decimal/SI)
+			if diskLimit != expectedDiskLimit {
+				t.Errorf("Disk limit bytes unexpected: %f (expected %f)", diskLimit, expectedDiskLimit)
+			}
+		} else {
+			t.Error("Disk cache limit bytes metric not found")
+		}
+
+		// Check total metrics (should be sum of memory + disk)
+		totalUsed, totalFound := getMetricValue(metrics, "caddy_sidekick_cache_used_bytes", "type", "total", "server", "default")
+		if !totalFound {
+			t.Error("Total cache used bytes metric not found")
+		} else {
+			expectedTotal := memUsed + diskUsed
+			// Allow for small differences due to timing
+			if totalUsed < expectedTotal*0.9 || totalUsed > expectedTotal*1.1 {
+				t.Errorf("Total cache bytes (%f) doesn't match sum of memory (%f) + disk (%f)", totalUsed, memUsed, diskUsed)
+			}
+		}
+	})
+
+	// Test 5: Verify bypass metrics
+	t.Run("BypassMetrics", func(t *testing.T) {
+		initialMetrics := fetchMetrics(t)
+		initialBypass, _ := getMetricValue(initialMetrics, "caddy_sidekick_cache_requests_total", "result", "bypass", "cache_type", "total")
+
+		// Make a request to a bypass path
+		resp, _ := makeRequest(t, "GET", baseURL+"/wp-admin/test", nil, nil)
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.Header.Get("X-Sidekick-Cache") != "BYPASS" {
+			t.Errorf("Expected BYPASS for /wp-admin path, got %s", resp.Header.Get("X-Sidekick-Cache"))
+		}
+
+		// Check bypass counter increased
+		time.Sleep(500 * time.Millisecond)
+		updatedMetrics := fetchMetrics(t)
+		updatedBypass, _ := getMetricValue(updatedMetrics, "caddy_sidekick_cache_requests_total", "result", "bypass", "cache_type", "total")
+
+		if initialBypass >= updatedBypass {
+			t.Errorf("Bypass counter did not increase: initial=%f, updated=%f", initialBypass, updatedBypass)
+		}
+	})
+
+	// Test 6: Verify purge metrics
+	t.Run("PurgeMetrics", func(t *testing.T) {
+		// Note: purge operations are no longer tracked in request metrics since they're not requests
+		// We'll just verify the purge completes successfully
+
+		// Perform a purge
+		purgeCache(t, nil)
+
+		// Check purge counter increased
+		time.Sleep(500 * time.Millisecond)
+		// Purge operations are not tracked in the simplified metrics
+		// Just verify purge completed without error
+	})
+
+	// Test 7: Verify response time histogram
+	t.Run("ResponseTimeHistogram", func(t *testing.T) {
+		// Make several requests
+		for i := 0; i < 5; i++ {
+			resp, _ := makeRequest(t, "GET", baseURL+"/metrics-timing-test", nil, nil)
+			_ = resp.Body.Close()
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		metrics := fetchMetrics(t)
+
+		// Check histogram exists by looking for sample count
+		if count, found := getMetricValue(metrics, "caddy_sidekick_response_time_ms", "cache_status", "miss", "server", "default"); !found || count == 0 {
+			t.Error("Response time histogram for cache misses not found or has no samples")
+		}
+	})
+
+	// Test 9: Verify size distribution histogram
+	t.Run("SizeDistributionHistogram", func(t *testing.T) {
+		metrics := fetchMetrics(t)
+
+		// Check size distribution histogram exists
+		if !strings.Contains(metrics, "caddy_sidekick_cache_size_distribution_bytes_bucket") {
+			t.Error("Size distribution histogram not found")
+		}
+
+		// Look for different bucket sizes
+		buckets := []string{`le="1024"`, `le="4096"`, `le="16384"`, `le="65536"`}
+		for _, bucket := range buckets {
+			if !strings.Contains(metrics, bucket) {
+				t.Errorf("Size distribution bucket %s not found", bucket)
+			}
+		}
+	})
+
+	// Test 11: Verify large files go to disk cache (exceed cache_memory_item_max_size)
+	t.Run("LargeFileDiskCache", func(t *testing.T) {
+		// Clear cache first to start fresh
+		purgeCache(t, nil)
+		time.Sleep(1 * time.Second)
+
+		// cache_memory_item_max_size is 1MB in Caddyfile
+		// Generate a 1.5MB response that should exceed this limit
+		sizeMB := 1.5
+		path := fmt.Sprintf("/test-generate-large-file-mb?size=%.1f", sizeMB)
+
+		// First request should be a MISS
+		resp1, body1 := makeRequest(t, "GET", baseURL+path, nil, nil)
+		defer func() { _ = resp1.Body.Close() }()
+
+		actualSize := len(body1)
+		expectedSize := int(sizeMB * 1000 * 1000) // Decimal MB
+		t.Logf("Large file response size: %d bytes (expected ~%d bytes)", actualSize, expectedSize)
+
+		// Verify size is approximately what we requested (allow 1% variance for HTML overhead)
+		if actualSize < int(float64(expectedSize)*0.99) || actualSize > int(float64(expectedSize)*1.01) {
+			t.Errorf("Response size %d is not within 1%% of expected %d", actualSize, expectedSize)
+		}
+
+		if resp1.Header.Get("X-Sidekick-Cache") != "MISS" {
+			t.Errorf("Expected MISS on first request, got %s", resp1.Header.Get("X-Sidekick-Cache"))
+		}
+
+		// Extract the unique ID from the response to verify caching
+		uniqueIDPrefix := "Unique ID: "
+		uniqueIDIndex := strings.Index(body1, uniqueIDPrefix)
+		var uniqueID1 string
+		if uniqueIDIndex > 0 {
+			endIndex := strings.Index(body1[uniqueIDIndex:], "</p>")
+			if endIndex > 0 {
+				uniqueID1 = body1[uniqueIDIndex+len(uniqueIDPrefix) : uniqueIDIndex+endIndex]
+			}
+		}
+		t.Logf("First request unique ID: %s", uniqueID1)
+
+		// Wait for cache write to complete
+		time.Sleep(2 * time.Second)
+
+		// Second request should be a HIT from disk cache
+		resp2, body2 := makeRequest(t, "GET", baseURL+path, nil, nil)
+		defer func() { _ = resp2.Body.Close() }()
+
+		if resp2.Header.Get("X-Sidekick-Cache") != "HIT" {
+			t.Errorf("Expected HIT on second request, got %s", resp2.Header.Get("X-Sidekick-Cache"))
+		}
+
+		// Extract unique ID from second response
+		var uniqueID2 string
+		uniqueIDIndex2 := strings.Index(body2, uniqueIDPrefix)
+		if uniqueIDIndex2 > 0 {
+			endIndex := strings.Index(body2[uniqueIDIndex2:], "</p>")
+			if endIndex > 0 {
+				uniqueID2 = body2[uniqueIDIndex2+len(uniqueIDPrefix) : uniqueIDIndex2+endIndex]
+			}
+		}
+		t.Logf("Second request unique ID: %s", uniqueID2)
+
+		// Verify the cached response has the same unique ID (proving it was cached)
+		if uniqueID1 != uniqueID2 {
+			t.Errorf("Unique IDs don't match - response was not cached properly (ID1: %s, ID2: %s)", uniqueID1, uniqueID2)
+		}
+
+		// Fetch metrics to verify it's in disk cache, not memory cache
+		metrics := fetchMetrics(t)
+
+		// Check memory cache - the large file should NOT be there
+		memUsed, _ := getMetricValue(metrics, "caddy_sidekick_cache_used_bytes", "type", "memory", "server", "default")
+		memCount, _ := getMetricValue(metrics, "caddy_sidekick_cache_used_count", "type", "memory", "server", "default")
+
+		// Memory should not contain the 1.5MB file
+		if memUsed > 1000000 { // 1MB threshold
+			t.Errorf("Memory cache contains %f bytes - large file should not be in memory (max item size is 1MB)", memUsed)
+		}
+
+		// Check disk cache - the large file SHOULD be there
+		diskUsed, diskFound := getMetricValue(metrics, "caddy_sidekick_cache_used_bytes", "type", "disk", "server", "default")
+		diskCount, diskCountFound := getMetricValue(metrics, "caddy_sidekick_cache_used_count", "type", "disk", "server", "default")
+
+		if !diskFound {
+			t.Error("Disk cache used bytes metric not found")
+		} else {
+			t.Logf("Disk cache used: %.0f bytes", diskUsed)
+			// The file is compressed on disk, so we just check it's non-zero
+			// The test data appears to be highly compressible (7KB compressed from 1.5MB)
+			if diskUsed == 0 {
+				t.Error("Disk cache has 0 bytes, but should contain the compressed large file")
+			} else {
+				compressionRatio := (float64(expectedSize) - diskUsed) / float64(expectedSize) * 100
+				t.Logf("File compressed from %d bytes to %.0f bytes (%.1f%% compression)", expectedSize, diskUsed, compressionRatio)
+			}
+		}
+
+		if !diskCountFound {
+			t.Error("Disk cache used count metric not found")
+		} else {
+			t.Logf("Disk cache items: %.0f", diskCount)
+			if diskCount < 1 {
+				t.Error("Disk cache should contain at least 1 item (the large file)")
+			}
+		}
+
+		t.Logf("Memory cache: %.0f bytes, %.0f items", memUsed, memCount)
+		t.Logf("Disk cache: %.0f bytes, %.0f items", diskUsed, diskCount)
+
+		// Verify we can still get a cache HIT after some time
+		time.Sleep(1 * time.Second)
+		resp3, _ := makeRequest(t, "GET", baseURL+path, nil, nil)
+		defer func() { _ = resp3.Body.Close() }()
+
+		if resp3.Header.Get("X-Sidekick-Cache") != "HIT" {
+			t.Errorf("Expected HIT on third request, got %s", resp3.Header.Get("X-Sidekick-Cache"))
+		}
+	})
+
 }

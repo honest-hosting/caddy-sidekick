@@ -1,5 +1,6 @@
 {
-	admin off
+	admin 0.0.0.0:8443
+
 	log {
 		level DEBUG
 	}
@@ -27,8 +28,8 @@
 		# Cache TTL (60 seconds for testing)
 		cache_ttl 60
 
-		# HTTP status codes to cache
-		cache_response_codes 200 301 302
+		# HTTP status codes to cache (including 404 for testing)
+		cache_response_codes 200 301 302 404
 
 		# Paths to bypass cache (WordPress-like paths for testing)
 		nocache /wp-admin /wp-json /non-cacheable /api/realtime /health.php
@@ -38,7 +39,7 @@
 
 		# Regex for file types to bypass (testing with images)
 		# We'll allow caching of test image paths for testing
-		nocache_regex "\\.(mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe)$"
+		nocache_regex "\.(mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe)$"
 
 		# Purge endpoint configuration
 		purge_uri /__sidekick/purge
@@ -49,7 +50,7 @@
 		cache_memory_item_max_size 1MB
 		cache_memory_max_size 64MB
 		cache_memory_max_count 100
-		cache_memory_stream_to_disk_size 512KB
+		cache_memory_stream_to_disk_size 100
 
 		# Disk cache limits (small for testing)
 		cache_disk_item_max_size 10MB

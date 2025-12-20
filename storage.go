@@ -33,9 +33,10 @@ type Storage struct {
 	ttl    int
 	logger *zap.Logger
 
-	memMaxSize  int
-	memMaxCount int
-	memCache    atomic.Value // *MemoryCache
+	memItemMaxSize int
+	memMaxSize     int
+	memMaxCount    int
+	memCache       atomic.Value // *MemoryCache
 
 	// Disk cache
 	diskItemMaxSize int
@@ -58,11 +59,12 @@ type MemoryCacheItem struct {
 }
 
 // NewStorage creates a new Storage instance
-func NewStorage(loc string, ttl int, memMaxSize int, memMaxCount int, diskItemMaxSize int, diskMaxSize int, diskMaxCount int, logger *zap.Logger) *Storage {
+func NewStorage(loc string, ttl int, memItemMaxSize int, memMaxSize int, memMaxCount int, diskItemMaxSize int, diskMaxSize int, diskMaxCount int, logger *zap.Logger) *Storage {
 	s := &Storage{
 		loc:             loc,
 		ttl:             ttl,
 		logger:          logger,
+		memItemMaxSize:  memItemMaxSize,
 		memMaxSize:      memMaxSize,
 		memMaxCount:     memMaxCount,
 		diskItemMaxSize: diskItemMaxSize,
@@ -163,6 +165,10 @@ func (s *Storage) Get(key string) ([]byte, *Metadata, error) {
 					zap.String("key", key),
 					zap.Int("data_size", (*cacheItem).value.Len()))
 			}
+			// Record metrics
+			metrics := GetMetrics()
+			metrics.RecordCacheOperation("get", "hit", "memory")
+			metrics.RecordItemSize("memory", "default", int64((*cacheItem).value.Len()))
 			return (*cacheItem).value.Bytes(), (*cacheItem).Metadata, nil
 		}
 	}
@@ -180,6 +186,10 @@ func (s *Storage) Get(key string) ([]byte, *Metadata, error) {
 						zap.String("key", key),
 						zap.Int("data_size", len(data)))
 				}
+				// Record metrics
+				metrics := GetMetrics()
+				metrics.RecordCacheOperation("get", "hit", "disk")
+				metrics.RecordItemSize("disk", "default", int64(len(data)))
 				return data, md, nil
 			}
 			if err == ErrCacheExpired {
@@ -196,6 +206,9 @@ func (s *Storage) Get(key string) ([]byte, *Metadata, error) {
 		}
 	}
 
+	// Record cache miss
+	metrics := GetMetrics()
+	metrics.RecordCacheOperation("get", "miss", "default")
 	return nil, nil, ErrCacheNotFound
 }
 
@@ -230,14 +243,18 @@ func (s *Storage) SetWithKey(key string, metadata *Metadata, data []byte) error 
 		metadata.Timestamp = now.Unix()
 	}
 
-	// Try to store in memory first if it fits and memory cache is enabled
-	if s.memMaxSize > 0 && dataSize <= s.memMaxSize {
+	// Try to store in memory first if it fits within the per-item size limit and memory cache is enabled
+	if s.memMaxSize > 0 && s.memItemMaxSize > 0 && dataSize <= s.memItemMaxSize {
 		if err := s.storeInMemory(key, data, metadata); err == nil {
 			if s.logger != nil {
 				s.logger.Debug("Stored in memory cache",
 					zap.String("key", key),
 					zap.Int("size", dataSize))
 			}
+			// Record metrics
+			metrics := GetMetrics()
+			metrics.RecordCacheOperation("store", "success", "memory")
+			metrics.RecordItemSize("memory", "default", int64(dataSize))
 			return nil
 		}
 	}
@@ -288,6 +305,10 @@ func (s *Storage) SetWithKey(key string, metadata *Metadata, data []byte) error 
 				zap.String("key", key),
 				zap.String("size", diskCache.humanizeSize(actualSize)))
 		}
+		// Record metrics
+		metrics := GetMetrics()
+		metrics.RecordCacheOperation("store", "success", "disk")
+		metrics.RecordItemSize("disk", "default", actualSize)
 	}
 
 	return nil
@@ -341,6 +362,10 @@ func (s *Storage) Purge(key string) error {
 		s.logger.Debug("Purged cache entry",
 			zap.String("key", key))
 	}
+
+	// Record metrics
+	metrics := GetMetrics()
+	metrics.RecordCacheOperation("purge", "success", "default")
 
 	return nil
 }

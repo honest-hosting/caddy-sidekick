@@ -66,6 +66,7 @@ test-integration-setup:
 
 test-integration-cleanup:
 	@docker compose down || true
+	@rm -rf integration-test/cache/* 2>/dev/null || true
 .PHONY: test-integration-cleanup
 
 fmt: ## Run go-fmt against codebase

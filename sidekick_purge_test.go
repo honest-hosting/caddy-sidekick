@@ -190,7 +190,7 @@ func TestPurgeHandler(t *testing.T) {
 	}
 
 	// Initialize storage
-	s.Storage = NewStorage(s.CacheDir, s.CacheTTL, 10*1024*1024, 100, 0, 0, 0, s.logger)
+	s.Storage = NewStorage(s.CacheDir, s.CacheTTL, 1*1024*1024, 10*1024*1024, 100, 0, 0, 0, s.logger)
 
 	// Helper function to generate cache key like the real implementation
 	generateCacheKey := func(path string) string {
@@ -521,7 +521,7 @@ func TestPurgePathVariations(t *testing.T) {
 	}
 
 	// Initialize storage
-	s.Storage = NewStorage(s.CacheDir, s.CacheTTL, 10*1024*1024, 100, 0, 0, 0, s.logger)
+	s.Storage = NewStorage(s.CacheDir, s.CacheTTL, 1*1024*1024, 10*1024*1024, 100, 0, 0, 0, s.logger)
 
 	// Helper to generate cache keys with variations
 	generateVariationKey := func(path string, queries map[string]string, headers map[string]string, cookies map[string]string) string {
@@ -699,7 +699,7 @@ func TestPurgeBackwardCompatibility(t *testing.T) {
 	}
 
 	// Initialize storage
-	s.Storage = NewStorage(s.CacheDir, s.CacheTTL, 10*1024*1024, 100, 0, 0, 0, s.logger)
+	s.Storage = NewStorage(s.CacheDir, s.CacheTTL, 1*1024*1024, 10*1024*1024, 100, 0, 0, 0, s.logger)
 
 	// Store entries with Path metadata (new style)
 	withPathKey1 := "key_with_path_1"

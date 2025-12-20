@@ -84,7 +84,7 @@ switch ($path) {
 </head>
 <body>
     <h1>This content is cacheable</h1>
-    <p>Generated at: ' . date('Y-m-d H:i:s') . '</p>
+    <p>Generated at: ' . date('Y-m-d H:i:s.u') . '</p>
     <p>Unique ID: ' . uniqid() . '</p>
     <p>This page should be cached and subsequent requests should show the same timestamp and ID.</p>
 </body>
@@ -103,7 +103,7 @@ switch ($path) {
 </head>
 <body>
     <h1>This content is NOT cacheable</h1>
-    <p>Generated at: ' . date('Y-m-d H:i:s') . '</p>
+    <p>Generated at: ' . date('Y-m-d H:i:s.u') . '</p>
     <p>Unique ID: ' . uniqid() . '</p>
     <p>This page should never be cached. Each request should show a different timestamp and ID.</p>
 </body>
@@ -119,7 +119,7 @@ switch ($path) {
         // JSON API endpoint - cacheable
         jsonResponse([
             'timestamp' => time(),
-            'date' => date('Y-m-d H:i:s'),
+            'date' => date('Y-m-d H:i:s.u'),
             'data' => [
                 'id' => uniqid(),
                 'value' => rand(1, 1000),
@@ -157,7 +157,7 @@ switch ($path) {
 <body>
     <h1>Static Content Page</h1>
     <p>This page simulates static content that rarely changes.</p>
-    <p>Generated: ' . date('Y-m-d H:i:s') . '</p>
+    <p>Generated: ' . date('Y-m-d H:i:s.u') . '</p>
     <p>Version: 1.0.0</p>
 </body>
 </html>', 200, [
@@ -180,7 +180,7 @@ switch ($path) {
 <body>
     <h1>Hello, ' . $name . '!</h1>
     <p>You are viewing page ' . $page . '</p>
-    <p>Generated at: ' . date('Y-m-d H:i:s') . '</p>
+    <p>Generated at: ' . date('Y-m-d H:i:s.u') . '</p>
     <p>Session: ' . uniqid() . '</p>
 </body>
 </html>', 200, [
@@ -202,7 +202,7 @@ switch ($path) {
 <body>
     <h1>404 - Page Not Found</h1>
     <p>The page you requested does not exist.</p>
-    <p>Error generated at: ' . date('Y-m-d H:i:s') . '</p>
+    <p>Error generated at: ' . date('Y-m-d H:i:s.u') . '</p>
 </body>
 </html>', 404, [
             'Cache-Control' => 'public, max-age=300',
@@ -221,7 +221,7 @@ switch ($path) {
     <h1>500 - Internal Server Error</h1>
     <p>Something went wrong on the server.</p>
     <p>Error ID: ' . uniqid() . '</p>
-    <p>Time: ' . date('Y-m-d H:i:s') . '</p>
+    <p>Time: ' . date('Y-m-d H:i:s.u') . '</p>
 </body>
 </html>', 500, [
             'Cache-Control' => 'no-cache, no-store',
@@ -334,10 +334,69 @@ switch ($path) {
         ]);
         break;
 
+    case '/test-generate-large-file-mb':
+        // Generate a large HTML response based on size parameter
+        $sizeMB = isset($query['size']) ? floatval($query['size']) : 1.0;
+        $sizeBytes = intval($sizeMB * 1000 * 1000); // Use decimal MB (1MB = 1,000,000 bytes)
+
+        // Generate HTML content with repeated lorem ipsum text
+        $loremIpsum = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. ";
+
+        // Start with valid HTML structure
+        $html = '<!DOCTYPE html>
+<html>
+<head>
+    <title>Large File Test - ' . $sizeMB . 'MB</title>
+    <meta charset="utf-8">
+</head>
+<body>
+    <h1>Large File Test</h1>
+    <p>This is a test file of approximately ' . $sizeMB . 'MB (' . number_format($sizeBytes) . ' bytes)</p>
+    <p>Generated at: ' . date('Y-m-d H:i:s.u') . '</p>
+    <p>Unique ID: ' . uniqid() . '</p>
+    <hr>
+    <div id="content">
+';
+
+        // Calculate how much padding we need
+        $currentSize = strlen($html);
+        $remainingSize = $sizeBytes - $currentSize - 100; // Leave space for closing tags
+
+        // Add repeated lorem ipsum paragraphs until we reach the desired size
+        $paragraph = '<p>' . $loremIpsum . '</p>' . PHP_EOL;
+        $paragraphSize = strlen($paragraph);
+        $paragraphsNeeded = intval($remainingSize / $paragraphSize);
+
+        for ($i = 0; $i < $paragraphsNeeded; $i++) {
+            $html .= $paragraph;
+        }
+
+        // Add any remaining bytes as a final paragraph with padding
+        $currentSize = strlen($html);
+        $finalPadding = $sizeBytes - $currentSize - 20; // Account for closing tags
+        if ($finalPadding > 0) {
+            $html .= '<p>' . str_repeat('X', $finalPadding) . '</p>' . PHP_EOL;
+        }
+
+        // Close HTML tags
+        $html .= '
+    </div>
+</body>
+</html>';
+
+        // Send response with caching headers
+        htmlResponse($html, 200, [
+            'Cache-Control' => 'public, max-age=3600',
+            'X-Test-Type' => 'large-file',
+            'X-Test-Size-MB' => $sizeMB,
+            'X-Test-Size-Bytes' => strlen($html)
+        ]);
+        break;
+
     default:
         // Handle paths starting with /path/ for testing wildcard purging
         if (strpos($path, '/path/') === 0) {
-            textResponse('Dynamic path content: ' . $path . ' at ' . date('Y-m-d H:i:s'), 200, [
+            textResponse('Dynamic path content: ' . $path . ' at ' . date('Y-m-d H:i:s.u'), 200, [
                 'Cache-Control' => 'public, max-age=600',
                 'X-Test-Type' => 'dynamic-path',
                 'X-Test-Path' => $path

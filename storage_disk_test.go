@@ -17,7 +17,7 @@ func TestDiskCacheStorage(t *testing.T) {
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, 0, 0, largeDataSize, mediumDataSize*10, 100, logger)
+	storage := NewStorage(testCacheDir, testTTL, 1*1024*1024, 0, 0, largeDataSize, mediumDataSize*10, 100, logger)
 
 	// Test Set and Get operations on disk
 	testData := generateTestData(mediumDataSize)
@@ -64,7 +64,7 @@ func TestDiskCacheEvictionByCount(t *testing.T) {
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, 0, 0, largeDataSize, largeDataSize*10, 3, logger)
+	storage := NewStorage(testCacheDir, testTTL, 1*1024*1024, 0, 0, largeDataSize, 100*1024*1024, 3, logger)
 
 	// Add items to exceed count limit
 	for i := 0; i < 5; i++ {
@@ -115,7 +115,7 @@ func TestDiskCacheEvictionBySize(t *testing.T) {
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, 0, 0, largeDataSize, smallDataSize*3, 100, logger)
+	storage := NewStorage(testCacheDir, testTTL, 512*1024, 0, 0, largeDataSize, smallDataSize*3, 100, logger)
 
 	// Add items to exceed size limit
 	t.Logf("Max disk size: %d bytes", smallDataSize*3)
@@ -174,7 +174,7 @@ func TestMaxItemSizeDisk(t *testing.T) {
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, smallDataSize, 10, mediumDataSize, largeDataSize*10, 100, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, 0, 0, mediumDataSize, largeDataSize*10, 100, logger)
 
 	// Try to store item larger than max size
 	largeData := generateTestData(largeDataSize)
@@ -211,7 +211,7 @@ func TestConcurrentDiskAccess(t *testing.T) {
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, smallDataSize, 10, largeDataSize, largeDataSize*100, 1000, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, 0, 0, largeDataSize, largeDataSize*100, 1000, logger)
 
 	numGoroutines := 20
 	numOperations := 50
@@ -273,7 +273,7 @@ func TestDiskCacheStartupPerformance(t *testing.T) {
 
 	// Create initial storage and populate with many items
 	// Set memMaxSize to 0 to force all items to disk
-	storage := NewStorage(testCacheDir, testTTL, 0, 0, largeDataSize, largeDataSize*1000, 10000, logger)
+	storage := NewStorage(testCacheDir, testTTL, 1*1024*1024, 0, 0, largeDataSize, largeDataSize*1000, 10000, logger)
 
 	numItems := 100
 	for i := 0; i < numItems; i++ {
@@ -298,7 +298,7 @@ func TestDiskCacheStartupPerformance(t *testing.T) {
 	// Create new storage instance to test startup loading
 	startTime := time.Now()
 	// Also set memMaxSize to 0 for the second instance to ensure disk loading
-	storage2 := NewStorage(testCacheDir, testTTL, 0, 0, largeDataSize, largeDataSize*1000, 10000, logger)
+	storage2 := NewStorage(testCacheDir, testTTL, 1*1024*1024, 0, 0, largeDataSize, largeDataSize*1000, 10000, logger)
 
 	// Wait for async index loading to complete
 	storage2.WaitForAsyncOps()
@@ -353,7 +353,7 @@ func TestDiskSpacePressure(t *testing.T) {
 
 	logger := getTestLogger()
 	// Set memMaxSize to 0 to force all items to disk
-	storage := NewStorage(testCacheDir, testTTL, 0, 0, mediumDataSize, mediumDataSize*5, 100, logger)
+	storage := NewStorage(testCacheDir, testTTL, 1*1024*1024, 0, 0, mediumDataSize, mediumDataSize*5, 100, logger)
 
 	// Fill up the disk cache
 	for i := 0; i < 10; i++ {
@@ -414,7 +414,7 @@ func TestLRUEvictionOrder(t *testing.T) {
 
 	logger := getTestLogger()
 	// Set memMaxSize to 0 to force all items to disk for proper disk LRU testing
-	storage := NewStorage(testCacheDir, testTTL, 0, 0, largeDataSize, largeDataSize*10, 3, logger)
+	storage := NewStorage(testCacheDir, testTTL, 1*1024*1024, 0, 0, largeDataSize, largeDataSize*10, 3, logger)
 
 	// Add 3 items
 	for i := 0; i < 3; i++ {
@@ -461,7 +461,7 @@ func TestCompressionStorage(t *testing.T) {
 	core, obs := observer.New(zapcore.DebugLevel)
 	logger := zap.New(core)
 
-	storage := NewStorage(testCacheDir, testTTL, smallDataSize, 10, largeDataSize, largeDataSize*10, 100, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, 0, 0, largeDataSize, largeDataSize*10, 100, logger)
 
 	// Create highly compressible data (repeated pattern)
 	compressibleData := make([]byte, mediumDataSize)
@@ -540,7 +540,7 @@ func TestDiskCacheMetadataHandling(t *testing.T) {
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, smallDataSize, 10, largeDataSize, largeDataSize*10, 100, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, 0, 0, largeDataSize, largeDataSize*10, 100, logger)
 
 	// Create metadata with various fields
 	metadata := &Metadata{
@@ -602,7 +602,7 @@ func TestDiskCacheMetadataHandling(t *testing.T) {
 	}
 
 	// Test metadata persistence across storage restart
-	storage2 := NewStorage(testCacheDir, testTTL, smallDataSize, 10, largeDataSize, largeDataSize*10, 100, logger)
+	storage2 := NewStorage(testCacheDir, testTTL, smallDataSize, 0, 0, largeDataSize, largeDataSize*10, 100, logger)
 	// Wait for async index loading to complete
 	storage2.WaitForAsyncOps()
 	retrievedData2, retrievedMetadata2, err := storage2.Get(key)
@@ -625,7 +625,7 @@ func BenchmarkDiskCacheSet(b *testing.B) {
 	defer cleanupTestDir(b)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, smallDataSize, 10, veryLargeDataSize, veryLargeDataSize*100, 10000, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, 0, 0, veryLargeDataSize, veryLargeDataSize*100, 10000, logger)
 
 	data := generateTestData(mediumDataSize)
 	metadata := createTestMetadata()
@@ -649,7 +649,7 @@ func BenchmarkDiskCacheGet(b *testing.B) {
 	defer cleanupTestDir(b)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, smallDataSize, 10, veryLargeDataSize, veryLargeDataSize*100, 10000, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, 0, 0, veryLargeDataSize, veryLargeDataSize*100, 10000, logger)
 
 	// Pre-populate cache
 	data := generateTestData(mediumDataSize)
@@ -676,7 +676,7 @@ func BenchmarkDiskCacheEviction(b *testing.B) {
 	defer cleanupTestDir(b)
 
 	logger := getTestLogger()
-	storage := NewStorage(testCacheDir, testTTL, smallDataSize, 10, mediumDataSize, mediumDataSize*10, 10, logger)
+	storage := NewStorage(testCacheDir, testTTL, smallDataSize, 0, 0, mediumDataSize, mediumDataSize*10, 10, logger)
 
 	data := generateTestData(mediumDataSize)
 	metadata := createTestMetadata()
