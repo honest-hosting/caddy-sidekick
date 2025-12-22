@@ -8,7 +8,7 @@ help: ## Display this help screen (default)
 .PHONY: help
 
 all: clean build test test-bench test-stress test-integration ## Run all steps: clean, build, test, test-bench, test-stress, test-integration
-	@grep -ci 'FAIL:' /tmp/sidekick-*
+	@grep -ci 'FAIL:' /tmp/sidekick-* || true
 .PHONY: all
 
 lint: ## Run linter against codebase

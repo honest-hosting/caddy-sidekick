@@ -46,7 +46,8 @@ All environment variables use the `SIDEKICK_` prefix for namespace isolation:
 | `SIDEKICK_NOCACHE_REGEX` | Regex pattern for paths to bypass | `\.(jpg\|jpeg\|png\|gif\|ico\|css\|js\|svg\|woff\|woff2\|ttf\|eot\|otf\|mp4\|webm\|mp3\|ogg\|wav\|pdf\|zip\|tar\|gz\|7z\|exe\|doc\|docx\|xls\|xlsx\|ppt\|pptx)$` |
 | `SIDEKICK_CACHE_TTL` | Cache time-to-live in seconds | `6000` |
 | `SIDEKICK_PURGE_HEADER` | HTTP header name for purge token | `X-Sidekick-Purge` |
-| `SIDEKICK_PURGE_URI` | API endpoint for cache purging (absolute path, only a-z0-9-_/ allowed) | `/__sidekick/purge` |
+| `SIDEKICK_PURGE_PATH` | API endpoint for cache purging (absolute path, only a-z0-9-_/ allowed) | `/__sidekick/purge` |
+| `SIDEKICK_PURGE_URL` | Optional custom URL for cache purging (e.g., `https://api.example.com`) | _(empty)_ |
 | `SIDEKICK_PURGE_TOKEN` | Secret token for purge authentication (required when cache is enabled) | `dead-beef` |
 | `SIDEKICK_CACHE_MEMORY_ITEM_MAX_SIZE` | Max size for single item in memory (e.g., `4MB`, `0` = disabled, `-1` = unlimited) | `4MB` |
 | `SIDEKICK_CACHE_MEMORY_MAX_SIZE` | Total memory cache size limit (e.g., `128MB`, `0` = disabled, `-1` = unlimited) | `128MB` |
@@ -63,7 +64,7 @@ All environment variables use the `SIDEKICK_` prefix for namespace isolation:
 | `SIDEKICK_WP_MU_PLUGIN_ENABLED` | Enable automatic WordPress mu-plugin management | `true` |
 | `SIDEKICK_WP_MU_PLUGIN_DIR` | Directory for WordPress mu-plugins | `/var/www/html/wp-content/mu-plugins` |
 
-**Note:** When either memory or disk cache is enabled, all purge-related options (`SIDEKICK_PURGE_HEADER`, `SIDEKICK_PURGE_URI`, `SIDEKICK_PURGE_TOKEN`) are required to be set.
+**Note:** When either memory or disk cache is enabled, all purge-related options (`SIDEKICK_PURGE_HEADER`, `SIDEKICK_PURGE_PATH`, `SIDEKICK_PURGE_TOKEN`) are required to be set. The `SIDEKICK_PURGE_URL` is optional and only needed if you want to use a custom URL for cache purging instead of the WordPress site URL.
 
 ### Quick Start
 
@@ -82,7 +83,7 @@ example.com {
         cache_dir /var/www/cache
         cache_ttl 3600
         
-        purge_uri /__sidekick/purge
+        purge_path /__sidekick/purge
         purge_header X-Sidekick-Purge
         purge_token "change-this-secret"
     }
@@ -142,9 +143,12 @@ example.com {
         nocache_regex "\\.(mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe)$"
         
         # Purge endpoint configuration (required when cache is enabled)
-        purge_uri /__sidekick/purge
+        purge_path /__sidekick/purge
         purge_header X-Sidekick-Purge
         purge_token "your-secret-token-here"  # CHANGE THIS!
+        
+        # Optional: Use custom URL for cache purging (e.g., when behind a proxy)
+        # purge_url https://api.example.com
         
         # Memory cache limits
         cache_memory_item_max_size 4MB
@@ -240,7 +244,8 @@ example.com {
                           "nocache": ["/wp-admin", "/wp-json", "/wp-login.php"],
                           "nocache_home": false,
                           "nocache_regex": "\\.(mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe)$",
-                          "purge_uri": "/__sidekick/purge",
+                          "purge_path": "/__sidekick/purge",
+                          "purge_url": "",
                           "purge_header": "X-Sidekick-Purge",
                           "purge_token": "your-secret-token-here",
                           "cache_memory_item_max_size": 4194304,
@@ -391,6 +396,9 @@ curl -X POST https://example.com/__sidekick/purge \
 Sidekick automatically manages WordPress must-use plugins when `wp_mu_plugin_enabled` is set to `true` (default). These plugins provide:
 
 1. **Content Cache Purge**: Automatically purges cache when posts are updated
+   - Uses `SIDEKICK_PURGE_URL` if set to send purge requests to a custom URL (e.g., `https://api.example.com`)
+   - Falls back to WordPress `get_site_url()` if `SIDEKICK_PURGE_URL` is not set
+   - Constructs the full purge URL as `{SIDEKICK_PURGE_URL}{SIDEKICK_PURGE_PATH}` or `{get_site_url()}{SIDEKICK_PURGE_PATH}`
 2. **Force URL Rewrite**: Ensures proper URL handling for WordPress
 
 The mu-plugins are:

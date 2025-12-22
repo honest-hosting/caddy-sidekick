@@ -35,7 +35,7 @@ func TestPurgeConfiguration(t *testing.T) {
 		envVars     map[string]string
 		expectError bool
 		expected    struct {
-			purgeURI    string
+			purgePath   string
 			purgeHeader string
 			purgeToken  string
 		}
@@ -48,11 +48,11 @@ func TestPurgeConfiguration(t *testing.T) {
 			},
 			expectError: false,
 			expected: struct {
-				purgeURI    string
+				purgePath   string
 				purgeHeader string
 				purgeToken  string
 			}{
-				purgeURI:    "/__sidekick/purge",
+				purgePath:   "/__sidekick/purge",
 				purgeHeader: "X-Sidekick-Purge",
 				purgeToken:  "dead-beef",
 			},
@@ -61,18 +61,18 @@ func TestPurgeConfiguration(t *testing.T) {
 			name: "custom values from env",
 			envVars: map[string]string{
 				"SIDEKICK_CACHE_DIR":             t.TempDir(),
-				"SIDEKICK_PURGE_URI":             "/custom/purge",
+				"SIDEKICK_PURGE_PATH":            "/custom/purge",
 				"SIDEKICK_PURGE_HEADER":          "X-Custom-Header",
 				"SIDEKICK_PURGE_TOKEN":           "custom-token-123",
 				"SIDEKICK_CACHE_MEMORY_MAX_SIZE": "1MB",
 			},
 			expectError: false,
 			expected: struct {
-				purgeURI    string
+				purgePath   string
 				purgeHeader string
 				purgeToken  string
 			}{
-				purgeURI:    "/custom/purge",
+				purgePath:   "/custom/purge",
 				purgeHeader: "X-Custom-Header",
 				purgeToken:  "custom-token-123",
 			},
@@ -81,7 +81,7 @@ func TestPurgeConfiguration(t *testing.T) {
 			name: "invalid purge URI - no leading slash",
 			envVars: map[string]string{
 				"SIDEKICK_CACHE_DIR":             t.TempDir(),
-				"SIDEKICK_PURGE_URI":             "custom/purge",
+				"SIDEKICK_PURGE_PATH":            "custom/purge",
 				"SIDEKICK_CACHE_MEMORY_MAX_SIZE": "1MB",
 			},
 			expectError: true,
@@ -90,7 +90,7 @@ func TestPurgeConfiguration(t *testing.T) {
 			name: "invalid purge URI - uppercase letters",
 			envVars: map[string]string{
 				"SIDEKICK_CACHE_DIR":             t.TempDir(),
-				"SIDEKICK_PURGE_URI":             "/Custom/Purge",
+				"SIDEKICK_PURGE_PATH":            "/Custom/Purge",
 				"SIDEKICK_CACHE_MEMORY_MAX_SIZE": "1MB",
 			},
 			expectError: true,
@@ -99,7 +99,7 @@ func TestPurgeConfiguration(t *testing.T) {
 			name: "invalid purge URI - special characters",
 			envVars: map[string]string{
 				"SIDEKICK_CACHE_DIR":             t.TempDir(),
-				"SIDEKICK_PURGE_URI":             "/custom_purge!",
+				"SIDEKICK_PURGE_PATH":            "/custom_purge!",
 				"SIDEKICK_CACHE_MEMORY_MAX_SIZE": "1MB",
 			},
 			expectError: true,
@@ -113,11 +113,11 @@ func TestPurgeConfiguration(t *testing.T) {
 			},
 			expectError: false,
 			expected: struct {
-				purgeURI    string
+				purgePath   string
 				purgeHeader string
 				purgeToken  string
 			}{
-				purgeURI:    "/__sidekick/purge",
+				purgePath:   "/__sidekick/purge",
 				purgeHeader: "X-Sidekick-Purge",
 				purgeToken:  "dead-beef", // Should get default value
 			},
@@ -151,8 +151,8 @@ func TestPurgeConfiguration(t *testing.T) {
 				}
 
 				// Verify configuration
-				if s.PurgeURI != tt.expected.purgeURI {
-					t.Errorf("PurgeURI: expected %s, got %s", tt.expected.purgeURI, s.PurgeURI)
+				if s.PurgePath != tt.expected.purgePath {
+					t.Errorf("PurgePath: expected %s, got %s", tt.expected.purgePath, s.PurgePath)
 				}
 				if s.PurgeHeader != tt.expected.purgeHeader {
 					t.Errorf("PurgeHeader: expected %s, got %s", tt.expected.purgeHeader, s.PurgeHeader)
@@ -172,7 +172,7 @@ func TestPurgeHandler(t *testing.T) {
 	s := &Sidekick{
 		CacheDir:               tmpDir,
 		CacheTTL:               60,
-		PurgeURI:               "/__sidekick/purge",
+		PurgePath:              "/__sidekick/purge",
 		PurgeHeader:            "X-Sidekick-Purge",
 		PurgeToken:             "test-token",
 		CacheMemoryItemMaxSize: 1024 * 1024,      // 1MB
@@ -500,7 +500,7 @@ func TestPurgePathVariations(t *testing.T) {
 	s := &Sidekick{
 		CacheDir:               tmpDir,
 		CacheTTL:               60,
-		PurgeURI:               "/__sidekick/purge",
+		PurgePath:              "/__sidekick/purge",
 		PurgeHeader:            "X-Sidekick-Purge",
 		PurgeToken:             "test-token",
 		CacheMemoryItemMaxSize: 1024 * 1024,      // 1MB
@@ -681,7 +681,7 @@ func TestPurgeBackwardCompatibility(t *testing.T) {
 	s := &Sidekick{
 		CacheDir:               tmpDir,
 		CacheTTL:               60,
-		PurgeURI:               "/__sidekick/purge",
+		PurgePath:              "/__sidekick/purge",
 		PurgeHeader:            "X-Sidekick-Purge",
 		PurgeToken:             "test-token",
 		CacheMemoryItemMaxSize: 1024 * 1024,      // 1MB
@@ -849,55 +849,55 @@ func TestPurgeBackwardCompatibility(t *testing.T) {
 	}
 }
 
-func TestPurgeURIValidation(t *testing.T) {
+func TestPurgePathValidation(t *testing.T) {
 	tests := []struct {
 		name        string
-		purgeURI    string
+		purgePath   string
 		shouldError bool
 	}{
 		{
 			name:        "valid simple path",
-			purgeURI:    "/purge",
+			purgePath:   "/purge",
 			shouldError: false,
 		},
 		{
 			name:        "valid path with hyphens",
-			purgeURI:    "/sidekick-purge",
+			purgePath:   "/sidekick-purge",
 			shouldError: false,
 		},
 		{
 			name:        "valid nested path",
-			purgeURI:    "/api/v1/cache/purge",
+			purgePath:   "/api/v1/cache/purge",
 			shouldError: false,
 		},
 		{
 			name:        "invalid - no leading slash",
-			purgeURI:    "purge",
+			purgePath:   "purge",
 			shouldError: true,
 		},
 		{
 			name:        "invalid - uppercase letters",
-			purgeURI:    "/PURGE",
+			purgePath:   "/PURGE",
 			shouldError: true,
 		},
 		{
 			name:        "valid path with underscore",
-			purgeURI:    "/purge_cache",
+			purgePath:   "/purge_cache",
 			shouldError: false,
 		},
 		{
 			name:        "invalid - special characters",
-			purgeURI:    "/purge!",
+			purgePath:   "/purge!",
 			shouldError: true,
 		},
 		{
 			name:        "invalid - spaces",
-			purgeURI:    "/purge cache",
+			purgePath:   "/purge cache",
 			shouldError: true,
 		},
 		{
 			name:        "invalid - dots",
-			purgeURI:    "/purge.php",
+			purgePath:   "/purge.php",
 			shouldError: true,
 		},
 	}
@@ -906,7 +906,7 @@ func TestPurgeURIValidation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Sidekick{
 				CacheDir:            t.TempDir(),
-				PurgeURI:            tt.purgeURI,
+				PurgePath:           tt.purgePath,
 				PurgeHeader:         "X-Sidekick-Purge",
 				PurgeToken:          "test-token",
 				CacheMemoryMaxSize:  1024 * 1024,
@@ -918,11 +918,119 @@ func TestPurgeURIValidation(t *testing.T) {
 			err := s.Provision(ctx)
 
 			if tt.shouldError && err == nil {
-				t.Errorf("Expected error for purge_uri '%s', but got none", tt.purgeURI)
+				t.Errorf("Expected error for purge_path '%s', but got none", tt.purgePath)
 			}
 			if !tt.shouldError && err != nil {
-				t.Errorf("Unexpected error for purge_uri '%s': %v", tt.purgeURI, err)
+				t.Errorf("Unexpected error for purge_path '%s': %v", tt.purgePath, err)
 			}
 		})
+	}
+}
+
+func TestPurgeURLValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		purgeURL    string
+		shouldError bool
+	}{
+		{
+			name:        "valid http URL",
+			purgeURL:    "http://example.com/purge",
+			shouldError: false,
+		},
+		{
+			name:        "valid https URL",
+			purgeURL:    "https://example.com/purge",
+			shouldError: false,
+		},
+		{
+			name:        "valid URL with port",
+			purgeURL:    "https://example.com:8080/purge",
+			shouldError: false,
+		},
+		{
+			name:        "valid URL with path",
+			purgeURL:    "https://api.example.com/v1/cache",
+			shouldError: false,
+		},
+		{
+			name:        "empty URL is valid (optional field)",
+			purgeURL:    "",
+			shouldError: false,
+		},
+		{
+			name:        "invalid - no scheme",
+			purgeURL:    "example.com/purge",
+			shouldError: true,
+		},
+		{
+			name:        "invalid - ftp scheme",
+			purgeURL:    "ftp://example.com/purge",
+			shouldError: true,
+		},
+		{
+			name:        "invalid - no host",
+			purgeURL:    "https:///purge",
+			shouldError: true,
+		},
+		{
+			name:        "invalid - malformed URL",
+			purgeURL:    "https://[invalid",
+			shouldError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Sidekick{
+				CacheDir:            t.TempDir(),
+				PurgePath:           "/__sidekick/purge",
+				PurgeURL:            tt.purgeURL,
+				PurgeHeader:         "X-Sidekick-Purge",
+				PurgeToken:          "test-token",
+				CacheMemoryMaxSize:  1024 * 1024,
+				CacheMemoryMaxCount: 100,
+			}
+
+			ctx := caddy.Context{}
+			err := s.Provision(ctx)
+
+			if tt.shouldError && err == nil {
+				t.Errorf("Expected error for purge_url '%s', but got none", tt.purgeURL)
+			}
+			if !tt.shouldError && err != nil {
+				t.Errorf("Unexpected error for purge_url '%s': %v", tt.purgeURL, err)
+			}
+		})
+	}
+}
+
+func TestPurgeWithCustomURL(t *testing.T) {
+	// Create temp directory for cache
+	tmpDir := t.TempDir()
+
+	s := &Sidekick{
+		CacheDir:               tmpDir,
+		CacheTTL:               60,
+		PurgePath:              "/__sidekick/purge",
+		PurgeURL:               "https://api.example.com",
+		PurgeHeader:            "X-Sidekick-Purge",
+		PurgeToken:             "test-token",
+		CacheMemoryItemMaxSize: 1024 * 1024,      // 1MB
+		CacheMemoryMaxSize:     10 * 1024 * 1024, // 10MB
+		CacheMemoryMaxCount:    100,
+		CacheResponseCodes:     []string{"200"},
+	}
+
+	// Initialize
+	ctx := caddy.Context{}
+	err := s.Provision(ctx)
+	if err != nil {
+		t.Fatalf("Failed to provision: %v", err)
+	}
+
+	// Verify PurgeURL is set
+	if s.PurgeURL != "https://api.example.com" {
+		t.Errorf("Expected PurgeURL to be 'https://api.example.com', got '%s'", s.PurgeURL)
 	}
 }

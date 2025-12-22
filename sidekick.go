@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -35,7 +36,8 @@ var (
 type Sidekick struct {
 	logger             *zap.Logger
 	CacheDir           string   `json:"cache_dir,omitempty"`
-	PurgeURI           string   `json:"purge_uri,omitempty"`
+	PurgePath          string   `json:"purge_path,omitempty"`
+	PurgeURL           string   `json:"purge_url,omitempty"`
 	PurgeHeader        string   `json:"purge_header,omitempty"`
 	PurgeToken         string   `json:"purge_token,omitempty"`
 	Metrics            string   `json:"metrics,omitempty"`       // Admin API path to expose metrics (e.g., "/metrics/sidekick")
@@ -221,16 +223,30 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				s.CacheTTL = ttl
 
-			case "purge_uri":
+			case "purge_path":
 				// Validate that it's an absolute path with only allowed chars
 				if !strings.HasPrefix(value, "/") {
-					return d.Errf("purge_uri must be an absolute path starting with /")
+					return d.Errf("purge_path must be an absolute path starting with /")
 				}
-				purgeURIRegex := regexp.MustCompile(`^/[a-z0-9\-/_]*$`)
-				if !purgeURIRegex.MatchString(value) {
-					return d.Errf("purge_uri can only contain lowercase letters, numbers, hyphens, underscores, and forward slashes")
+				purgePathRegex := regexp.MustCompile(`^/[a-z0-9\-/_]*$`)
+				if !purgePathRegex.MatchString(value) {
+					return d.Errf("purge_path can only contain lowercase letters, numbers, hyphens, underscores, and forward slashes")
 				}
-				s.PurgeURI = value
+				s.PurgePath = value
+
+			case "purge_url":
+				// Validate that it's a valid URL
+				parsedURL, err := url.Parse(value)
+				if err != nil {
+					return d.Errf("purge_url must be a valid URL: %v", err)
+				}
+				if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+					return d.Errf("purge_url must use http or https scheme")
+				}
+				if parsedURL.Host == "" {
+					return d.Errf("purge_url must include a host")
+				}
+				s.PurgeURL = value
 
 			case "purge_header":
 				s.PurgeHeader = strings.TrimSpace(value)
@@ -419,7 +435,7 @@ const (
 	DefaultMemoryCacheMaxSize  = 128 * 1024 * 1024 // 128MB
 	DefaultMemoryCacheMaxCount = 32 * 1024         // 32K items
 	DefaultBypassDebugQuery    = "sidekick-nocache"
-	DefaultPurgeURI            = "/__sidekick/purge"
+	DefaultPurgePath           = "/__sidekick/purge"
 	DefaultPurgeHeader         = "X-Sidekick-Purge"
 	DefaultPurgeToken          = "dead-beef"
 	CacheHeaderName            = "X-Sidekick-Cache" // Not configurable
@@ -540,18 +556,36 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 		}
 	}
 
-	if s.PurgeURI == "" {
-		s.PurgeURI = os.Getenv("SIDEKICK_PURGE_URI")
-		if s.PurgeURI == "" {
-			s.PurgeURI = DefaultPurgeURI
+	if s.PurgePath == "" {
+		s.PurgePath = os.Getenv("SIDEKICK_PURGE_PATH")
+		if s.PurgePath == "" {
+			s.PurgePath = DefaultPurgePath
 		}
 	}
-	// Validate PurgeURI format
-	if !strings.HasPrefix(s.PurgeURI, "/") {
-		return fmt.Errorf("purge_uri must be an absolute path starting with /")
+	// Validate PurgePath format
+	if !strings.HasPrefix(s.PurgePath, "/") {
+		return fmt.Errorf("purge_path must be an absolute path starting with /")
 	}
-	if matched, _ := regexp.MatchString(`^/[a-z0-9\-/_]*$`, s.PurgeURI); !matched {
-		return fmt.Errorf("purge_uri can only contain lowercase letters, numbers, hyphens, underscores, and forward slashes")
+	if matched, _ := regexp.MatchString(`^/[a-z0-9\-/_]*$`, s.PurgePath); !matched {
+		return fmt.Errorf("purge_path can only contain lowercase letters, numbers, hyphens, underscores, and forward slashes")
+	}
+
+	// Handle PurgeURL if provided
+	if s.PurgeURL == "" {
+		s.PurgeURL = os.Getenv("SIDEKICK_PURGE_URL")
+	}
+	if s.PurgeURL != "" {
+		// Validate PurgeURL format
+		parsedURL, err := url.Parse(s.PurgeURL)
+		if err != nil {
+			return fmt.Errorf("purge_url must be a valid URL: %v", err)
+		}
+		if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+			return fmt.Errorf("purge_url must use http or https scheme")
+		}
+		if parsedURL.Host == "" {
+			return fmt.Errorf("purge_url must include a host")
+		}
 	}
 
 	if s.PurgeHeader == "" {
@@ -898,8 +932,8 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 	cacheEnabled := (memMaxSize > 0 && memMaxCount > 0) || (diskMaxSize > 0 && diskMaxCount > 0)
 	if cacheEnabled {
 		// These fields are required when cache is enabled
-		if s.PurgeURI == "" {
-			return fmt.Errorf("purge_uri is required when cache is enabled")
+		if s.PurgePath == "" {
+			return fmt.Errorf("purge_path is required when cache is enabled")
 		}
 		if s.PurgeHeader == "" {
 			return fmt.Errorf("purge_header is required when cache is enabled")
@@ -960,7 +994,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	metrics := GetMetrics()
 
 	// Handle purge requests
-	if strings.HasPrefix(r.URL.Path, s.PurgeURI) {
+	if strings.HasPrefix(r.URL.Path, s.PurgePath) {
 		return s.handlePurgeRequest(w, r, storage)
 	}
 

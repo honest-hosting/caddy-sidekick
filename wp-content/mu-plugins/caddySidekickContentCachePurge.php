@@ -21,20 +21,22 @@ function sidekick_get_config() {
     }
 
     // prefer getenv() (server-level env)
-    $uri    = getenv('SIDEKICK_PURGE_URI') ?: ($_SERVER['SIDEKICK_PURGE_URI'] ?? null);
+    $path   = getenv('SIDEKICK_PURGE_PATH') ?: ($_SERVER['SIDEKICK_PURGE_PATH'] ?? null);
+    $url    = getenv('SIDEKICK_PURGE_URL') ?: ($_SERVER['SIDEKICK_PURGE_URL'] ?? null);
     $header = getenv('SIDEKICK_PURGE_HEADER') ?: ($_SERVER['SIDEKICK_PURGE_HEADER'] ?? null);
     $token  = getenv('SIDEKICK_PURGE_TOKEN') ?: ($_SERVER['SIDEKICK_PURGE_TOKEN'] ?? null);
 
-    if (!$uri || !$header || !$token) {
+    if (!$path || !$header || !$token) {
         error_log("[Sidekick] Missing configuration: " . json_encode([
-            "SIDEKICK_PURGE_URI"    => (bool) $uri,
+            "SIDEKICK_PURGE_PATH"   => (bool) $path,
             "SIDEKICK_PURGE_HEADER" => (bool) $header,
             "SIDEKICK_PURGE_TOKEN"  => (bool) $token,
         ]));
         $conf = null;
     } else {
         $conf = [
-            'uri'    => $uri,
+            'path'   => $path,
+            'url'    => $url,
             'header' => $header,
             'token'  => $token,
         ];
@@ -52,7 +54,12 @@ function sidekick_purge_paths(array $paths) {
         return;
     }
 
-    $url = get_site_url() . $conf['uri'];
+    // Use custom URL if provided, otherwise use WordPress site URL
+    if (!empty($conf['url'])) {
+        $url = $conf['url'] . $conf['path'];
+    } else {
+        $url = get_site_url() . $conf['path'];
+    }
 
     $response = wp_remote_post($url, [
         'body' => ['paths' => array_values(array_unique($paths))],

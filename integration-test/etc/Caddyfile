@@ -44,7 +44,7 @@
 		nocache_regex "\.(mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe)$"
 
 		# Purge endpoint configuration
-		purge_uri /__sidekick/purge
+		purge_path /__sidekick/purge
 		purge_header X-Sidekick-Purge
 		purge_token test-token-12345
 
