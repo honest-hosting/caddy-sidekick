@@ -40,11 +40,11 @@ All environment variables use the `SIDEKICK_` prefix for namespace isolation:
 |---------------------|-------------|---------|
 | `SIDEKICK_CACHE_DIR` | Cache storage directory | `/var/www/html/wp-content/cache` |
 | `SIDEKICK_METRICS` | Enable metrics and set admin API path (e.g., `/metrics/sidekick`) | _(disabled)_ |
-| `SIDEKICK_CACHE_RESPONSE_CODES` | HTTP status codes to cache (comma-separated) | `200,404,405` |
-| `SIDEKICK_NOCACHE` | Path prefixes to bypass cache (comma-separated) | `/wp-admin,/wp-json` |
+| `SIDEKICK_CACHE_RESPONSE_CODES` | HTTP status codes to cache (comma-separated) | `2XX,301,302` |
+| `SIDEKICK_NOCACHE` | Path prefixes to bypass cache (comma-separated, uses prefix matching) | `/wp-admin,/wp-json` |
 | `SIDEKICK_NOCACHE_HOME` | Skip caching home page | `false` |
 | `SIDEKICK_NOCACHE_REGEX` | Regex pattern for paths to bypass | `\.(jpg\|jpeg\|png\|gif\|ico\|css\|js\|svg\|woff\|woff2\|ttf\|eot\|otf\|mp4\|webm\|mp3\|ogg\|wav\|pdf\|zip\|tar\|gz\|7z\|exe\|doc\|docx\|xls\|xlsx\|ppt\|pptx)$` |
-| `SIDEKICK_CACHE_TTL` | Cache time-to-live in seconds | `6000` |
+| `SIDEKICK_CACHE_TTL` | Cache time-to-live in seconds | `300` |
 | `SIDEKICK_PURGE_HEADER` | HTTP header name for purge token | `X-Sidekick-Purge` |
 | `SIDEKICK_PURGE_PATH` | API endpoint for cache purging (absolute path, only a-z0-9-_/ allowed) | `/__sidekick/purge` |
 | `SIDEKICK_PURGE_URL` | Optional custom URL for cache purging (e.g., `https://api.example.com`) | _(empty)_ |
@@ -58,9 +58,9 @@ All environment variables use the `SIDEKICK_` prefix for namespace isolation:
 | `SIDEKICK_CACHE_DISK_MAX_SIZE` | Total disk cache size limit (e.g., `10GB`, `0` = disabled, `-1` = unlimited) | `10GB` |
 | `SIDEKICK_CACHE_DISK_MAX_PERCENT` | Disk cache as % of available space (1-100, `0` = disabled, `-1` = unlimited). Mutually exclusive with `SIDEKICK_CACHE_DISK_MAX_SIZE` | _(none)_ |
 | `SIDEKICK_CACHE_DISK_MAX_COUNT` | Max number of items in disk cache (`-1` = unlimited, `0` = disabled) | `100000` |
-| `SIDEKICK_CACHE_KEY_HEADERS` | Headers to include in cache key (comma-separated) | _(none)_ |
-| `SIDEKICK_CACHE_KEY_QUERIES` | Query parameters to include in cache key (comma-separated, use `*` for all) | _(none)_ |
-| `SIDEKICK_CACHE_KEY_COOKIES` | Cookies to include in cache key (comma-separated) | _(none)_ |
+| `SIDEKICK_CACHE_KEY_HEADERS` | Headers to include in cache key (comma-separated) | `Accept-Encoding` |
+| `SIDEKICK_CACHE_KEY_QUERIES` | Query parameters to include in cache key (comma-separated, use `*` for all) | `p,page,paged,s,category,tag,author` |
+| `SIDEKICK_CACHE_KEY_COOKIES` | Cookies to include in cache key (comma-separated, supports wildcards with `*`) | `wordpress_logged_in_*,wordpress_sec_*,wp-settings-*` |
 | `SIDEKICK_WP_MU_PLUGIN_ENABLED` | Enable automatic WordPress mu-plugin management | `true` |
 | `SIDEKICK_WP_MU_PLUGIN_DIR` | Directory for WordPress mu-plugins | `/var/www/html/wp-content/mu-plugins` |
 
@@ -126,13 +126,13 @@ example.com {
         # Cache storage location
         cache_dir /var/www/cache
         
-        # Cache TTL in seconds (1 hour)
+        # Cache TTL in seconds (default: 300)
         cache_ttl 3600
         
         # HTTP status codes to cache
         cache_response_codes 200 301 302
         
-        # Paths to bypass cache (WordPress paths)
+        # Paths to bypass cache (uses prefix matching, so /wp-admin matches /wp-admin/*)
         nocache /wp-admin /wp-json /wp-login.php
         
         # Don't cache home page (optional)
@@ -161,10 +161,12 @@ example.com {
         cache_disk_max_size 10GB
         cache_disk_max_count 100000
         
-        # Cache key customization
-        cache_key_queries page sort filter     # Include these query params
-        cache_key_headers Accept-Language      # Vary cache by these headers
-        cache_key_cookies wordpress_logged_in_* # Include these cookies
+        # Cache key customization (defaults shown below if omitted)
+        # Note: Set to "" (empty string) to disable, but this is not recommended
+        cache_key_queries page sort filter     # Default: p,page,paged,s,category,tag,author
+        cache_key_headers Accept-Language      # Default: Accept-Encoding
+        cache_key_cookies session_id user_*    # Default: wordpress_logged_in_*,wordpress_sec_*,wp-settings-*
+                                                # Supports wildcards with * for prefix matching
         
         # WordPress mu-plugin management
         wp_mu_plugin_enabled true
@@ -418,6 +420,61 @@ Or via environment variable:
 ```bash
 SIDEKICK_WP_MU_PLUGIN_ENABLED=false
 ```
+
+## Cache Key Configuration
+
+### Default Cache Key Components
+
+By default, Sidekick includes the following in cache keys:
+
+- **Query Parameters**: `p`, `page`, `paged`, `s`, `category`, `tag`, `author` (common WordPress parameters)
+- **Headers**: `Accept-Encoding` (to vary cache by compression support)
+- **Cookies**: `wordpress_logged_in_*`, `wordpress_sec_*`, `wp-settings-*` (WordPress session cookies, with wildcard support)
+
+### Customizing Cache Keys
+
+You can override these defaults in your Caddyfile:
+
+```caddyfile
+sidekick {
+    # Include all query parameters in cache key
+    cache_key_queries *
+    
+    # Include specific headers
+    cache_key_headers Accept-Language User-Agent
+    
+    # Include cookies with wildcard patterns
+    cache_key_cookies session_* user_pref_*
+}
+```
+
+**Important**: Setting any of these to an empty string (`""`) will disable that component entirely, which is not recommended as it may cause cache pollution. If you see warnings about empty cache key options, consider if you really want to disable them.
+
+### Cookie Wildcard Matching
+
+The `cache_key_cookies` option supports wildcard patterns using `*` for prefix matching:
+- `wordpress_logged_in_*` matches any cookie starting with `wordpress_logged_in_`
+- `session_*` matches `session_id`, `session_token`, etc.
+- Exact names (without `*`) only match that specific cookie
+
+## NoCache Path Matching
+
+The `nocache` option uses **prefix matching** for paths:
+
+```caddyfile
+sidekick {
+    # This will bypass cache for:
+    # - /wp-admin
+    # - /wp-admin/index.php
+    # - /wp-admin/users.php
+    # - /wp-json
+    # - /wp-json/wp/v2/posts
+    # - /wp-json-custom (any path starting with /wp-json)
+    nocache /wp-admin /wp-json
+}
+```
+
+This makes it easy to exclude entire sections of your site from caching without listing every possible path.
 
 ## Size Configuration Guidelines
 

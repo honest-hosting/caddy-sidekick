@@ -318,8 +318,15 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				s.CacheMemoryStreamToDiskSize = size
 
 			case "cache_key_headers":
-				// Ignore empty values
-				if value != "" {
+				// Check if value is explicitly empty
+				if value == "" {
+					// Mark as explicitly empty by setting to empty slice (not nil)
+					s.CacheKeyHeaders = []string{}
+					// Consume any remaining arguments
+					for d.NextArg() {
+						// Skip
+					}
+				} else {
 					headers := strings.Split(value, ",")
 					for d.NextArg() {
 						headers = append(headers, strings.Split(d.Val(), ",")...)
@@ -336,17 +343,22 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					}
 					if len(nonEmptyHeaders) > 0 {
 						s.CacheKeyHeaders = nonEmptyHeaders
-					}
-				} else {
-					// Consume any remaining arguments even if value is empty
-					for d.NextArg() {
-						// Skip
+					} else {
+						// All were empty after trimming, treat as explicitly empty
+						s.CacheKeyHeaders = []string{}
 					}
 				}
 
 			case "cache_key_queries":
-				// Ignore empty values
-				if value != "" {
+				// Check if value is explicitly empty
+				if value == "" {
+					// Mark as explicitly empty by setting to empty slice (not nil)
+					s.CacheKeyQueries = []string{}
+					// Consume any remaining arguments
+					for d.NextArg() {
+						// Skip
+					}
+				} else {
 					queries := strings.Split(value, ",")
 					for d.NextArg() {
 						queries = append(queries, strings.Split(d.Val(), ",")...)
@@ -363,17 +375,22 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					}
 					if len(nonEmptyQueries) > 0 {
 						s.CacheKeyQueries = nonEmptyQueries
-					}
-				} else {
-					// Consume any remaining arguments even if value is empty
-					for d.NextArg() {
-						// Skip
+					} else {
+						// All were empty after trimming, treat as explicitly empty
+						s.CacheKeyQueries = []string{}
 					}
 				}
 
 			case "cache_key_cookies":
-				// Ignore empty values
-				if value != "" {
+				// Check if value is explicitly empty
+				if value == "" {
+					// Mark as explicitly empty by setting to empty slice (not nil)
+					s.CacheKeyCookies = []string{}
+					// Consume any remaining arguments
+					for d.NextArg() {
+						// Skip
+					}
+				} else {
 					cookies := strings.Split(value, ",")
 					for d.NextArg() {
 						cookies = append(cookies, strings.Split(d.Val(), ",")...)
@@ -390,11 +407,9 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					}
 					if len(nonEmptyCookies) > 0 {
 						s.CacheKeyCookies = nonEmptyCookies
-					}
-				} else {
-					// Consume any remaining arguments even if value is empty
-					for d.NextArg() {
-						// Skip
+					} else {
+						// All were empty after trimming, treat as explicitly empty
+						s.CacheKeyCookies = []string{}
 					}
 				}
 
@@ -440,7 +455,7 @@ const (
 	DefaultPurgeToken          = "dead-beef"
 	CacheHeaderName            = "X-Sidekick-Cache" // Not configurable
 	DefaultNoCacheRegex        = `\.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot|otf|mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe|doc|docx|xls|xlsx|ppt|pptx)$`
-	DefaultTTL                 = 6000
+	DefaultTTL                 = 300
 	DefaultDiskItemMaxSize     = 100 * 1024 * 1024                     // 100MB
 	DefaultDiskMaxSize         = 10 * 1024 * 1024 * 1024               // 10GB
 	DefaultDiskMaxCount        = 100000                                // 100K items on disk
@@ -771,7 +786,7 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 	}
 
 	// Load cache key configuration from environment
-	if len(s.CacheKeyHeaders) == 0 {
+	if s.CacheKeyHeaders == nil {
 		if envVal := os.Getenv("SIDEKICK_CACHE_KEY_HEADERS"); envVal != "" {
 			headers := strings.Split(envVal, ",")
 			var nonEmptyHeaders []string
@@ -784,10 +799,17 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 			if len(nonEmptyHeaders) > 0 {
 				s.CacheKeyHeaders = nonEmptyHeaders
 			}
+		} else {
+			// Set default if not provided
+			s.CacheKeyHeaders = []string{"Accept-Encoding"}
+			s.logger.Info("Using default cache_key_headers", zap.Strings("headers", s.CacheKeyHeaders))
 		}
+	} else if len(s.CacheKeyHeaders) == 0 {
+		// Explicitly empty, warn but continue
+		s.logger.Warn("cache_key_headers is explicitly empty, which is not recommended")
 	}
 
-	if len(s.CacheKeyQueries) == 0 {
+	if s.CacheKeyQueries == nil {
 		if envVal := os.Getenv("SIDEKICK_CACHE_KEY_QUERIES"); envVal != "" {
 			queries := strings.Split(envVal, ",")
 			var nonEmptyQueries []string
@@ -800,10 +822,17 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 			if len(nonEmptyQueries) > 0 {
 				s.CacheKeyQueries = nonEmptyQueries
 			}
+		} else {
+			// Set default if not provided
+			s.CacheKeyQueries = []string{"p", "page", "paged", "s", "category", "tag", "author"}
+			s.logger.Info("Using default cache_key_queries", zap.Strings("queries", s.CacheKeyQueries))
 		}
+	} else if len(s.CacheKeyQueries) == 0 {
+		// Explicitly empty, warn but continue
+		s.logger.Warn("cache_key_queries is explicitly empty, which is not recommended")
 	}
 
-	if len(s.CacheKeyCookies) == 0 {
+	if s.CacheKeyCookies == nil {
 		if envVal := os.Getenv("SIDEKICK_CACHE_KEY_COOKIES"); envVal != "" {
 			cookies := strings.Split(envVal, ",")
 			var nonEmptyCookies []string
@@ -816,7 +845,14 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 			if len(nonEmptyCookies) > 0 {
 				s.CacheKeyCookies = nonEmptyCookies
 			}
+		} else {
+			// Set default if not provided
+			s.CacheKeyCookies = []string{"wordpress_logged_in_*", "wordpress_sec_*", "wp-settings-*"}
+			s.logger.Info("Using default cache_key_cookies", zap.Strings("cookies", s.CacheKeyCookies))
 		}
+	} else if len(s.CacheKeyCookies) == 0 {
+		// Explicitly empty, warn but continue
+		s.logger.Warn("cache_key_cookies is explicitly empty, which is not recommended")
 	}
 
 	// Convert size values for storage initialization
@@ -1548,10 +1584,22 @@ func (s *Sidekick) buildCacheKey(r *http.Request) string {
 		}
 	}
 
-	// Include configured cookies
-	for _, cookieName := range s.CacheKeyCookies {
-		if cookie, err := r.Cookie(cookieName); err == nil {
-			h.Write([]byte(cookieName + "=" + cookie.Value))
+	// Include configured cookies (with wildcard support)
+	for _, cookiePattern := range s.CacheKeyCookies {
+		// Check if pattern contains wildcard
+		if strings.Contains(cookiePattern, "*") {
+			// Convert wildcard to prefix matching
+			prefix := strings.TrimSuffix(cookiePattern, "*")
+			for _, cookie := range r.Cookies() {
+				if strings.HasPrefix(cookie.Name, prefix) {
+					h.Write([]byte(cookie.Name + "=" + cookie.Value))
+				}
+			}
+		} else {
+			// Exact match
+			if cookie, err := r.Cookie(cookiePattern); err == nil {
+				h.Write([]byte(cookiePattern + "=" + cookie.Value))
+			}
 		}
 	}
 
