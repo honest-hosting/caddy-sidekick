@@ -322,6 +322,19 @@ switch ($path) {
         ]);
         break;
 
+    case '/wp-cron.php':
+        // WordPress cron endpoint - should be bypassed via nocache prefix
+        jsonResponse([
+            'cron' => true,
+            'timestamp' => microtime(true),
+            'date' => $now->format('Y-m-d H:i:s.u'),
+            'unique_id' => uniqid('cron_', true),
+            'query' => $query,
+        ], 200, [
+            'X-Test-Type' => 'wp-cron'
+        ]);
+        break;
+
     case '/wp-json/wp/v2/posts':
         jsonResponse([
             'posts' => [

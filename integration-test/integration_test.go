@@ -837,6 +837,113 @@ func TestIntegrationNoCacheRegex(t *testing.T) {
 	}
 }
 
+// TestIntegrationNoCacheWpCronGET tests that GET requests to /wp-cron.php are
+// bypassed (not cached) regardless of query parameters. The nocache config
+// contains only the exact path "/wp-cron.php" — no query string.
+func TestIntegrationNoCacheWpCronGET(t *testing.T) {
+	cfg := newTestConfig()
+
+	// Clear cache
+	purgeCache(t, nil)
+	time.Sleep(1 * time.Second)
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{"bare path", "/wp-cron.php"},
+		{"with test=1", "/wp-cron.php?test=1"},
+		{"with unique param", fmt.Sprintf("/wp-cron.php?test=%d", time.Now().UnixNano())},
+		{"with doing_cron", "/wp-cron.php?doing_wp_cron=1234567890.1234"},
+		{"with multiple params", "/wp-cron.php?doing_wp_cron=1234567890&test=1"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bodies := make([]string, cfg.verifyRequestCount)
+			for i := 0; i < cfg.verifyRequestCount; i++ {
+				resp, body := makeRequest(t, "GET", baseURL+tc.path, nil, nil)
+				if resp.StatusCode != 200 {
+					t.Fatalf("Request %d: Expected status 200, got %d", i+1, resp.StatusCode)
+				}
+				cacheHeader := resp.Header.Get("X-Sidekick-Cache")
+				if cacheHeader != "BYPASS" {
+					t.Errorf("Request %d: Expected X-Sidekick-Cache: BYPASS, got: %s (path: %s)", i+1, cacheHeader, tc.path)
+				}
+				bodies[i] = body
+
+				if i < cfg.verifyRequestCount-1 {
+					time.Sleep(cfg.verifyRequestDelay)
+				}
+			}
+
+			// Bodies should differ across requests (not cached, PHP returns unique timestamp/id)
+			allSame := true
+			for i := 1; i < len(bodies); i++ {
+				if bodies[i] != bodies[0] {
+					allSame = false
+					break
+				}
+			}
+			if allSame {
+				t.Errorf("Nocache path %s: responses should not be cached but all %d bodies are identical", tc.path, cfg.verifyRequestCount)
+			}
+		})
+	}
+}
+
+// TestIntegrationNoCacheWpCronHEAD tests that HEAD requests to /wp-cron.php
+// are not served from cache. HEAD requests skip the caching layer entirely
+// (method != GET), so they should pass through to the upstream without any
+// X-Sidekick-Cache header.
+func TestIntegrationNoCacheWpCronHEAD(t *testing.T) {
+	// Clear cache
+	purgeCache(t, nil)
+	time.Sleep(1 * time.Second)
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{"bare path", "/wp-cron.php"},
+		{"with test=1", "/wp-cron.php?test=1"},
+		{"with unique param", fmt.Sprintf("/wp-cron.php?test=%d", time.Now().UnixNano())},
+		{"with doing_cron", "/wp-cron.php?doing_wp_cron=1234567890.1234"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// First, prime the cache with a GET so there's a cached entry for this path
+			resp, _ := makeRequest(t, "GET", baseURL+tc.path, nil, nil)
+			cacheHeader := resp.Header.Get("X-Sidekick-Cache")
+			// The GET itself should be BYPASS since /wp-cron.php is in nocache
+			if cacheHeader != "BYPASS" {
+				t.Errorf("Priming GET: Expected X-Sidekick-Cache: BYPASS, got: %s (path: %s)", cacheHeader, tc.path)
+			}
+
+			time.Sleep(200 * time.Millisecond)
+
+			// Now make HEAD requests — these should not be served from cache
+			for i := 0; i < 3; i++ {
+				resp := makeRequestRaw(t, "HEAD", baseURL+tc.path, nil, nil)
+				_ = resp.Body.Close()
+
+				if resp.StatusCode != 200 {
+					t.Fatalf("HEAD request %d: Expected status 200, got %d", i+1, resp.StatusCode)
+				}
+
+				// HEAD requests skip the caching layer entirely (method != GET),
+				// so there should be no X-Sidekick-Cache header at all.
+				// If we see HIT or MISS, something is wrong.
+				cacheHeader := resp.Header.Get("X-Sidekick-Cache")
+				if cacheHeader == "HIT" || cacheHeader == "MISS" {
+					t.Errorf("HEAD request %d: X-Sidekick-Cache should not be HIT or MISS for non-GET, got: %s (path: %s)", i+1, cacheHeader, tc.path)
+				}
+			}
+		})
+	}
+}
+
 // TestIntegrationMetrics tests that metrics are properly exposed and incremented
 func TestIntegrationMetrics(t *testing.T) {
 	metricsURL := "http://localhost:9443/metrics/sidekick"
