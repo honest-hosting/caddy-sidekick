@@ -335,6 +335,20 @@ switch ($path) {
         ]);
         break;
 
+    case '/foo.php':
+    case '/bar.php':
+        // Generic PHP endpoints for nocache testing with comma-separated config
+        jsonResponse([
+            'path' => $path,
+            'timestamp' => microtime(true),
+            'date' => $now->format('Y-m-d H:i:s.u'),
+            'unique_id' => uniqid('nocache_', true),
+            'query' => $query,
+        ], 200, [
+            'X-Test-Type' => 'nocache-test'
+        ]);
+        break;
+
     case '/wp-json/wp/v2/posts':
         jsonResponse([
             'posts' => [

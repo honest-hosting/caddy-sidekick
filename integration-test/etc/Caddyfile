@@ -34,7 +34,8 @@
 		cache_response_codes 200 301 302 404
 
 		# Paths to bypass cache (WordPress-like paths for testing)
-		nocache /wp-admin /wp-json /wp-cron.php /non-cacheable /api/realtime /health.php
+		# Uses mixed delimiters: space-separated AND comma-separated
+		nocache /wp-admin /wp-json /wp-cron.php,/foo.php,/bar.php /non-cacheable /api/realtime /health.php
 
 		# Don't cache home page (set to false for testing)
 		nocache_home false

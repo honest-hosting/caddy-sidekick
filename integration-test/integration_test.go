@@ -3,6 +3,7 @@ package integration_test
 import (
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -59,11 +60,12 @@ func TestIntegrationMemoryCacheBasic(t *testing.T) {
 		t.Fatalf("Expected status 200, got %d", resp1.StatusCode)
 	}
 	checkCacheHeader(t, resp1, "MISS")
+	checkNoCacheHeaders(t, resp1)
 
 	// Wait for cache to be written
 	time.Sleep(cfg.cacheWriteWait)
 
-	// Verify multiple requests return HIT
+	// Verify multiple requests return HIT with proper cache-control headers
 	bodies := verifyCacheHits(t, baseURL+"/cacheable", nil, nil, cfg)
 
 	// All cached bodies should be identical to the original
@@ -840,6 +842,9 @@ func TestIntegrationNoCacheRegex(t *testing.T) {
 // TestIntegrationNoCacheWpCronGET tests that GET requests to /wp-cron.php are
 // bypassed (not cached) regardless of query parameters. The nocache config
 // contains only the exact path "/wp-cron.php" — no query string.
+// It also tests /foo.php and /bar.php which are configured via comma-separated
+// syntax in the same nocache directive (e.g. "/wp-cron.php,/foo.php,/bar.php")
+// to verify that both space-separated and comma-separated delimiters work.
 func TestIntegrationNoCacheWpCronGET(t *testing.T) {
 	cfg := newTestConfig()
 
@@ -851,11 +856,18 @@ func TestIntegrationNoCacheWpCronGET(t *testing.T) {
 		name string
 		path string
 	}{
-		{"bare path", "/wp-cron.php"},
-		{"with test=1", "/wp-cron.php?test=1"},
-		{"with unique param", fmt.Sprintf("/wp-cron.php?test=%d", time.Now().UnixNano())},
-		{"with doing_cron", "/wp-cron.php?doing_wp_cron=1234567890.1234"},
-		{"with multiple params", "/wp-cron.php?doing_wp_cron=1234567890&test=1"},
+		// /wp-cron.php — first in the comma group "/wp-cron.php,/foo.php,/bar.php"
+		{"wp-cron bare path", "/wp-cron.php"},
+		{"wp-cron with test=1", "/wp-cron.php?test=1"},
+		{"wp-cron with unique param", fmt.Sprintf("/wp-cron.php?test=%d", time.Now().UnixNano())},
+		{"wp-cron with doing_cron", "/wp-cron.php?doing_wp_cron=1234567890.1234"},
+		{"wp-cron with multiple params", "/wp-cron.php?doing_wp_cron=1234567890&test=1"},
+		// /foo.php — middle of the comma group, verifies comma-separated parsing
+		{"foo.php bare path", "/foo.php"},
+		{"foo.php with query", "/foo.php?action=test"},
+		// /bar.php — last in the comma group, verifies comma-separated parsing
+		{"bar.php bare path", "/bar.php"},
+		{"bar.php with query", "/bar.php?id=123&mode=debug"},
 	}
 
 	for _, tc := range tests {
@@ -892,10 +904,10 @@ func TestIntegrationNoCacheWpCronGET(t *testing.T) {
 	}
 }
 
-// TestIntegrationNoCacheWpCronHEAD tests that HEAD requests to /wp-cron.php
-// are not served from cache. HEAD requests skip the caching layer entirely
-// (method != GET), so they should pass through to the upstream without any
-// X-Sidekick-Cache header.
+// TestIntegrationNoCacheWpCronHEAD tests that HEAD requests to /wp-cron.php,
+// /foo.php, and /bar.php are not served from cache. HEAD requests skip the
+// caching layer entirely (method != GET), so they should pass through to
+// the upstream without any X-Sidekick-Cache header.
 func TestIntegrationNoCacheWpCronHEAD(t *testing.T) {
 	// Clear cache
 	purgeCache(t, nil)
@@ -905,10 +917,14 @@ func TestIntegrationNoCacheWpCronHEAD(t *testing.T) {
 		name string
 		path string
 	}{
-		{"bare path", "/wp-cron.php"},
-		{"with test=1", "/wp-cron.php?test=1"},
-		{"with unique param", fmt.Sprintf("/wp-cron.php?test=%d", time.Now().UnixNano())},
-		{"with doing_cron", "/wp-cron.php?doing_wp_cron=1234567890.1234"},
+		{"wp-cron bare path", "/wp-cron.php"},
+		{"wp-cron with test=1", "/wp-cron.php?test=1"},
+		{"wp-cron with unique param", fmt.Sprintf("/wp-cron.php?test=%d", time.Now().UnixNano())},
+		{"wp-cron with doing_cron", "/wp-cron.php?doing_wp_cron=1234567890.1234"},
+		{"foo.php bare path", "/foo.php"},
+		{"foo.php with query", "/foo.php?action=test"},
+		{"bar.php bare path", "/bar.php"},
+		{"bar.php with query", "/bar.php?id=123"},
 	}
 
 	for _, tc := range tests {
@@ -1411,4 +1427,77 @@ func TestIntegrationMetrics(t *testing.T) {
 		}
 	})
 
+}
+
+// TestIntegrationCacheControlHeaders tests that Cache-Control and Age headers
+// are correctly set for HIT responses and that Age increases over time.
+func TestIntegrationCacheControlHeaders(t *testing.T) {
+	const testTTL = 60 // matches Caddyfile cache_ttl
+
+	// Clear cache first
+	purgeCache(t, nil)
+	time.Sleep(1 * time.Second)
+
+	// Use /cacheable with a unique query param to avoid collisions with other tests
+	// ("name" is in cache_key_queries so it creates a distinct cache entry)
+	url := baseURL + "/cacheable?name=cc-header-test"
+
+	// First request - should be MISS with no-cache headers
+	resp1, _ := makeRequest(t, "GET", url, nil, nil)
+	if resp1.StatusCode != 200 {
+		t.Fatalf("Expected status 200, got %d", resp1.StatusCode)
+	}
+	checkCacheHeader(t, resp1, "MISS")
+	checkNoCacheHeaders(t, resp1)
+
+	// Wait for cache to be written
+	time.Sleep(500 * time.Millisecond)
+
+	// Second request - should be HIT with cache-control headers
+	resp2, _ := makeRequest(t, "GET", url, nil, nil)
+	checkCacheHeader(t, resp2, "HIT")
+	checkCacheControlHIT(t, resp2, testTTL)
+
+	// Parse the initial Age
+	age1Str := resp2.Header.Get("Age")
+	age1, err := strconv.Atoi(age1Str)
+	if err != nil {
+		t.Fatalf("Failed to parse Age header %q: %v", age1Str, err)
+	}
+
+	// Wait 2 seconds and verify Age increases
+	time.Sleep(2 * time.Second)
+
+	resp3, _ := makeRequest(t, "GET", url, nil, nil)
+	checkCacheHeader(t, resp3, "HIT")
+	checkCacheControlHIT(t, resp3, testTTL)
+
+	age2Str := resp3.Header.Get("Age")
+	age2, err := strconv.Atoi(age2Str)
+	if err != nil {
+		t.Fatalf("Failed to parse Age header %q: %v", age2Str, err)
+	}
+
+	if age2 < age1+1 {
+		t.Errorf("Age should have increased: first=%d, second=%d", age1, age2)
+	}
+
+	// Verify Age + max-age ≈ CacheTTL (within 2s tolerance for test timing)
+	cc3 := resp3.Header.Get("Cache-Control")
+	maxAge3Str := strings.TrimPrefix(cc3, "public, max-age=")
+	maxAge3, _ := strconv.Atoi(maxAge3Str)
+
+	sum := age2 + maxAge3
+	if sum < testTTL-2 || sum > testTTL+2 {
+		t.Errorf("Age(%d) + max-age(%d) = %d, expected ~%d (TTL)", age2, maxAge3, sum, testTTL)
+	}
+}
+
+// TestIntegrationBypassCacheControlHeaders tests that bypass responses include
+// no-cache directives.
+func TestIntegrationBypassCacheControlHeaders(t *testing.T) {
+	// Test a bypass path
+	resp, _ := makeRequest(t, "GET", baseURL+"/wp-admin/index.php", nil, nil)
+	checkCacheHeader(t, resp, "BYPASS")
+	checkNoCacheHeaders(t, resp)
 }

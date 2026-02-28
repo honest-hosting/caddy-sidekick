@@ -224,6 +224,7 @@ func (r *ResponseWriter) WriteHeader(status int) {
 	cacheState := "BYPASS"
 	if bypass {
 		hdr.Set(r.cacheHeaderName, cacheState)
+		setNoCacheHeaders(hdr)
 		r.ResponseWriter.WriteHeader(status)
 		return
 	}
@@ -232,6 +233,7 @@ func (r *ResponseWriter) WriteHeader(status int) {
 	cacheState = "MISS"
 
 	hdr.Set(r.cacheHeaderName, cacheState)
+	setNoCacheHeaders(hdr)
 	r.ResponseWriter.WriteHeader(status)
 }
 

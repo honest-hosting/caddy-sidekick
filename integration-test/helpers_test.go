@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -107,6 +109,57 @@ func verifyCacheHits(t *testing.T, url string, body io.Reader, headers map[strin
 	}
 
 	return bodies
+}
+
+// checkCacheControlHIT validates Cache-Control and Age headers for HIT responses.
+// maxTTL is the configured CacheTTL in seconds.
+func checkCacheControlHIT(t *testing.T, resp *http.Response, maxTTL int) {
+	t.Helper()
+	cc := resp.Header.Get("Cache-Control")
+	if cc == "" {
+		t.Error("Expected Cache-Control header on HIT, got empty")
+		return
+	}
+	if !strings.HasPrefix(cc, "public, max-age=") {
+		t.Errorf("Expected Cache-Control to start with 'public, max-age=', got: %s", cc)
+		return
+	}
+	maxAgeStr := strings.TrimPrefix(cc, "public, max-age=")
+	maxAge, err := strconv.Atoi(maxAgeStr)
+	if err != nil {
+		t.Errorf("Failed to parse max-age value %q: %v", maxAgeStr, err)
+		return
+	}
+	if maxAge < 0 || maxAge > maxTTL {
+		t.Errorf("max-age=%d is outside valid range [0, %d]", maxAge, maxTTL)
+	}
+
+	ageStr := resp.Header.Get("Age")
+	if ageStr == "" {
+		t.Error("Expected Age header on HIT, got empty")
+		return
+	}
+	age, err := strconv.Atoi(ageStr)
+	if err != nil {
+		t.Errorf("Failed to parse Age value %q: %v", ageStr, err)
+		return
+	}
+	if age < 0 {
+		t.Errorf("Age=%d should be non-negative", age)
+	}
+}
+
+// checkNoCacheHeaders validates no-cache headers for MISS/BYPASS responses.
+func checkNoCacheHeaders(t *testing.T, resp *http.Response) {
+	t.Helper()
+	cc := resp.Header.Get("Cache-Control")
+	if cc != "no-cache, no-store, must-revalidate" {
+		t.Errorf("Expected Cache-Control: no-cache, no-store, must-revalidate, got: %s", cc)
+	}
+	pragma := resp.Header.Get("Pragma")
+	if pragma != "no-cache" {
+		t.Errorf("Expected Pragma: no-cache, got: %s", pragma)
+	}
 }
 
 // Compression decoders

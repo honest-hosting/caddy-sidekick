@@ -1045,6 +1045,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	hdr := w.Header()
 	if bypass {
 		hdr.Set(CacheHeaderName, "BYPASS")
+		setNoCacheHeaders(hdr)
 		metrics.RecordCacheOperation("bypass", "true", "default")
 		err := next.ServeHTTP(w, r)
 		metrics.RecordResponseTime("bypass", "default", time.Since(startTime))
@@ -1070,6 +1071,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		// Cache HIT
 		// Check for 304 Not Modified
 		if s.shouldReturn304(cacheMeta, etag, modifiedSince) {
+			s.setCacheControlHeaders(w.Header(), cacheMeta)
 			w.WriteHeader(http.StatusNotModified)
 			metrics.RecordResponseTime("hit", "default", time.Since(startTime))
 			return nil
@@ -1158,6 +1160,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		// Serve from cache
 		hdr.Set(CacheHeaderName, "HIT")
 		hdr.Set("Vary", "Accept-Encoding")
+		s.setCacheControlHeaders(hdr, cacheMeta)
 		if selectedEncoding != "" {
 			hdr.Set("Content-Encoding", selectedEncoding)
 		}
@@ -1185,8 +1188,9 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 			if len(kv) != 2 {
 				continue
 			}
-			// Skip Content-Encoding and Content-Length as we handle them
-			if kv[0] == "Content-Encoding" || kv[0] == "Content-Length" {
+			// Skip headers we manage directly
+			if kv[0] == "Content-Encoding" || kv[0] == "Content-Length" ||
+				kv[0] == "Cache-Control" || kv[0] == "Age" || kv[0] == "Pragma" {
 				continue
 			}
 			hdr.Set(kv[0], kv[1])
@@ -1630,6 +1634,33 @@ func (s *Sidekick) shouldReturn304(meta *Metadata, ifNoneMatch, ifModifiedSince 
 	}
 
 	return false
+}
+
+// setCacheControlHeaders sets Cache-Control and Age headers for HIT/304 responses
+// based on the TTL configuration and the cache entry's age.
+func (s *Sidekick) setCacheControlHeaders(hdr http.Header, cacheMeta *Metadata) {
+	if s.CacheTTL <= 0 || cacheMeta == nil || cacheMeta.Timestamp <= 0 {
+		return
+	}
+
+	ageSeconds := time.Now().Unix() - cacheMeta.Timestamp
+	if ageSeconds < 0 {
+		ageSeconds = 0
+	}
+
+	remainingTTL := int64(s.CacheTTL) - ageSeconds
+	if remainingTTL < 0 {
+		remainingTTL = 0
+	}
+
+	hdr.Set("Cache-Control", fmt.Sprintf("public, max-age=%d", remainingTTL))
+	hdr.Set("Age", fmt.Sprintf("%d", ageSeconds))
+}
+
+// setNoCacheHeaders sets headers to prevent upstream caching for MISS/BYPASS responses.
+func setNoCacheHeaders(hdr http.Header) {
+	hdr.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	hdr.Set("Pragma", "no-cache")
 }
 
 // Cleanup implements caddy.CleanerUpper

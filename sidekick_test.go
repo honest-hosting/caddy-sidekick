@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -389,4 +390,152 @@ func TestShouldBypass_PrefixMatching(t *testing.T) {
 			assert.Equal(t, tc.shouldBypass, bypass, "Bypass result mismatch for path %s", tc.requestPath)
 		})
 	}
+}
+
+func TestSetCacheControlHeaders(t *testing.T) {
+	tests := []struct {
+		name           string
+		cacheTTL       int
+		timestamp      int64
+		expectCC       string // expected Cache-Control value, "" means not set
+		expectAge      string // expected Age value, "" means not set
+	}{
+		{
+			name:      "normal HIT with remaining TTL",
+			cacheTTL:  300,
+			timestamp: time.Now().Unix() - 100,
+			expectCC:  "public, max-age=200",
+			expectAge: "100",
+		},
+		{
+			name:      "freshly cached",
+			cacheTTL:  300,
+			timestamp: time.Now().Unix(),
+			expectCC:  "public, max-age=300",
+			expectAge: "0",
+		},
+		{
+			name:      "expired entry clamps to zero",
+			cacheTTL:  300,
+			timestamp: time.Now().Unix() - 350,
+			expectCC:  "public, max-age=0",
+			expectAge: "350",
+		},
+		{
+			name:      "exactly at TTL boundary",
+			cacheTTL:  300,
+			timestamp: time.Now().Unix() - 300,
+			expectCC:  "public, max-age=0",
+			expectAge: "300",
+		},
+		{
+			name:      "TTL disabled (0) - no headers",
+			cacheTTL:  0,
+			timestamp: time.Now().Unix() - 100,
+			expectCC:  "",
+			expectAge: "",
+		},
+		{
+			name:      "negative TTL - no headers",
+			cacheTTL:  -1,
+			timestamp: time.Now().Unix() - 100,
+			expectCC:  "",
+			expectAge: "",
+		},
+		{
+			name:      "zero timestamp - no headers",
+			cacheTTL:  300,
+			timestamp: 0,
+			expectCC:  "",
+			expectAge: "",
+		},
+		{
+			name:      "nil-safe - no headers when TTL disabled",
+			cacheTTL:  0,
+			timestamp: 0,
+			expectCC:  "",
+			expectAge: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Sidekick{
+				CacheTTL: tc.cacheTTL,
+			}
+			meta := &Metadata{
+				Timestamp: tc.timestamp,
+			}
+
+			hdr := http.Header{}
+			s.setCacheControlHeaders(hdr, meta)
+
+			if tc.expectCC == "" {
+				assert.Empty(t, hdr.Get("Cache-Control"), "Cache-Control should not be set")
+				assert.Empty(t, hdr.Get("Age"), "Age should not be set")
+			} else {
+				assert.Equal(t, tc.expectCC, hdr.Get("Cache-Control"))
+				assert.Equal(t, tc.expectAge, hdr.Get("Age"))
+			}
+		})
+	}
+}
+
+func TestSetCacheControlHeaders_NilMetadata(t *testing.T) {
+	s := &Sidekick{CacheTTL: 300}
+	hdr := http.Header{}
+	s.setCacheControlHeaders(hdr, nil)
+	assert.Empty(t, hdr.Get("Cache-Control"), "should not set Cache-Control with nil metadata")
+	assert.Empty(t, hdr.Get("Age"), "should not set Age with nil metadata")
+}
+
+func TestSetNoCacheHeaders(t *testing.T) {
+	hdr := http.Header{}
+	setNoCacheHeaders(hdr)
+	assert.Equal(t, "no-cache, no-store, must-revalidate", hdr.Get("Cache-Control"))
+	assert.Equal(t, "no-cache", hdr.Get("Pragma"))
+}
+
+func TestCacheControlHeaders_NotOverwrittenByMetadata(t *testing.T) {
+	// Simulate serving a HIT where cached metadata contains origin Cache-Control
+	s := &Sidekick{
+		CacheTTL: 300,
+		logger:   zap.NewNop(),
+	}
+
+	meta := &Metadata{
+		Timestamp: time.Now().Unix() - 60,
+		StateCode: 200,
+		Header: [][]string{
+			{"Content-Type", "text/html"},
+			{"Cache-Control", "max-age=3600"}, // origin value that should be skipped
+			{"Age", "999"},                     // origin value that should be skipped
+			{"Pragma", "no-cache"},             // origin value that should be skipped
+		},
+	}
+
+	hdr := http.Header{}
+
+	// Set computed cache-control headers (as done in HIT path)
+	s.setCacheControlHeaders(hdr, meta)
+
+	// Simulate the metadata restoration loop with the skip logic
+	for _, kv := range meta.Header {
+		if len(kv) != 2 {
+			continue
+		}
+		if kv[0] == "Content-Encoding" || kv[0] == "Content-Length" ||
+			kv[0] == "Cache-Control" || kv[0] == "Age" || kv[0] == "Pragma" {
+			continue
+		}
+		hdr.Set(kv[0], kv[1])
+	}
+
+	// Verify our computed values survived
+	assert.Equal(t, "public, max-age=240", hdr.Get("Cache-Control"),
+		"Cache-Control should be the computed value, not the origin value")
+	assert.Equal(t, "60", hdr.Get("Age"),
+		"Age should be the computed value, not the origin value")
+	assert.Equal(t, "text/html", hdr.Get("Content-Type"),
+		"Content-Type should still be restored from metadata")
 }
