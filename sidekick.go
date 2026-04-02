@@ -1563,6 +1563,16 @@ func humanizeBytes(bytes int64) string {
 func (s *Sidekick) buildCacheKey(r *http.Request) string {
 	h := md5.New()
 
+	// Always include hostname to prevent cross-domain cache pollution.
+	// In multi-domain setups (e.g., WordPress Multisite with a catch-all
+	// Caddyfile block), different domains sharing the same path must have
+	// separate cache entries. Note: r.Host is used instead of
+	// r.Header.Get("Host") because Go's net/http promotes the Host header
+	// to r.Host and removes it from the header map.
+	if r.Host != "" {
+		h.Write([]byte(r.Host))
+	}
+
 	// Always include path
 	h.Write([]byte(r.URL.Path))
 
@@ -1581,9 +1591,18 @@ func (s *Sidekick) buildCacheKey(r *http.Request) string {
 		}
 	}
 
-	// Include configured headers
+	// Include configured headers.
+	// Special case: Go's net/http promotes the Host header to r.Host and
+	// removes it from r.Header, so r.Header.Get("Host") returns "".
+	// Fall back to r.Host when the header name is "Host".
 	for _, hdr := range s.CacheKeyHeaders {
-		if val := r.Header.Get(hdr); val != "" {
+		var val string
+		if strings.EqualFold(hdr, "Host") {
+			val = r.Host
+		} else {
+			val = r.Header.Get(hdr)
+		}
+		if val != "" {
 			h.Write([]byte(hdr + ":" + val))
 		}
 	}
