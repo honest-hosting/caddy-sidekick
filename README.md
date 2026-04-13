@@ -428,7 +428,7 @@ SIDEKICK_WP_MU_PLUGIN_ENABLED=false
 By default, Sidekick includes the following in cache keys:
 
 - **Query Parameters**: `p`, `page`, `paged`, `s`, `category`, `tag`, `author` (common WordPress parameters)
-- **Headers**: `Accept-Encoding` (to vary cache by compression support)
+- **Headers**: `Host` (automatically included to prevent cache poisoning/pollution), `Accept-Encoding` (to vary cache by compression support)
 - **Cookies**: `wordpress_logged_in_*`, `wordpress_sec_*`, `wp-settings-*` (WordPress session cookies, with wildcard support)
 
 ### Customizing Cache Keys
