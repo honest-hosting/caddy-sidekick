@@ -319,7 +319,7 @@ func TestBuildCacheKey_WildcardCookieValues(t *testing.T) {
 
 	// Verify the cookie value is actually used in the hash
 	h := md5.New()
-	h.Write([]byte(""))    // empty host from httptest
+	h.Write([]byte("example.com")) // httptest sets r.Host to "example.com"
 	h.Write([]byte("/test"))
 	h.Write([]byte("test_cookie=value1"))
 	expectedKey1 := fmt.Sprintf("%x", h.Sum(nil))
@@ -430,11 +430,11 @@ func TestShouldBypass_PrefixMatching(t *testing.T) {
 
 func TestSetCacheControlHeaders(t *testing.T) {
 	tests := []struct {
-		name           string
-		cacheTTL       int
-		timestamp      int64
-		expectCC       string // expected Cache-Control value, "" means not set
-		expectAge      string // expected Age value, "" means not set
+		name      string
+		cacheTTL  int
+		timestamp int64
+		expectCC  string // expected Cache-Control value, "" means not set
+		expectAge string // expected Age value, "" means not set
 	}{
 		{
 			name:      "normal HIT with remaining TTL",
@@ -545,8 +545,8 @@ func TestCacheControlHeaders_NotOverwrittenByMetadata(t *testing.T) {
 		Header: [][]string{
 			{"Content-Type", "text/html"},
 			{"Cache-Control", "max-age=3600"}, // origin value that should be skipped
-			{"Age", "999"},                     // origin value that should be skipped
-			{"Pragma", "no-cache"},             // origin value that should be skipped
+			{"Age", "999"},                    // origin value that should be skipped
+			{"Pragma", "no-cache"},            // origin value that should be skipped
 		},
 	}
 
