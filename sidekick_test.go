@@ -319,10 +319,46 @@ func TestBuildCacheKey_WildcardCookieValues(t *testing.T) {
 
 	// Verify the cookie value is actually used in the hash
 	h := md5.New()
+	h.Write([]byte("example.com")) // httptest sets r.Host to "example.com"
 	h.Write([]byte("/test"))
 	h.Write([]byte("test_cookie=value1"))
 	expectedKey1 := fmt.Sprintf("%x", h.Sum(nil))
 	assert.Equal(t, expectedKey1, key1, "Cache key should include cookie name and value")
+}
+
+// TestBuildCacheKey_HostIsolation tests that different hostnames produce different cache keys
+func TestBuildCacheKey_HostIsolation(t *testing.T) {
+	s := &Sidekick{
+		logger: zap.NewNop(),
+	}
+
+	req1 := httptest.NewRequest("GET", "https://example.com/", nil)
+	req2 := httptest.NewRequest("GET", "https://other.com/", nil)
+	req3 := httptest.NewRequest("GET", "https://example.com/", nil)
+
+	key1 := s.buildCacheKey(req1)
+	key2 := s.buildCacheKey(req2)
+	key3 := s.buildCacheKey(req3)
+
+	assert.NotEqual(t, key1, key2, "Different hostnames should produce different cache keys")
+	assert.Equal(t, key1, key3, "Same hostname and path should produce the same cache key")
+}
+
+// TestBuildCacheKey_HostHeader tests that cache_key_headers with "Host" works
+// despite Go promoting the Host header to r.Host
+func TestBuildCacheKey_HostHeader(t *testing.T) {
+	s := &Sidekick{
+		CacheKeyHeaders: []string{"Host"},
+		logger:          zap.NewNop(),
+	}
+
+	req1 := httptest.NewRequest("GET", "https://example.com/test", nil)
+	req2 := httptest.NewRequest("GET", "https://other.com/test", nil)
+
+	key1 := s.buildCacheKey(req1)
+	key2 := s.buildCacheKey(req2)
+
+	assert.NotEqual(t, key1, key2, "cache_key_headers with Host should differentiate domains")
 }
 
 // TestShouldBypass_PrefixMatching tests that nocache paths use prefix matching
@@ -394,11 +430,11 @@ func TestShouldBypass_PrefixMatching(t *testing.T) {
 
 func TestSetCacheControlHeaders(t *testing.T) {
 	tests := []struct {
-		name           string
-		cacheTTL       int
-		timestamp      int64
-		expectCC       string // expected Cache-Control value, "" means not set
-		expectAge      string // expected Age value, "" means not set
+		name      string
+		cacheTTL  int
+		timestamp int64
+		expectCC  string // expected Cache-Control value, "" means not set
+		expectAge string // expected Age value, "" means not set
 	}{
 		{
 			name:      "normal HIT with remaining TTL",
@@ -509,8 +545,8 @@ func TestCacheControlHeaders_NotOverwrittenByMetadata(t *testing.T) {
 		Header: [][]string{
 			{"Content-Type", "text/html"},
 			{"Cache-Control", "max-age=3600"}, // origin value that should be skipped
-			{"Age", "999"},                     // origin value that should be skipped
-			{"Pragma", "no-cache"},             // origin value that should be skipped
+			{"Age", "999"},                    // origin value that should be skipped
+			{"Pragma", "no-cache"},            // origin value that should be skipped
 		},
 	}
 
