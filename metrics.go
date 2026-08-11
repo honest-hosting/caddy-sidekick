@@ -48,10 +48,29 @@ type MetricsCollector struct {
 	// Bypass tracking
 	bypassCount atomic.Uint64
 
+	// The storage the usage gauges describe, and the server label to report it
+	// under. Held as pointers, replaced on every Provision, so there is exactly
+	// one source of truth no matter how many times Caddy reloads.
+	currentStorage atomic.Pointer[Storage]
+	currentServer  atomic.Pointer[string]
+
+	// Guards the single updater goroutine.
+	updaterMu      sync.Mutex
+	updaterRunning bool
+
 	// Context for lifecycle management
 	ctx    context.Context
 	cancel context.CancelFunc
 }
+
+// storageMetricsInterval is how often the usage gauges are refreshed in the
+// background.
+//
+// The gauges are also refreshed synchronously whenever the sidekick metrics
+// endpoint is scraped, so this only needs to keep Caddy's own /metrics roughly
+// current. It used to be 575ms, which is ~2 wakeups a second for a figure
+// nothing reads that often.
+const storageMetricsInterval = 5 * time.Second
 
 var (
 	// Global metrics instance - survives config reloads
@@ -224,6 +243,10 @@ func (m *MetricsCollector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Metrics not initialized", http.StatusInternalServerError)
 		return
 	}
+
+	// Recompute usage from the live cache before gathering, so a scrape reports
+	// the state now rather than as of the last background tick.
+	m.RefreshStorageMetrics()
 
 	// Use the default registry which contains our metrics
 	handler := promhttp.HandlerFor(
@@ -426,25 +449,82 @@ func (m *MetricsCollector) GetRates() map[string]map[string]float64 {
 	return rates
 }
 
-// StartMetricsUpdater starts a goroutine that periodically updates metrics
+// StartMetricsUpdater points the usage gauges at a storage and ensures the
+// background refresher is running.
+//
+// Safe to call on every Provision, which is the point. It used to spawn a
+// goroutine per call, each closing over the Storage it was handed — and because
+// the collector is global and deliberately survives config reloads, its context
+// never cancelled and none of those goroutines ever exited. Every Caddy reload
+// added another one, all writing the same gauge labels (the server label is a
+// constant), so a stale empty Storage would overwrite the live one's numbers
+// 1.7 times a second.
+//
+// That failure was invisible in the obvious places: the request counters and
+// the size histogram are atomics on this collector and stayed correct, and the
+// *limits* stayed correct too because they are read from configuration fields
+// that every Storage carries. Only used_bytes and used_count — the two figures
+// that come from live cache contents — reported zero.
 func (m *MetricsCollector) StartMetricsUpdater(storage *Storage, serverName string) {
 	if m == nil {
 		return
 	}
 
+	m.currentStorage.Store(storage)
+	m.currentServer.Store(&serverName)
+
+	m.updaterMu.Lock()
+	defer m.updaterMu.Unlock()
+
+	if m.updaterRunning {
+		// Already refreshing; it reads whatever was just stored above.
+		return
+	}
+	m.updaterRunning = true
+
 	go func() {
-		ticker := time.NewTicker(575 * time.Millisecond) // Update every 1 second for faster testing
-		defer ticker.Stop()
+		ticker := time.NewTicker(storageMetricsInterval)
+
+		defer func() {
+			ticker.Stop()
+
+			m.updaterMu.Lock()
+			m.updaterRunning = false
+			m.updaterMu.Unlock()
+		}()
 
 		for {
 			select {
 			case <-m.ctx.Done():
 				return
 			case <-ticker.C:
-				m.updateStorageMetrics(storage, serverName)
+				m.RefreshStorageMetrics()
 			}
 		}
 	}()
+}
+
+// RefreshStorageMetrics recomputes the usage gauges from the current storage.
+//
+// Exported so a scrape can force the figures to be current rather than up to
+// one tick stale — which matters right after a purge, when "did that work?" is
+// exactly the question being asked.
+func (m *MetricsCollector) RefreshStorageMetrics() {
+	if m == nil {
+		return
+	}
+
+	storage := m.currentStorage.Load()
+	if storage == nil {
+		return
+	}
+
+	serverName := "default"
+	if name := m.currentServer.Load(); name != nil {
+		serverName = *name
+	}
+
+	m.updateStorageMetrics(storage, serverName)
 }
 
 // updateStorageMetrics updates storage-related metrics
