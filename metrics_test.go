@@ -1,6 +1,7 @@
 package sidekick
 
 import (
+	"runtime"
 	"testing"
 	"time"
 
@@ -316,4 +317,83 @@ func TestMetricsCollector_StartMetricsUpdater(t *testing.T) {
 
 	// The updater should have stopped gracefully
 	// We can't easily test the exact updates, but we can verify it doesn't panic
+}
+
+// A config reload must not leave a stale storage reporting over the live one.
+//
+// This is the regression test for the bug where StartMetricsUpdater spawned a
+// goroutine per call, each closing over the Storage it was handed. The global
+// collector deliberately survives reloads and its context never cancels, so
+// none of those goroutines exited — every Caddy reload added another writer of
+// the same gauge labels, and an empty Storage from a previous provision would
+// overwrite the live one's usage figures.
+//
+// The old code passed every existing test while doing this, because the request
+// counters and the size histogram are atomics that stayed correct, and the
+// limit gauges stayed correct too: they are read from configuration fields that
+// every Storage carries, live or not. Only used_bytes and used_count were wrong.
+func TestStartMetricsUpdaterUsesTheMostRecentStorage(t *testing.T) {
+	logger := zap.NewNop()
+	metrics := NewMetricsCollector(logger)
+	defer metrics.Cleanup()
+
+	stale := NewStorage(t.TempDir(), 3600, 512*1024, 1024*1024, 100, 1024*1024, 10*1024*1024, 1000, logger)
+	live := NewStorage(t.TempDir(), 3600, 512*1024, 1024*1024, 100, 1024*1024, 10*1024*1024, 1000, logger)
+
+	// The live storage holds something; the stale one never will.
+	if err := live.storeInMemory("/a-cached-page", make([]byte, 4096), &Metadata{}); err != nil {
+		t.Fatalf("failed to seed the live cache: %v", err)
+	}
+
+	// Two provisions, as a config reload produces.
+	metrics.StartMetricsUpdater(stale, "default")
+	metrics.StartMetricsUpdater(live, "default")
+
+	metrics.RefreshStorageMetrics()
+
+	usedBytes, err := metrics.cacheUsedBytes.GetMetricWith(prometheus.Labels{
+		"type": "memory", "server": "default",
+	})
+	if err != nil {
+		t.Fatalf("gauge lookup failed: %v", err)
+	}
+
+	usedCount, err := metrics.cacheUsedCount.GetMetricWith(prometheus.Labels{
+		"type": "memory", "server": "default",
+	})
+	if err != nil {
+		t.Fatalf("gauge lookup failed: %v", err)
+	}
+
+	if got := testutil.ToFloat64(usedBytes); got == 0 {
+		t.Error("used_bytes reported 0: the gauges are describing a storage that is no longer serving")
+	}
+	if got := testutil.ToFloat64(usedCount); got != 1 {
+		t.Errorf("used_count = %v, want 1", got)
+	}
+}
+
+// Repeated provisions must not accumulate refresher goroutines.
+func TestStartMetricsUpdaterRunsOneRefresher(t *testing.T) {
+	logger := zap.NewNop()
+	metrics := NewMetricsCollector(logger)
+	defer metrics.Cleanup()
+
+	storage := NewStorage(t.TempDir(), 3600, 512*1024, 1024*1024, 100, 1024*1024, 10*1024*1024, 1000, logger)
+
+	metrics.StartMetricsUpdater(storage, "default")
+	time.Sleep(20 * time.Millisecond)
+
+	before := runtime.NumGoroutine()
+
+	for i := 0; i < 25; i++ {
+		metrics.StartMetricsUpdater(storage, "default")
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	// Allow a little slack for unrelated runtime activity; the old code would
+	// have added 25.
+	if after := runtime.NumGoroutine(); after > before+5 {
+		t.Errorf("goroutines grew from %d to %d across 25 provisions", before, after)
+	}
 }
