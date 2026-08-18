@@ -142,6 +142,12 @@ example.com {
         # Exclude large media files from cache
         nocache_regex "\\.(mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe)$"
         
+        # Paths whose bytes cannot vary by cookie (see "Shared cache safety" below).
+        # These are exempt from the WordPress login-cookie bypass and from cookie
+        # cache keying, so one shared entry serves logged-in and anonymous visitors.
+        # Default shown; widen only if the site has no download-gating plugin.
+        static_asset_regex "\\.(css|js|mjs|map|jpg|jpeg|png|gif|webp|avif|svg|ico|woff|woff2|ttf|otf|eot)$"
+        
         # Purge endpoint configuration (required when cache is enabled)
         purge_path /__sidekick/purge
         purge_header X-Sidekick-Purge
@@ -456,6 +462,46 @@ The `cache_key_cookies` option supports wildcard patterns using `*` for prefix m
 - `wordpress_logged_in_*` matches any cookie starting with `wordpress_logged_in_`
 - `session_*` matches `session_id`, `session_token`, etc.
 - Exact names (without `*`) only match that specific cookie
+
+## Shared Cache Safety
+
+When a request carries a cookie matching `cache_key_cookies`, the cache key — and
+therefore the response — is specific to that visitor's session. Sidekick emits such
+responses as:
+
+```
+Cache-Control: private, no-store
+Vary: Accept-Encoding, Cookie
+```
+
+This keeps them out of CloudFront, corporate proxies and any other shared cache, while
+Sidekick's own cache still segments them correctly by key. Anonymous responses are
+unaffected and remain `public`, so CDN hit rate for ordinary traffic is unchanged.
+
+All downstream cache headers (`Cache-Control`, `Pragma`, `Age`, `Vary`) are written in
+exactly one place, `applyDownstreamCacheHeaders`, from the same value that varied the
+cache key. A unit test walks the package AST and fails the build if any other function
+writes them, so adding a cookie to `cache_key_cookies` cannot silently make a
+session-specific response shareable.
+
+### Static Asset Exemption
+
+WordPress scopes `wordpress_logged_in_<hash>` to `/`, so a logged-in visitor sends it
+with **every** request — including stylesheets, scripts, fonts and images. Without an
+exemption those all bypass the cache and hit the origin, even though their bytes are
+identical to what an anonymous visitor receives.
+
+Paths matching `static_asset_regex` are therefore exempt from both the login-cookie
+bypass and cookie cache keying, so a single shared entry serves everyone.
+
+The default pattern is deliberately conservative. It **excludes** `pdf`, `zip`,
+archives, office documents and media (`mp4`, `mov`, `webm`, `mp3`), because those are
+the formats membership and download-protection plugins gate behind a login check —
+exempting them could share one visitor's gated copy with everyone. Widen the pattern
+for a site only when you know it has no such plugin.
+
+The `nocache` prefixes, `nocache_regex` and `nocache_home` are all evaluated **before**
+this exemption, so an explicitly excluded path stays excluded even if it looks static.
 
 ## NoCache Path Matching
 

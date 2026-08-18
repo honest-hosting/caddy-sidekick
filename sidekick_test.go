@@ -245,8 +245,8 @@ func TestBuildCacheKey_WildcardCookies(t *testing.T) {
 				req2.AddCookie(cookie)
 			}
 
-			key1 := s.buildCacheKey(req1)
-			key2 := s.buildCacheKey(req2)
+			key1, _ := s.buildCacheKey(req1)
+			key2, _ := s.buildCacheKey(req2)
 
 			if tc.expectDifferent {
 				assert.NotEqual(t, key1, key2, "Cache keys should be different")
@@ -288,7 +288,7 @@ func TestBuildCacheKey_WildcardCookies(t *testing.T) {
 						req3.AddCookie(modifiedCookie)
 					}
 
-					key3 := s.buildCacheKey(req3)
+					key3, _ := s.buildCacheKey(req3)
 					// Keys should be different when cookie values change
 					assert.NotEqual(t, key1, key3, "Cache keys should differ when cookie values change")
 				}
@@ -311,8 +311,8 @@ func TestBuildCacheKey_WildcardCookieValues(t *testing.T) {
 	req2 := httptest.NewRequest("GET", "/test", nil)
 	req2.AddCookie(&http.Cookie{Name: "test_cookie", Value: "value2"})
 
-	key1 := s.buildCacheKey(req1)
-	key2 := s.buildCacheKey(req2)
+	key1, _ := s.buildCacheKey(req1)
+	key2, _ := s.buildCacheKey(req2)
 
 	// Keys should be different for different cookie values
 	assert.NotEqual(t, key1, key2, "Different cookie values should produce different cache keys")
@@ -336,9 +336,9 @@ func TestBuildCacheKey_HostIsolation(t *testing.T) {
 	req2 := httptest.NewRequest("GET", "https://other.com/", nil)
 	req3 := httptest.NewRequest("GET", "https://example.com/", nil)
 
-	key1 := s.buildCacheKey(req1)
-	key2 := s.buildCacheKey(req2)
-	key3 := s.buildCacheKey(req3)
+	key1, _ := s.buildCacheKey(req1)
+	key2, _ := s.buildCacheKey(req2)
+	key3, _ := s.buildCacheKey(req3)
 
 	assert.NotEqual(t, key1, key2, "Different hostnames should produce different cache keys")
 	assert.Equal(t, key1, key3, "Same hostname and path should produce the same cache key")
@@ -355,8 +355,8 @@ func TestBuildCacheKey_HostHeader(t *testing.T) {
 	req1 := httptest.NewRequest("GET", "https://example.com/test", nil)
 	req2 := httptest.NewRequest("GET", "https://other.com/test", nil)
 
-	key1 := s.buildCacheKey(req1)
-	key2 := s.buildCacheKey(req2)
+	key1, _ := s.buildCacheKey(req1)
+	key2, _ := s.buildCacheKey(req2)
 
 	assert.NotEqual(t, key1, key2, "cache_key_headers with Host should differentiate domains")
 }
@@ -504,7 +504,7 @@ func TestSetCacheControlHeaders(t *testing.T) {
 			}
 
 			hdr := http.Header{}
-			s.setCacheControlHeaders(hdr, meta)
+			s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateHit, meta)
 
 			if tc.expectCC == "" {
 				assert.Empty(t, hdr.Get("Cache-Control"), "Cache-Control should not be set")
@@ -520,14 +520,15 @@ func TestSetCacheControlHeaders(t *testing.T) {
 func TestSetCacheControlHeaders_NilMetadata(t *testing.T) {
 	s := &Sidekick{CacheTTL: 300}
 	hdr := http.Header{}
-	s.setCacheControlHeaders(hdr, nil)
+	s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateHit, nil)
 	assert.Empty(t, hdr.Get("Cache-Control"), "should not set Cache-Control with nil metadata")
 	assert.Empty(t, hdr.Get("Age"), "should not set Age with nil metadata")
 }
 
 func TestSetNoCacheHeaders(t *testing.T) {
+	s := &Sidekick{}
 	hdr := http.Header{}
-	setNoCacheHeaders(hdr)
+	s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateMiss, nil)
 	assert.Equal(t, "no-cache, no-store, must-revalidate", hdr.Get("Cache-Control"))
 	assert.Equal(t, "no-cache", hdr.Get("Pragma"))
 }
@@ -552,20 +553,22 @@ func TestCacheControlHeaders_NotOverwrittenByMetadata(t *testing.T) {
 
 	hdr := http.Header{}
 
-	// Set computed cache-control headers (as done in HIT path)
-	s.setCacheControlHeaders(hdr, meta)
-
-	// Simulate the metadata restoration loop with the skip logic
+	// Simulate the metadata restoration loop with the skip logic, then apply the
+	// chokepoint — this is the order the HIT path uses, so the computed values win
+	// over anything the origin stored.
 	for _, kv := range meta.Header {
 		if len(kv) != 2 {
 			continue
 		}
 		if kv[0] == "Content-Encoding" || kv[0] == "Content-Length" ||
-			kv[0] == "Cache-Control" || kv[0] == "Age" || kv[0] == "Pragma" {
+			kv[0] == "Cache-Control" || kv[0] == "Age" || kv[0] == "Pragma" ||
+			kv[0] == "Vary" {
 			continue
 		}
 		hdr.Set(kv[0], kv[1])
 	}
+
+	s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateHit, meta)
 
 	// Verify our computed values survived
 	assert.Equal(t, "public, max-age=240", hdr.Get("Cache-Control"),

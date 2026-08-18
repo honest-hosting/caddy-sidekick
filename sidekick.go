@@ -34,16 +34,20 @@ var (
 )
 
 type Sidekick struct {
-	logger             *zap.Logger
-	CacheDir           string   `json:"cache_dir,omitempty"`
-	PurgePath          string   `json:"purge_path,omitempty"`
-	PurgeURL           string   `json:"purge_url,omitempty"`
-	PurgeHeader        string   `json:"purge_header,omitempty"`
-	PurgeToken         string   `json:"purge_token,omitempty"`
-	Metrics            string   `json:"metrics,omitempty"`       // Admin API path to expose metrics (e.g., "/metrics/sidekick")
-	NoCache            []string `json:"nocache,omitempty"`       // Path prefixes to bypass
-	NoCacheRegex       string   `json:"nocache_regex,omitempty"` // Regex pattern to bypass
-	NoCacheHome        bool     `json:"nocache_home,omitempty"`  // Whether to skip caching home page
+	logger       *zap.Logger
+	CacheDir     string   `json:"cache_dir,omitempty"`
+	PurgePath    string   `json:"purge_path,omitempty"`
+	PurgeURL     string   `json:"purge_url,omitempty"`
+	PurgeHeader  string   `json:"purge_header,omitempty"`
+	PurgeToken   string   `json:"purge_token,omitempty"`
+	Metrics      string   `json:"metrics,omitempty"`       // Admin API path to expose metrics (e.g., "/metrics/sidekick")
+	NoCache      []string `json:"nocache,omitempty"`       // Path prefixes to bypass
+	NoCacheRegex string   `json:"nocache_regex,omitempty"` // Regex pattern to bypass
+	NoCacheHome  bool     `json:"nocache_home,omitempty"`  // Whether to skip caching home page
+	// StaticAssetRegex matches paths whose response bytes cannot vary by cookie.
+	// Such paths are exempt from the WordPress login-cookie bypass and from
+	// cookie-based cache keying, so one shared entry serves every visitor.
+	StaticAssetRegex   string   `json:"static_asset_regex,omitempty"`
 	CacheResponseCodes []string `json:"cache_response_codes,omitempty"`
 	CacheTTL           int      `json:"cache_ttl,omitempty"` // TTL in seconds
 	Storage            *Storage
@@ -69,6 +73,7 @@ type Sidekick struct {
 	CacheKeyCookies []string `json:"cache_key_cookies,omitempty"`
 
 	pathRx           *regexp.Regexp
+	staticAssetRx    *regexp.Regexp
 	bypassDebugQuery string // Internal field for debug query bypass
 
 	// Synchronization handler (initialized during Provision)
@@ -201,6 +206,16 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("nocache_home must be true or false")
 				}
 				s.NoCacheHome = b
+
+			case "static_asset_regex":
+				value = strings.TrimSpace(value)
+				if len(value) != 0 {
+					_, err := regexp.Compile(value)
+					if err != nil {
+						return err
+					}
+				}
+				s.StaticAssetRegex = value
 
 			case "cache_response_codes":
 				codes := strings.Split(value, ",")
@@ -455,14 +470,22 @@ const (
 	DefaultPurgeToken          = "dead-beef"
 	CacheHeaderName            = "X-Sidekick-Cache" // Not configurable
 	DefaultNoCacheRegex        = `\.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot|otf|mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe|doc|docx|xls|xlsx|ppt|pptx)$`
-	DefaultTTL                 = 300
-	DefaultDiskItemMaxSize     = 100 * 1024 * 1024                     // 100MB
-	DefaultDiskMaxSize         = 10 * 1024 * 1024 * 1024               // 10GB
-	DefaultDiskMaxCount        = 100000                                // 100K items on disk
-	DefaultStreamToDiskSize    = 10 * 1024 * 1024                      // 10MB
-	DefaultBufferSize          = 32 * 1024                             // 32KB buffer size
-	DefaultWPMuPluginEnabled   = true                                  // Enable mu-plugin management by default
-	DefaultWPMuPluginDir       = "/var/www/html/wp-content/mu-plugins" // Default mu-plugins directory
+	// DefaultStaticAssetRegex is deliberately conservative. It covers the asset
+	// types whose bytes are served straight off disk and cannot vary by cookie,
+	// and it deliberately EXCLUDES pdf/zip/archives/office documents and media
+	// (mp4, mov, webm, mp3): those are the formats membership and
+	// download-protection plugins gate behind a login check, and exempting them
+	// would let one visitor's gated copy be shared with everyone. Widen this
+	// per-site only when the site has no such plugin.
+	DefaultStaticAssetRegex  = `\.(css|js|mjs|map|jpg|jpeg|png|gif|webp|avif|svg|ico|woff|woff2|ttf|otf|eot)$`
+	DefaultTTL               = 300
+	DefaultDiskItemMaxSize   = 100 * 1024 * 1024                     // 100MB
+	DefaultDiskMaxSize       = 10 * 1024 * 1024 * 1024               // 10GB
+	DefaultDiskMaxCount      = 100000                                // 100K items on disk
+	DefaultStreamToDiskSize  = 10 * 1024 * 1024                      // 10MB
+	DefaultBufferSize        = 32 * 1024                             // 32KB buffer size
+	DefaultWPMuPluginEnabled = true                                  // Enable mu-plugin management by default
+	DefaultWPMuPluginDir     = "/var/www/html/wp-content/mu-plugins" // Default mu-plugins directory
 )
 
 func (s *Sidekick) Provision(ctx caddy.Context) error {
@@ -548,6 +571,20 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("invalid nocache_regex pattern: %v", err)
 		}
 		s.pathRx = rx
+	}
+
+	if s.StaticAssetRegex == "" {
+		s.StaticAssetRegex = os.Getenv("SIDEKICK_STATIC_ASSET_REGEX")
+		if s.StaticAssetRegex == "" {
+			s.StaticAssetRegex = DefaultStaticAssetRegex
+		}
+	}
+	if s.StaticAssetRegex != "" {
+		rx, err := regexp.Compile(s.StaticAssetRegex)
+		if err != nil {
+			return fmt.Errorf("invalid static_asset_regex pattern: %v", err)
+		}
+		s.staticAssetRx = rx
 	}
 
 	if !s.NoCacheHome {
@@ -1045,7 +1082,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	hdr := w.Header()
 	if bypass {
 		hdr.Set(CacheHeaderName, "BYPASS")
-		setNoCacheHeaders(hdr)
+		s.applyDownstreamCacheHeaders(hdr, s.computeKeyDims(r), cacheStateBypass, nil)
 		metrics.RecordCacheOperation("bypass", "true", "default")
 		err := next.ServeHTTP(w, r)
 		metrics.RecordResponseTime("bypass", "default", time.Since(startTime))
@@ -1057,7 +1094,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	modifiedSince := r.Header.Get("If-Modified-Since")
 
 	// Build cache key with configurable components
-	cacheKey := s.buildCacheKey(r)
+	cacheKey, keyDimensions := s.buildCacheKey(r)
 
 	// Parse Accept-Encoding header
 	requestEncoding := strings.Split(strings.Join(reqHdr["Accept-Encoding"], ","), ",")
@@ -1071,7 +1108,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		// Cache HIT
 		// Check for 304 Not Modified
 		if s.shouldReturn304(cacheMeta, etag, modifiedSince) {
-			s.setCacheControlHeaders(w.Header(), cacheMeta)
+			s.applyDownstreamCacheHeaders(w.Header(), keyDimensions, cacheStateNotModified, cacheMeta)
 			w.WriteHeader(http.StatusNotModified)
 			metrics.RecordResponseTime("hit", "default", time.Since(startTime))
 			return nil
@@ -1157,10 +1194,9 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		}
 
 	serveResponse:
-		// Serve from cache
+		// Serve from cache. Cache-Control/Age/Vary are applied further down, after
+		// the cached metadata headers, so the chokepoint has the final say.
 		hdr.Set(CacheHeaderName, "HIT")
-		hdr.Set("Vary", "Accept-Encoding")
-		s.setCacheControlHeaders(hdr, cacheMeta)
 		if selectedEncoding != "" {
 			hdr.Set("Content-Encoding", selectedEncoding)
 		}
@@ -1190,11 +1226,17 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 			}
 			// Skip headers we manage directly
 			if kv[0] == "Content-Encoding" || kv[0] == "Content-Length" ||
-				kv[0] == "Cache-Control" || kv[0] == "Age" || kv[0] == "Pragma" {
+				kv[0] == "Cache-Control" || kv[0] == "Age" || kv[0] == "Pragma" ||
+				kv[0] == "Vary" {
 				continue
 			}
 			hdr.Set(kv[0], kv[1])
 		}
+
+		// Applied after the cached metadata headers so that Cache-Control, Age and
+		// Vary come from the single chokepoint rather than from whatever the origin
+		// happened to send when this entry was stored.
+		s.applyDownstreamCacheHeaders(hdr, keyDimensions, cacheStateHit, cacheMeta)
 
 		// Set correct Content-Length for the data we're sending
 		hdr.Set("Content-Length", strconv.Itoa(len(dataToServe)))
@@ -1227,7 +1269,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	// Create custom writer to capture response
 	buf := s.bufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
-	nw := NewResponseWriter(w, r, storage, s.logger, s, once, cacheKey, buf)
+	nw := NewResponseWriter(w, r, storage, s.logger, s, once, cacheKey, buf, keyDimensions)
 	defer func() {
 		// Return buffer to pool
 		metrics.RecordResponseTime("miss", "default", time.Since(startTime))
@@ -1454,11 +1496,23 @@ func (s *Sidekick) shouldBypass(r *http.Request) bool {
 		return true
 	}
 
-	// Check WordPress login cookie
-	cookies := r.Cookies()
-	for _, cookie := range cookies {
-		if strings.HasPrefix(cookie.Name, "wordpress_logged_in") {
-			return true
+	// Check WordPress login cookie.
+	//
+	// Static assets are exempt. WordPress scopes wordpress_logged_in_<hash> to "/"
+	// (wp-includes/pluggable.php, COOKIEPATH), so a logged-in visitor sends it with
+	// EVERY request — including stylesheets, scripts, fonts and images. Without this
+	// exemption those requests all bypass the cache and hit the origin, even though
+	// their bytes are identical to what an anonymous visitor receives.
+	//
+	// This is evaluated last on purpose: the nocache prefixes, nocache_regex and
+	// nocache_home checks above all take precedence, so an explicitly excluded path
+	// stays excluded even if it looks like a static asset.
+	if !s.isStaticAsset(r.URL.Path) {
+		cookies := r.Cookies()
+		for _, cookie := range cookies {
+			if strings.HasPrefix(cookie.Name, "wordpress_logged_in") {
+				return true
+			}
 		}
 	}
 
@@ -1559,8 +1613,79 @@ func humanizeBytes(bytes int64) string {
 	return fmt.Sprintf("%.1f%s", float64(bytes)/float64(div), units[exp+1])
 }
 
-// buildCacheKey builds a cache key based on configured components
-func (s *Sidekick) buildCacheKey(r *http.Request) string {
+// keyDims records which request dimensions were folded into the cache key for a
+// given request. It exists so that the code deciding what varies the key and the
+// code deciding whether the response may be stored by a SHARED cache (CloudFront,
+// a corporate proxy, anything downstream) are driven by the same value and cannot
+// drift apart.
+//
+// The invariant: if Cookies is true, the response is specific to whoever sent that
+// cookie and must never be advertised as shareable. See applyDownstreamCacheHeaders.
+type keyDims struct {
+	// Headers lists the configured cache_key_headers actually present on the request.
+	Headers []string
+	// Cookies reports whether any cache_key_cookies pattern matched a cookie on
+	// the request, meaning the cache key — and therefore the response — is
+	// specific to that cookie value.
+	Cookies bool
+}
+
+// isStaticAsset reports whether a path's response bytes cannot vary by cookie.
+// Such paths are served straight off disk, so one entry can safely be shared by
+// logged-in and anonymous visitors alike.
+func (s *Sidekick) isStaticAsset(path string) bool {
+	return s.staticAssetRx != nil && s.staticAssetRx.MatchString(path)
+}
+
+// computeKeyDims determines which request dimensions vary the cache key. It is the
+// single source of truth for that question: buildCacheKey uses it to build the key,
+// and applyDownstreamCacheHeaders uses it to decide shareability.
+func (s *Sidekick) computeKeyDims(r *http.Request) keyDims {
+	var dims keyDims
+
+	for _, hdr := range s.CacheKeyHeaders {
+		// Host is part of the key unconditionally and is already implied by the
+		// request URL, so it never belongs in Vary.
+		if strings.EqualFold(hdr, "Host") {
+			continue
+		}
+		if r.Header.Get(hdr) != "" {
+			dims.Headers = append(dims.Headers, hdr)
+		}
+	}
+
+	// Static assets are exempt from cookie keying: their bytes are identical for
+	// every visitor, so varying on a session cookie would fragment the cache into
+	// per-session copies of the same file and force each copy to be marked private.
+	if s.isStaticAsset(r.URL.Path) {
+		return dims
+	}
+
+	for _, cookiePattern := range s.CacheKeyCookies {
+		if strings.Contains(cookiePattern, "*") {
+			prefix := strings.TrimSuffix(cookiePattern, "*")
+			for _, cookie := range r.Cookies() {
+				if strings.HasPrefix(cookie.Name, prefix) {
+					dims.Cookies = true
+					break
+				}
+			}
+		} else if _, err := r.Cookie(cookiePattern); err == nil {
+			dims.Cookies = true
+		}
+		if dims.Cookies {
+			break
+		}
+	}
+
+	return dims
+}
+
+// buildCacheKey builds a cache key based on configured components. It also returns
+// the dimensions that varied the key, which the caller MUST pass to
+// applyDownstreamCacheHeaders so a cookie-varied response is never marked shareable.
+func (s *Sidekick) buildCacheKey(r *http.Request) (string, keyDims) {
+	dims := s.computeKeyDims(r)
 	h := md5.New()
 
 	// Always include hostname to prevent cross-domain cache pollution.
@@ -1607,26 +1732,30 @@ func (s *Sidekick) buildCacheKey(r *http.Request) string {
 		}
 	}
 
-	// Include configured cookies (with wildcard support)
-	for _, cookiePattern := range s.CacheKeyCookies {
-		// Check if pattern contains wildcard
-		if strings.Contains(cookiePattern, "*") {
-			// Convert wildcard to prefix matching
-			prefix := strings.TrimSuffix(cookiePattern, "*")
-			for _, cookie := range r.Cookies() {
-				if strings.HasPrefix(cookie.Name, prefix) {
-					h.Write([]byte(cookie.Name + "=" + cookie.Value))
+	// Include configured cookies (with wildcard support). Skipped entirely for
+	// static assets — see computeKeyDims — so those keys are cookie-free and the
+	// resulting entry can be shared by every visitor.
+	if dims.Cookies {
+		for _, cookiePattern := range s.CacheKeyCookies {
+			// Check if pattern contains wildcard
+			if strings.Contains(cookiePattern, "*") {
+				// Convert wildcard to prefix matching
+				prefix := strings.TrimSuffix(cookiePattern, "*")
+				for _, cookie := range r.Cookies() {
+					if strings.HasPrefix(cookie.Name, prefix) {
+						h.Write([]byte(cookie.Name + "=" + cookie.Value))
+					}
 				}
-			}
-		} else {
-			// Exact match
-			if cookie, err := r.Cookie(cookiePattern); err == nil {
-				h.Write([]byte(cookiePattern + "=" + cookie.Value))
+			} else {
+				// Exact match
+				if cookie, err := r.Cookie(cookiePattern); err == nil {
+					h.Write([]byte(cookiePattern + "=" + cookie.Value))
+				}
 			}
 		}
 	}
 
-	return fmt.Sprintf("%x", h.Sum(nil))
+	return fmt.Sprintf("%x", h.Sum(nil)), dims
 }
 
 // shouldReturn304 checks if we should return a 304 Not Modified response
@@ -1655,31 +1784,84 @@ func (s *Sidekick) shouldReturn304(meta *Metadata, ifNoneMatch, ifModifiedSince 
 	return false
 }
 
-// setCacheControlHeaders sets Cache-Control and Age headers for HIT/304 responses
-// based on the TTL configuration and the cache entry's age.
-func (s *Sidekick) setCacheControlHeaders(hdr http.Header, cacheMeta *Metadata) {
-	if s.CacheTTL <= 0 || cacheMeta == nil || cacheMeta.Timestamp <= 0 {
+// cacheState identifies which path produced a response, for the purpose of
+// choosing downstream cache headers.
+type cacheState int
+
+const (
+	cacheStateBypass cacheState = iota
+	cacheStateMiss
+	cacheStateHit
+	cacheStateNotModified
+)
+
+// applyDownstreamCacheHeaders is the ONLY place in this package that writes
+// Cache-Control, Pragma, Age or Vary on a response. Every serving path routes
+// through it so that the shareability decision is made once, from the same keyDims
+// value that varied the cache key.
+//
+// The safety rule it enforces: a response whose cache key was varied by a cookie is
+// specific to that visitor's session and must never be stored by a shared cache. It
+// is emitted as "private, no-store" with Cookie in Vary. Sidekick's own cache still
+// segments such entries correctly by key — the restriction is about what CloudFront,
+// proxies and other intermediaries are permitted to do with the response.
+//
+// Callers MUST pass the keyDims returned by buildCacheKey (or computeKeyDims on
+// paths that never build a key). Passing a zero keyDims for a request that did carry
+// a matching cookie would reintroduce the leak this function exists to prevent.
+func (s *Sidekick) applyDownstreamCacheHeaders(hdr http.Header, dims keyDims, state cacheState, cacheMeta *Metadata) {
+	// Vary must be consistent across HIT, MISS and BYPASS for the same URL, or a
+	// shared cache can store one variant and serve it for another. It lists every
+	// request dimension that varies the cache key.
+	vary := make([]string, 0, len(dims.Headers)+2)
+	vary = append(vary, "Accept-Encoding")
+	for _, h := range dims.Headers {
+		if !strings.EqualFold(h, "Accept-Encoding") {
+			vary = append(vary, h)
+		}
+	}
+	if dims.Cookies {
+		vary = append(vary, "Cookie")
+	}
+	hdr.Set("Vary", strings.Join(vary, ", "))
+
+	// A cookie-varied response is private to one session, whatever produced it.
+	// Vary: Cookie above is defense in depth for intermediaries that honor Vary but
+	// mishandle private; this header is the actual guarantee.
+	if dims.Cookies {
+		hdr.Set("Cache-Control", "private, no-store")
+		hdr.Set("Pragma", "no-cache")
+		hdr.Del("Age")
 		return
 	}
 
-	ageSeconds := time.Now().Unix() - cacheMeta.Timestamp
-	if ageSeconds < 0 {
-		ageSeconds = 0
+	switch state {
+	case cacheStateHit, cacheStateNotModified:
+		if s.CacheTTL <= 0 || cacheMeta == nil || cacheMeta.Timestamp <= 0 {
+			return
+		}
+
+		ageSeconds := time.Now().Unix() - cacheMeta.Timestamp
+		if ageSeconds < 0 {
+			ageSeconds = 0
+		}
+
+		remainingTTL := int64(s.CacheTTL) - ageSeconds
+		if remainingTTL < 0 {
+			remainingTTL = 0
+		}
+
+		hdr.Set("Cache-Control", fmt.Sprintf("public, max-age=%d", remainingTTL))
+		hdr.Set("Age", fmt.Sprintf("%d", ageSeconds))
+
+	default:
+		// MISS and BYPASS keep the existing conservative behavior. Relaxing this so
+		// that a MISS is as cacheable downstream as a HIT is deliberately a separate
+		// change: it needs the bypass-reason classification (private vs policy) to
+		// avoid marking logged-in responses cacheable.
+		hdr.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		hdr.Set("Pragma", "no-cache")
 	}
-
-	remainingTTL := int64(s.CacheTTL) - ageSeconds
-	if remainingTTL < 0 {
-		remainingTTL = 0
-	}
-
-	hdr.Set("Cache-Control", fmt.Sprintf("public, max-age=%d", remainingTTL))
-	hdr.Set("Age", fmt.Sprintf("%d", ageSeconds))
-}
-
-// setNoCacheHeaders sets headers to prevent upstream caching for MISS/BYPASS responses.
-func setNoCacheHeaders(hdr http.Header) {
-	hdr.Set("Cache-Control", "no-cache, no-store, must-revalidate")
-	hdr.Set("Pragma", "no-cache")
 }
 
 // Cleanup implements caddy.CleanerUpper

@@ -18,12 +18,13 @@ import (
 	"go.uber.org/zap"
 )
 
-func NewResponseWriter(rw http.ResponseWriter, r *http.Request, storage *Storage, logger *zap.Logger, s *Sidekick, once *sync.Once, cacheKey string, buf *bytes.Buffer) *ResponseWriter {
+func NewResponseWriter(rw http.ResponseWriter, r *http.Request, storage *Storage, logger *zap.Logger, s *Sidekick, once *sync.Once, cacheKey string, buf *bytes.Buffer, dims keyDims) *ResponseWriter {
 	nw := ResponseWriter{
 		ResponseWriter: rw,
 		Request:        r,
 		Storage:        storage,
 		Logger:         logger,
+		keyDims:        dims,
 
 		// keep original request info
 		origUrl: *r.URL,
@@ -79,6 +80,11 @@ type ResponseWriter struct {
 	cacheKey string
 	cacheMu  *sync.RWMutex
 	bufMu    sync.Mutex
+
+	// keyDims records which request dimensions varied the cache key, and drives
+	// whether this response may be stored by a shared cache. See
+	// Sidekick.applyDownstreamCacheHeaders.
+	keyDims keyDims
 
 	// Reference to parent
 	sidekick *Sidekick
@@ -221,19 +227,17 @@ func (r *ResponseWriter) WriteHeader(status int) {
 		}
 	}
 
-	cacheState := "BYPASS"
 	if bypass {
-		hdr.Set(r.cacheHeaderName, cacheState)
-		setNoCacheHeaders(hdr)
+		hdr.Set(r.cacheHeaderName, "BYPASS")
+		r.sidekick.applyDownstreamCacheHeaders(hdr, r.keyDims, cacheStateBypass, nil)
 		r.ResponseWriter.WriteHeader(status)
 		return
 	}
 
 	atomic.StoreInt32(&r.needCache, 1)
-	cacheState = "MISS"
 
-	hdr.Set(r.cacheHeaderName, cacheState)
-	setNoCacheHeaders(hdr)
+	hdr.Set(r.cacheHeaderName, "MISS")
+	r.sidekick.applyDownstreamCacheHeaders(hdr, r.keyDims, cacheStateMiss, nil)
 	r.ResponseWriter.WriteHeader(status)
 }
 
