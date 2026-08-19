@@ -409,16 +409,9 @@ func (s *Storage) readDiskCacheData(key string, cacheDir string) ([]byte, *Metad
 	}
 
 	// Check TTL
-	if s.ttl > 0 && md.Timestamp > 0 {
-		if time.Since(time.Unix(md.Timestamp, 0)) > time.Duration(s.ttl)*time.Second {
-			// Cache expired, clean it up asynchronously
-			s.asyncOps.Add(1)
-			go func() {
-				defer s.asyncOps.Done()
-				_ = s.Purge(key)
-			}()
-			return nil, nil, ErrCacheExpired
-		}
+	if s.isExpired(md.Timestamp) {
+		s.purgeAsync(key)
+		return nil, nil, ErrCacheExpired
 	}
 
 	// Read data file

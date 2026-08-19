@@ -1255,6 +1255,17 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	// Parse Accept-Encoding header
 	requestEncoding := strings.Split(strings.Join(reqHdr["Accept-Encoding"], ","), ",")
 
+	// Streaming fast path. When the stored bytes can go to the client unchanged,
+	// serve them from an open file instead of reading the whole entry into memory —
+	// otherwise a cached 34MB video costs 34MB of transient heap per viewer. Falls
+	// through to the buffered path below for anything needing a transform.
+	if !clientWantsCompression(requestEncoding) {
+		served, err := s.tryServeStreamed(w, r, cacheKey, keyDimensions, etag, modifiedSince, metrics, startTime)
+		if served {
+			return err
+		}
+	}
+
 	// Try to get from cache with read lock
 	s.syncHandler.cacheMu.RLock()
 	cacheData, cacheMeta, err := storage.Get(cacheKey)
@@ -2054,6 +2065,89 @@ func (s *Sidekick) buildCacheKey(r *http.Request) (string, keyDims) {
 }
 
 // shouldReturn304 checks if we should return a 304 Not Modified response
+// clientWantsCompression reports whether the buffered HIT path would compress an
+// identity-encoded entry on the fly for this client.
+//
+// It mirrors the negotiation loop in ServeHTTP, including its first-match-wins
+// semantics, and exists so the caller can decide whether the stored bytes may be
+// streamed straight through before touching the body at all.
+func clientWantsCompression(requestEncodings []string) bool {
+	for _, enc := range requestEncodings {
+		enc = strings.TrimSpace(enc)
+		if idx := strings.Index(enc, ";"); idx != -1 {
+			enc = enc[:idx]
+		}
+		switch enc {
+		case "br", "gzip", "zstd":
+			return true
+		case "identity", "*":
+			return false
+		}
+	}
+	return false
+}
+
+// tryServeStreamed serves a cache hit directly from storage without materializing the
+// body. It reports whether it handled the request; false means the caller should fall
+// through to the buffered path.
+//
+// Deliberately narrow: only a full, identity-encoded 200 is served this way. Cached
+// redirects and error statuses need their own status code written, and compressed
+// entries keep the existing whole-body handling so that Range never applies to
+// encoded bytes.
+func (s *Sidekick) tryServeStreamed(w http.ResponseWriter, r *http.Request, cacheKey string,
+	dims keyDims, etag, modifiedSince string,
+	metrics *MetricsCollector, startTime time.Time) (bool, error) {
+
+	s.syncHandler.cacheMu.RLock()
+	reader, cacheMeta, size, err := s.Storage.GetReader(cacheKey)
+	s.syncHandler.cacheMu.RUnlock()
+
+	if err != nil {
+		// Miss, expired, or compressed on disk — the buffered path deals with it.
+		return false, nil
+	}
+
+	enc := cacheMeta.HeaderValue("Content-Encoding")
+	if cacheMeta.StateCode != http.StatusOK || (enc != "" && enc != "identity") {
+		_ = reader.Close()
+		return false, nil
+	}
+
+	defer func() {
+		if cerr := reader.Close(); cerr != nil {
+			s.logger.Debug("Failed to close streamed cache reader", zap.Error(cerr))
+		}
+	}()
+
+	canRange := r.Header.Get("Range") != ""
+
+	// Conditional handling matches the buffered path: ServeContent owns it for range
+	// requests, the local implementation handles everything else.
+	if !canRange && s.shouldReturn304(cacheMeta, etag, modifiedSince) {
+		s.applyDownstreamCacheHeaders(w.Header(), dims, cacheStateNotModified, cacheMeta)
+		w.WriteHeader(http.StatusNotModified)
+		metrics.RecordResponseTime("hit", "default", time.Since(startTime))
+		return true, nil
+	}
+
+	s.logger.Debug("Serving cached response from storage without buffering",
+		zap.String("path", r.URL.Path), zap.Int64("size", size), zap.Bool("range", canRange))
+
+	hdr := w.Header()
+	hdr.Set(CacheHeaderName, "HIT")
+	s.applyCachedHeaders(hdr, cacheMeta, dims)
+	hdr.Del("Content-Length") // ServeContent derives it from what it actually sends
+
+	http.ServeContent(w, r, "", cachedModTime(cacheMeta), reader)
+
+	if canRange {
+		metrics.RecordCacheOperation("get", "range_hit", "default")
+	}
+	metrics.RecordResponseTime("hit", "default", time.Since(startTime))
+	return true, nil
+}
+
 // applyCachedHeaders restores the stored response headers onto hdr and then applies
 // the downstream cache-header chokepoint.
 //

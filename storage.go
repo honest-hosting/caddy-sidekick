@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -19,6 +20,9 @@ import (
 var (
 	ErrCacheExpired  = errors.New("cache expired")
 	ErrCacheNotFound = errors.New("cache not found")
+	// ErrNotStreamable means the entry exists but cannot be served without being
+	// materialized first (it is compressed on disk). Callers should fall back to Get.
+	ErrNotStreamable = errors.New("cache entry is not streamable")
 )
 
 // keyMutexShards is the number of per-key lock shards. Large enough that unrelated
@@ -160,16 +164,9 @@ func (s *Storage) Get(key string) ([]byte, *Metadata, error) {
 	if memCache != nil {
 		if cacheItem, ok := memCache.Get(key); ok && cacheItem != nil && (*cacheItem).Metadata != nil {
 			// Check TTL
-			if s.ttl > 0 && (*cacheItem).Timestamp > 0 {
-				if time.Now().Unix() > (*cacheItem).Timestamp+int64(s.ttl) {
-					// Cache expired, clean it up asynchronously
-					s.asyncOps.Add(1)
-					go func() {
-						defer s.asyncOps.Done()
-						_ = s.Purge(key)
-					}()
-					return nil, nil, ErrCacheExpired
-				}
+			if s.isExpired((*cacheItem).Timestamp) {
+				s.purgeAsync(key)
+				return nil, nil, ErrCacheExpired
 			}
 
 			if s.logger != nil {
@@ -223,6 +220,137 @@ func (s *Storage) Get(key string) ([]byte, *Metadata, error) {
 	metrics.RecordCacheOperation("get", "miss", "default")
 	return nil, nil, ErrCacheNotFound
 }
+
+// GetReader returns a seekable reader over a cached entry without materializing the
+// body in memory, along with its metadata and size.
+//
+// This is the path that makes large objects cheap to serve: Get reads the whole entry
+// into a []byte on every request, so a cached 34MB video costs 34MB of transient heap
+// per concurrent viewer. A disk-backed entry returned here is an open *os.File, so the
+// bytes go from page cache to socket without a copy through the handler.
+//
+// Returns ErrNotStreamable when the entry is compressed on disk and would have to be
+// decompressed in full anyway; callers should fall back to Get in that case. The
+// caller MUST Close the returned reader.
+func (s *Storage) GetReader(key string) (io.ReadSeekCloser, *Metadata, int64, error) {
+	keyMu := s.getKeyMutex(key)
+	keyMu.RLock()
+	defer keyMu.RUnlock()
+
+	// Memory tier: entries are capped at cache_memory_item_max_size, so there is
+	// nothing to stream. Hand back the bytes we already hold.
+	memCache := s.GetMemCache()
+	if memCache != nil {
+		if cacheItem, ok := memCache.Get(key); ok && cacheItem != nil && (*cacheItem).Metadata != nil {
+			if s.isExpired((*cacheItem).Timestamp) {
+				s.purgeAsync(key)
+				return nil, nil, 0, ErrCacheExpired
+			}
+
+			data := (*cacheItem).value.Bytes()
+			metrics := GetMetrics()
+			metrics.RecordCacheOperation("get", "hit", "memory")
+			metrics.RecordItemSize("memory", "default", int64(len(data)))
+			return nopSeekCloser{bytes.NewReader(data)}, (*cacheItem).Metadata, int64(len(data)), nil
+		}
+	}
+
+	diskCache := s.GetDiskCache()
+	if diskCache == nil {
+		return nil, nil, 0, ErrCacheNotFound
+	}
+
+	item, err := diskCache.Get(key)
+	if err != nil || item == nil {
+		metrics := GetMetrics()
+		metrics.RecordCacheOperation("get", "miss", "default")
+		return nil, nil, 0, ErrCacheNotFound
+	}
+
+	md := &Metadata{}
+	if err := md.LoadFromFile(filepath.Join(item.Path, "metadata.json")); err != nil {
+		return nil, nil, 0, fmt.Errorf("failed to load metadata: %w", err)
+	}
+
+	if s.isExpired(md.Timestamp) {
+		_ = diskCache.Delete(key)
+		return nil, nil, 0, ErrCacheExpired
+	}
+
+	// A compressed entry has to be decompressed in full to be useful, so there is
+	// nothing to gain from streaming it. Phase 3.1 keeps media uncompressed, which
+	// is what makes this path apply to the objects that actually matter.
+	if ct := md.HeaderValue("X-Compression-Type"); ct != "" && ct != "none" {
+		return nil, nil, 0, ErrNotStreamable
+	}
+
+	// Take the file lock only to open, never across the response.
+	//
+	// fileMu is Storage-wide, not per-key: holding it while streaming a large body
+	// to a slow client would stall every write in the process. Releasing it here is
+	// safe because eviction removes entries with os.RemoveAll, and on Linux an open
+	// descriptor keeps the inode alive after the directory entry is unlinked — so a
+	// response already in flight completes correctly even if the entry is evicted
+	// mid-stream.
+	s.fileMu.RLock()
+	f, err := os.Open(filepath.Join(item.Path, "data"))
+	s.fileMu.RUnlock()
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("failed to open data file: %w", err)
+	}
+
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		_ = f.Close()
+		return nil, nil, 0, fmt.Errorf("failed to size data file: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		_ = f.Close()
+		return nil, nil, 0, fmt.Errorf("failed to rewind data file: %w", err)
+	}
+
+	if s.logger != nil {
+		s.logger.Debug("Cache hit (disk, streamed)",
+			zap.String("key", key), zap.Int64("size", size))
+	}
+	metrics := GetMetrics()
+	metrics.RecordCacheOperation("get", "hit", "disk")
+	metrics.RecordItemSize("disk", "default", size)
+
+	return f, md, size, nil
+}
+
+// isExpired reports whether an entry stamped at ts has outlived the configured TTL.
+//
+// Compared as a duration rather than by whole seconds. The two tiers previously
+// disagreed here — the memory path used integer-second arithmetic while the disk path
+// used time.Since — which made expiry differ by up to a second depending on which
+// tier an entry happened to land in. This is the disk path's (more precise) rule,
+// now applied to both.
+func (s *Storage) isExpired(ts int64) bool {
+	if s.ttl <= 0 || ts <= 0 {
+		return false
+	}
+	return time.Since(time.Unix(ts, 0)) > time.Duration(s.ttl)*time.Second
+}
+
+// purgeAsync removes an entry in the background, used when a read discovers it has
+// expired and must not block on cleanup.
+func (s *Storage) purgeAsync(key string) {
+	s.asyncOps.Add(1)
+	go func() {
+		defer s.asyncOps.Done()
+		_ = s.Purge(key)
+	}()
+}
+
+// nopSeekCloser adapts an in-memory reader to io.ReadSeekCloser so callers can treat
+// memory- and disk-backed entries identically.
+type nopSeekCloser struct {
+	*bytes.Reader
+}
+
+func (nopSeekCloser) Close() error { return nil }
 
 func (s *Storage) Set(url string, metadata *Metadata, data []byte) error {
 	key := s.buildCacheKey(url)

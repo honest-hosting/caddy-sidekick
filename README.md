@@ -516,6 +516,23 @@ Note that the first range request for a cold object costs a full read of that ob
 from the origin. Against a local `file_server` that is cheap. Set `range_fill false`
 if your origin makes it expensive.
 
+### Streaming From Disk
+
+When the stored bytes can go to the client unchanged, Sidekick serves them from an
+open file rather than reading the entry into memory first. A cached 34MB video is
+therefore never fully resident in RAM, no matter how many viewers are streaming it —
+which is what makes `cache_memory_stream_to_disk_size` describe real behavior on both
+the write and the read side.
+
+The buffered path is still used when the body has to be transformed: an
+identity-encoded entry being compressed on the fly for a client that asked for gzip or
+brotli, or an entry that was compressed on disk and must be decompressed. Cached
+redirects and error statuses also take the buffered path, since they need their own
+status code rather than the `200`/`206` that streaming produces.
+
+Nothing about this is configurable — it is chosen automatically per request based on
+whether a transform is needed.
+
 ### Request Collapsing
 
 A range fill reads the whole object, so several viewers seeking into the same cold
