@@ -12,6 +12,7 @@ import (
 	"path"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -45,6 +46,71 @@ func NewResponseWriter(rw http.ResponseWriter, r *http.Request, storage *Storage
 }
 
 var _ http.ResponseWriter = (*ResponseWriter)(nil)
+
+// bypassResponseWriter re-applies Sidekick's downstream cache headers after the
+// upstream handler has written its own.
+//
+// On the bypass path Sidekick does not wrap the body at all, so it used to set
+// Cache-Control before invoking the upstream and the upstream was then free to
+// overwrite it. That made the "private, no-store" guarantee advisory: a handler
+// emitting its own `public, max-age=...` silently won. Deferring the write until
+// WriteHeader means Sidekick's decision is applied last and actually holds.
+type bypassResponseWriter struct {
+	http.ResponseWriter
+	sidekick *Sidekick
+	dims     keyDims
+	state    cacheState
+	applied  bool
+}
+
+func newBypassResponseWriter(w http.ResponseWriter, s *Sidekick, dims keyDims, state cacheState) *bypassResponseWriter {
+	return &bypassResponseWriter{ResponseWriter: w, sidekick: s, dims: dims, state: state}
+}
+
+// applyHeaders stamps the cache headers exactly once. Safe to call after the handler
+// returns, for handlers that never wrote anything.
+func (w *bypassResponseWriter) applyHeaders() {
+	if w.applied {
+		return
+	}
+	w.applied = true
+
+	hdr := w.Header()
+	hdr.Set(CacheHeaderName, "BYPASS")
+	w.sidekick.applyDownstreamCacheHeaders(hdr, w.dims, w.state, nil)
+}
+
+func (w *bypassResponseWriter) WriteHeader(status int) {
+	w.applyHeaders()
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *bypassResponseWriter) Write(b []byte) (int, error) {
+	w.applyHeaders()
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *bypassResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *bypassResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *bypassResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("hijacking not supported")
+}
+
+func (w *bypassResponseWriter) Push(target string, opts *http.PushOptions) error {
+	if p, ok := w.ResponseWriter.(http.Pusher); ok {
+		return p.Push(target, opts)
+	}
+	return fmt.Errorf("push not supported")
+}
 
 // ResponseWriter handles the response and provide the way to cache the value
 type ResponseWriter struct {
@@ -237,9 +303,34 @@ func (r *ResponseWriter) WriteHeader(status int) {
 		}
 	}
 
+	// Respect the origin's own cacheability directives.
+	//
+	// Nothing previously looked at these, so a response the application explicitly
+	// marked no-store or private — a checkout page, an account page, anything a
+	// plugin protects — was stored by Sidekick anyway. That was already wrong; it
+	// becomes materially worse now that a MISS is advertised as publicly cacheable,
+	// because the response would also be offered to shared caches.
+	originPrivate := false
+	if cc := strings.ToLower(hdr.Get("Cache-Control")); cc != "" {
+		if strings.Contains(cc, "no-store") || strings.Contains(cc, "private") {
+			bypass = true
+			originPrivate = true
+			r.Debug("Bypass caching because the origin marked the response uncacheable",
+				zap.String("cache_control", cc))
+		}
+	}
+
 	if bypass {
+		// A response the origin called private stays private. Everything else here
+		// is Sidekick policy — too large, an uncacheable status, a header we refuse
+		// to store — which says nothing about whether others may cache it.
+		state := cacheStateBypassPolicy
+		if originPrivate {
+			state = cacheStateBypassPrivate
+		}
+
 		hdr.Set(r.cacheHeaderName, "BYPASS")
-		r.sidekick.applyDownstreamCacheHeaders(hdr, r.keyDims, cacheStateBypass, nil)
+		r.sidekick.applyDownstreamCacheHeaders(hdr, r.keyDims, state, nil)
 		// Nothing will be cached, so there is no reason to hold the body back.
 		// Abandon the fill before any bytes are written and stream normally.
 		r.abandonCaptureBeforeBody()

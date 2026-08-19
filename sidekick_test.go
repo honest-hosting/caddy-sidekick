@@ -421,9 +421,14 @@ func TestShouldBypass_PrefixMatching(t *testing.T) {
 			}
 
 			req := httptest.NewRequest("GET", tc.requestPath, nil)
-			bypass := s.shouldBypass(req)
+			reason := s.shouldBypass(req)
 
-			assert.Equal(t, tc.shouldBypass, bypass, "Bypass result mismatch for path %s", tc.requestPath)
+			assert.Equal(t, tc.shouldBypass, reason != bypassNone,
+				"Bypass result mismatch for path %s", tc.requestPath)
+			if tc.shouldBypass {
+				assert.Equal(t, bypassPrivate, reason,
+					"nocache prefixes name private application areas, so they bypass as private")
+			}
 		})
 	}
 }
@@ -525,12 +530,69 @@ func TestSetCacheControlHeaders_NilMetadata(t *testing.T) {
 	assert.Empty(t, hdr.Get("Age"), "should not set Age with nil metadata")
 }
 
-func TestSetNoCacheHeaders(t *testing.T) {
-	s := &Sidekick{}
+// TestDownstreamCacheHeadersByState replaces the old TestSetNoCacheHeaders, which
+// asserted the blanket "no-store on everything that is not a HIT" behavior. That was
+// the bug: it told browsers and CloudFront to discard responses they were entitled to
+// keep, so the same object was re-fetched from origin forever.
+func TestDownstreamCacheHeadersByState(t *testing.T) {
+	s := &Sidekick{CacheTTL: 300, BypassCacheControl: bypassCacheControlPreserve}
+
+	t.Run("miss is as cacheable as a hit", func(t *testing.T) {
+		hdr := http.Header{}
+		s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateMiss, nil)
+		assert.Equal(t, "public, max-age=300", hdr.Get("Cache-Control"))
+		assert.Equal(t, "0", hdr.Get("Age"))
+		assert.Empty(t, hdr.Get("Pragma"), "Pragma is meaningless in a response")
+	})
+
+	t.Run("private bypass is locked down", func(t *testing.T) {
+		hdr := http.Header{}
+		s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateBypassPrivate, nil)
+		assert.Equal(t, "private, no-store", hdr.Get("Cache-Control"))
+		assert.Equal(t, "no-cache", hdr.Get("Pragma"))
+		assert.Empty(t, hdr.Get("Age"))
+	})
+
+	t.Run("policy bypass leaves the origin alone", func(t *testing.T) {
+		hdr := http.Header{}
+		hdr.Set("Cache-Control", "public, max-age=31536000, immutable")
+		s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateBypassPolicy, nil)
+		assert.Equal(t, "public, max-age=31536000, immutable", hdr.Get("Cache-Control"),
+			"declining to store a response says nothing about whether others may")
+	})
+
+	t.Run("policy bypass adds nothing when the origin said nothing", func(t *testing.T) {
+		hdr := http.Header{}
+		s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateBypassPolicy, nil)
+		assert.Empty(t, hdr.Get("Cache-Control"))
+	})
+
+	t.Run("debug bypass never caches", func(t *testing.T) {
+		hdr := http.Header{}
+		hdr.Set("Cache-Control", "public, max-age=600")
+		s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateBypassDebug, nil)
+		assert.Equal(t, "no-cache, no-store, must-revalidate", hdr.Get("Cache-Control"))
+	})
+}
+
+// TestBypassCacheControlLegacyMode covers the escape hatch: the old blanket behavior
+// must be restorable with a config push rather than a redeploy.
+func TestBypassCacheControlLegacyMode(t *testing.T) {
+	s := &Sidekick{CacheTTL: 300, BypassCacheControl: bypassCacheControlNoStore}
+
+	for _, state := range []cacheState{
+		cacheStateMiss, cacheStateBypassPrivate, cacheStateBypassPolicy, cacheStateBypassDebug,
+	} {
+		hdr := http.Header{}
+		hdr.Set("Cache-Control", "public, max-age=600")
+		s.applyDownstreamCacheHeaders(hdr, keyDims{}, state, nil)
+		assert.Equal(t, "no-cache, no-store, must-revalidate", hdr.Get("Cache-Control"))
+	}
+
+	// A HIT is still cacheable — the escape hatch covers non-hit paths only.
 	hdr := http.Header{}
-	s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateMiss, nil)
-	assert.Equal(t, "no-cache, no-store, must-revalidate", hdr.Get("Cache-Control"))
-	assert.Equal(t, "no-cache", hdr.Get("Pragma"))
+	s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateHit, &Metadata{Timestamp: time.Now().Unix()})
+	assert.Contains(t, hdr.Get("Cache-Control"), "public")
 }
 
 func TestCacheControlHeaders_NotOverwrittenByMetadata(t *testing.T) {

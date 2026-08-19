@@ -55,10 +55,12 @@ func TestSharedCacheSafety_CookieVariedIsNeverPublic(t *testing.T) {
 	s := prodLikeSidekick(t)
 
 	states := map[string]cacheState{
-		"hit":          cacheStateHit,
-		"miss":         cacheStateMiss,
-		"bypass":       cacheStateBypass,
-		"not-modified": cacheStateNotModified,
+		"hit":            cacheStateHit,
+		"miss":           cacheStateMiss,
+		"bypass-private": cacheStateBypassPrivate,
+		"bypass-policy":  cacheStateBypassPolicy,
+		"bypass-debug":   cacheStateBypassDebug,
+		"not-modified":   cacheStateNotModified,
 	}
 
 	for _, pattern := range s.CacheKeyCookies {
@@ -100,7 +102,7 @@ func TestSharedCacheSafety_SecCookieWithoutLoggedIn(t *testing.T) {
 	req := requestWithCookies("/members/dashboard",
 		&http.Cookie{Name: "wordpress_sec_abc123", Value: "session-value"})
 
-	assert.False(t, s.shouldBypass(req),
+	assert.Equal(t, bypassNone, s.shouldBypass(req),
 		"precondition: this request is not bypassed, which is why the header matters")
 
 	dims := s.computeKeyDims(req)
@@ -144,7 +146,8 @@ func TestVaryIsConsistentAcrossStates(t *testing.T) {
 
 	var seen string
 	for i, state := range []cacheState{
-		cacheStateBypass, cacheStateMiss, cacheStateHit, cacheStateNotModified,
+		cacheStateBypassPrivate, cacheStateBypassPolicy, cacheStateBypassDebug,
+		cacheStateMiss, cacheStateHit, cacheStateNotModified,
 	} {
 		hdr := http.Header{}
 		s.applyDownstreamCacheHeaders(hdr, dims, state, &Metadata{Timestamp: 1})
@@ -201,7 +204,7 @@ func TestStaticAssetExemption_LoggedInIsCachedAndShared(t *testing.T) {
 		t.Run(path, func(t *testing.T) {
 			req := requestWithCookies(path, loggedIn)
 
-			assert.False(t, s.shouldBypass(req),
+			assert.Equal(t, bypassNone, s.shouldBypass(req),
 				"static assets must not bypass just because a login cookie is present")
 
 			dims := s.computeKeyDims(req)
@@ -237,11 +240,11 @@ func TestStaticAssetExemption_GatedFormatsStayProtected(t *testing.T) {
 		t.Run(path, func(t *testing.T) {
 			req := requestWithCookies(path, loggedIn)
 
-			assert.True(t, s.shouldBypass(req),
+			assert.NotEqual(t, bypassNone, s.shouldBypass(req),
 				"non-static paths must still bypass for logged-in users")
 
 			hdr := http.Header{}
-			s.applyDownstreamCacheHeaders(hdr, s.computeKeyDims(req), cacheStateBypass, nil)
+			s.applyDownstreamCacheHeaders(hdr, s.computeKeyDims(req), cacheStateBypassPrivate, nil)
 			assert.NotContains(t, hdr.Get("Cache-Control"), "public")
 		})
 	}
@@ -259,11 +262,11 @@ func TestStaticAssetExemption_ExplicitExclusionsWin(t *testing.T) {
 	loggedIn := &http.Cookie{Name: "wordpress_logged_in_abc123", Value: "session-value"}
 
 	// Matches a nocache prefix and also looks static.
-	assert.True(t, s.shouldBypass(requestWithCookies("/wp-admin/load-styles.css", loggedIn)),
+	assert.NotEqual(t, bypassNone, s.shouldBypass(requestWithCookies("/wp-admin/load-styles.css", loggedIn)),
 		"nocache prefix must win over the static-asset exemption")
 
 	// Matches nocache_regex and also looks static.
-	assert.True(t, s.shouldBypass(requestWithCookies("/private/secret.css", loggedIn)),
+	assert.NotEqual(t, bypassNone, s.shouldBypass(requestWithCookies("/private/secret.css", loggedIn)),
 		"nocache_regex must win over the static-asset exemption")
 }
 

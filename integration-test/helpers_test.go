@@ -149,16 +149,61 @@ func checkCacheControlHIT(t *testing.T, resp *http.Response, maxTTL int) {
 	}
 }
 
-// checkNoCacheHeaders validates no-cache headers for MISS/BYPASS responses.
-func checkNoCacheHeaders(t *testing.T, resp *http.Response) {
+// checkCacheControlMISS validates that a MISS is advertised as cacheable downstream.
+//
+// A MISS used to be stamped "no-cache, no-store, must-revalidate", which told the
+// browser and CloudFront to discard a response they were entitled to keep — so the
+// first viewer's copy was thrown away everywhere and the object was re-fetched from
+// origin forever. A MISS is exactly as cacheable as a HIT; it simply was not in
+// Sidekick's cache yet.
+func checkCacheControlMISS(t *testing.T, resp *http.Response, ttl int) {
 	t.Helper()
+
 	cc := resp.Header.Get("Cache-Control")
-	if cc != "no-cache, no-store, must-revalidate" {
-		t.Errorf("Expected Cache-Control: no-cache, no-store, must-revalidate, got: %s", cc)
+	expected := fmt.Sprintf("public, max-age=%d", ttl)
+	if cc != expected {
+		t.Errorf("Expected Cache-Control: %s on MISS, got: %s", expected, cc)
 	}
-	pragma := resp.Header.Get("Pragma")
-	if pragma != "no-cache" {
+
+	if age := resp.Header.Get("Age"); age != "0" {
+		t.Errorf("Expected Age: 0 on MISS, got: %q", age)
+	}
+
+	if pragma := resp.Header.Get("Pragma"); pragma != "" {
+		t.Errorf("Pragma has no defined meaning in a response and should not be set on a MISS, got: %q", pragma)
+	}
+}
+
+// checkPrivateHeaders validates that a response is locked out of every cache. Used
+// for private bypasses: the WordPress login cookie, the nocache path prefixes
+// (/wp-admin, /wp-json, ...), and anything the origin itself marked no-store.
+func checkPrivateHeaders(t *testing.T, resp *http.Response) {
+	t.Helper()
+
+	cc := resp.Header.Get("Cache-Control")
+	if cc != "private, no-store" {
+		t.Errorf("Expected Cache-Control: private, no-store, got: %s", cc)
+	}
+	if strings.Contains(cc, "public") {
+		t.Errorf("A private response must never be advertised as shareable, got: %s", cc)
+	}
+	if pragma := resp.Header.Get("Pragma"); pragma != "no-cache" {
 		t.Errorf("Expected Pragma: no-cache, got: %s", pragma)
+	}
+}
+
+// checkPolicyBypassHeaders validates that a policy bypass leaves the origin's own
+// cacheability directives alone. Sidekick declining to store a response says nothing
+// about whether the browser or a CDN may.
+func checkPolicyBypassHeaders(t *testing.T, resp *http.Response) {
+	t.Helper()
+
+	cc := resp.Header.Get("Cache-Control")
+	if cc == "private, no-store" || cc == "no-cache, no-store, must-revalidate" {
+		t.Errorf("A policy bypass must not stamp its own no-store directives, got: %s", cc)
+	}
+	if resp.Header.Get("Vary") == "" {
+		t.Error("Vary must be set on every path, including policy bypasses")
 	}
 }
 

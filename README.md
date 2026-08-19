@@ -142,6 +142,11 @@ example.com {
         # Exclude large media files from cache
         nocache_regex "\\.(mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe)$"
         
+        # How downstream cache headers are chosen (see "Downstream Cacheability").
+        # "preserve" (default) picks headers from the reason a request bypassed;
+        # "nostore" restores the legacy blanket no-store on every non-HIT path.
+        bypass_cache_control preserve
+        
         # Paths whose bytes cannot vary by cookie (see "Shared cache safety" below).
         # These are exempt from the WordPress login-cookie bypass and from cookie
         # cache keying, so one shared entry serves logged-in and anonymous visitors.
@@ -548,6 +553,35 @@ have succeeded — the worst case is the behavior you had before collapsing exis
 
 Only range fills are collapsed. Ordinary misses are cheap and keep their existing
 concurrent behavior rather than serializing behind a leader.
+
+## Downstream Cacheability
+
+Sidekick chooses response cache headers from **why** a request skipped the cache, not
+merely that it did. "Sidekick declines to store this" and "nobody may store this" are
+different statements, and treating them the same meant every bypassed response was
+marked `no-store` — telling browsers and CloudFront to discard content they were
+entitled to keep, so the same object was re-fetched from origin forever.
+
+| Situation | Emitted |
+|---|---|
+| HIT / 304 | `public, max-age=<remaining ttl>` + `Age` |
+| MISS | `public, max-age=<ttl>` + `Age: 0` — a MISS is as cacheable as a HIT, it just was not in the cache yet |
+| Bypass: `nocache` prefixes, WordPress login cookie | `private, no-store` |
+| Bypass: `nocache_regex`, `nocache_home`, uncacheable response | origin's own `Cache-Control`, untouched |
+| Bypass: debug query | `no-cache, no-store, must-revalidate` |
+| **Any** cookie-varied request | `private, no-store` — overrides everything above |
+
+The `nocache` prefix list is treated as private because it names application areas
+(`/wp-admin`, `/wp-json`, `/sitepro`) whose responses are user-specific.
+`nocache_regex` is treated as policy because it names file types Sidekick chooses not
+to store — ordinary public content the browser and CDN should still cache.
+
+Responses the origin itself marks `no-store` or `private` are never cached by Sidekick
+and are passed through as `private, no-store`.
+
+Set `bypass_cache_control nostore` to restore the old blanket behavior on every
+non-HIT path. It is an escape hatch, not a recommended setting; cookie-varied
+responses stay private under both values.
 
 ## Shared Cache Safety
 

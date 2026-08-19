@@ -44,6 +44,13 @@ type Sidekick struct {
 	NoCache      []string `json:"nocache,omitempty"`       // Path prefixes to bypass
 	NoCacheRegex string   `json:"nocache_regex,omitempty"` // Regex pattern to bypass
 	NoCacheHome  bool     `json:"nocache_home,omitempty"`  // Whether to skip caching home page
+	// BypassCacheControl selects how downstream cache headers are chosen:
+	//   "preserve" (default) — headers follow the reason a request bypassed, and a
+	//     MISS is advertised as cacheable just like a HIT.
+	//   "nostore" — legacy blanket "no-cache, no-store, must-revalidate" on every
+	//     non-hit path. An escape hatch, not a recommended setting.
+	// Cookie-varied responses are forced private under BOTH values.
+	BypassCacheControl string `json:"bypass_cache_control,omitempty"`
 	// StaticAssetRegex matches paths whose response bytes cannot vary by cookie.
 	// Such paths are exempt from the WordPress login-cookie bypass and from
 	// cookie-based cache keying, so one shared entry serves every visitor.
@@ -269,6 +276,14 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("nocache_home must be true or false")
 				}
 				s.NoCacheHome = b
+
+			case "bypass_cache_control":
+				value = strings.ToLower(strings.TrimSpace(value))
+				if value != bypassCacheControlPreserve && value != bypassCacheControlNoStore {
+					return d.Errf("bypass_cache_control must be %q or %q",
+						bypassCacheControlPreserve, bypassCacheControlNoStore)
+				}
+				s.BypassCacheControl = value
 
 			case "static_asset_regex":
 				value = strings.TrimSpace(value)
@@ -901,6 +916,21 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 		}
 	}
 
+	if s.BypassCacheControl == "" {
+		s.BypassCacheControl = strings.ToLower(strings.TrimSpace(os.Getenv("SIDEKICK_BYPASS_CACHE_CONTROL")))
+	}
+	switch s.BypassCacheControl {
+	case "":
+		s.BypassCacheControl = bypassCacheControlPreserve
+	case bypassCacheControlPreserve, bypassCacheControlNoStore:
+		// valid
+	default:
+		return fmt.Errorf("bypass_cache_control must be %q or %q, got %q",
+			bypassCacheControlPreserve, bypassCacheControlNoStore, s.BypassCacheControl)
+	}
+	s.logger.Debug("Downstream cache header policy configured",
+		zap.String("bypass_cache_control", s.BypassCacheControl))
+
 	// Range fill defaults to enabled; nil here means it was never configured.
 	if s.RangeFill == nil {
 		enabled := true
@@ -1214,7 +1244,6 @@ func (Sidekick) CaddyModule() caddy.ModuleInfo {
 
 // ServeHTTP implements the caddy.Handler interface.
 func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	bypass := false
 	startTime := time.Now()
 	s.logger.Debug("HTTP Version", zap.String("Version", r.Proto))
 
@@ -1233,14 +1262,16 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	}
 
 	// Check bypass conditions
-	bypass = s.shouldBypass(r)
+	reason := s.shouldBypass(r)
 
 	hdr := w.Header()
-	if bypass {
-		hdr.Set(CacheHeaderName, "BYPASS")
-		s.applyDownstreamCacheHeaders(hdr, s.computeKeyDims(r), cacheStateBypass, nil)
+	if reason != bypassNone {
+		// Wrapped so the cache headers are applied AFTER the upstream handler has
+		// written its own — see bypassResponseWriter.
+		bw := newBypassResponseWriter(w, s, s.computeKeyDims(r), bypassState(reason))
 		metrics.RecordCacheOperation("bypass", "true", "default")
-		err := next.ServeHTTP(w, r)
+		err := next.ServeHTTP(bw, r)
+		bw.applyHeaders() // handlers that wrote nothing still get the headers
 		metrics.RecordResponseTime("bypass", "default", time.Since(startTime))
 		return err
 	}
@@ -1404,7 +1435,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 			// range, so it must not be pre-set here, and it reuses the Content-Type
 			// and Etag already staged above rather than sniffing.
 			http.ServeContent(w, r, "", cachedModTime(cacheMeta), bytes.NewReader(dataToServe))
-			metrics.RecordCacheOperation("get", "range_hit", "default")
+			metrics.RecordRangeOperation("hit")
 			metrics.RecordResponseTime("hit", "default", time.Since(startTime))
 			return nil
 		}
@@ -1510,7 +1541,7 @@ func (s *Sidekick) awaitFill(w http.ResponseWriter, r *http.Request, next caddyh
 				hdr.Del("Content-Length")
 
 				http.ServeContent(w, r, "", cachedModTime(cacheMeta), bytes.NewReader(cacheData))
-				metrics.RecordCacheOperation("get", "range_collapsed", "default")
+				metrics.RecordRangeOperation("collapsed")
 				metrics.RecordResponseTime("hit", "default", time.Since(startTime))
 				return nil
 			}
@@ -1529,11 +1560,12 @@ func (s *Sidekick) awaitFill(w http.ResponseWriter, r *http.Request, next caddyh
 	}
 
 	// Degrade open: let the origin answer the original range request directly.
-	hdr := w.Header()
-	hdr.Set(CacheHeaderName, "BYPASS")
-	s.applyDownstreamCacheHeaders(hdr, dims, cacheStateBypass, nil)
-	metrics.RecordCacheOperation("get", "range_collapse_fallback", "default")
-	err := next.ServeHTTP(w, r)
+	// Policy, not private — this is ordinary public content that Sidekick simply is
+	// not serving from cache right now, so the origin's directives should stand.
+	bw := newBypassResponseWriter(w, s, dims, cacheStateBypassPolicy)
+	metrics.RecordRangeOperation("collapse_fallback")
+	err := next.ServeHTTP(bw, r)
+	bw.applyHeaders()
 	metrics.RecordResponseTime("bypass", "default", time.Since(startTime))
 	return err
 }
@@ -1582,7 +1614,7 @@ func (s *Sidekick) serveRangeFill(w http.ResponseWriter, r *http.Request, next c
 	hdr.Del("Content-Length") // ServeContent computes this from the selected range
 
 	http.ServeContent(w, r, "", time.Time{}, reader)
-	metrics.RecordCacheOperation("get", "range_fill", "default")
+	metrics.RecordRangeOperation("fill")
 	metrics.RecordResponseTime("miss", "default", time.Since(startTime))
 	return nil
 }
@@ -1770,29 +1802,41 @@ func (s *Sidekick) handlePurgeRequest(w http.ResponseWriter, r *http.Request, st
 	return nil
 }
 
-func (s *Sidekick) shouldBypass(r *http.Request) bool {
+// shouldBypass reports whether a request skips the cache, and WHY.
+//
+// The reason matters downstream: "Sidekick declines to store this" and "nobody may
+// store this" are different statements, and collapsing them is what made every
+// bypassed response no-store regardless of whether it was actually private.
+func (s *Sidekick) shouldBypass(r *http.Request) bypassReason {
 	// Check debug query parameter
 	if s.bypassDebugQuery != "" && r.URL.Query().Has(s.bypassDebugQuery) {
-		return true
+		return bypassDebug
 	}
 
-	// Check path prefixes
+	// Check path prefixes. These are treated as PRIVATE: the prefix list names
+	// application areas (/wp-admin, /wp-json, /sitepro) whose responses are
+	// user-specific, not merely inconvenient to cache.
 	for _, prefix := range s.NoCache {
 		if prefix != "" && strings.HasPrefix(r.URL.Path, prefix) {
 			s.logger.Debug("sidekick - bypass prefix", zap.String("prefix", prefix))
-			return true
+			return bypassPrivate
 		}
 	}
 
-	// Check regex pattern
+	// Check regex pattern. This is POLICY: the pattern names file types Sidekick
+	// chooses not to store. The bytes are ordinary public content, so the browser
+	// and any CDN should still be allowed to cache them.
 	if s.pathRx != nil && s.pathRx.MatchString(r.URL.Path) {
 		s.logger.Debug("sidekick - bypass regex", zap.String("regex", s.NoCacheRegex))
-		return true
+		return bypassPolicy
 	}
 
-	// Check home page
+	// Check home page. Also policy: an anonymous home page is public content that
+	// Sidekick simply is not storing. A personalized one is still protected, because
+	// a request carrying a configured cookie is forced private by keyDims regardless
+	// of how it bypassed.
 	if s.NoCacheHome && r.URL.Path == "/" {
-		return true
+		return bypassPolicy
 	}
 
 	// Check WordPress login cookie.
@@ -1810,12 +1854,12 @@ func (s *Sidekick) shouldBypass(r *http.Request) bool {
 		cookies := r.Cookies()
 		for _, cookie := range cookies {
 			if strings.HasPrefix(cookie.Name, "wordpress_logged_in") {
-				return true
+				return bypassPrivate
 			}
 		}
 	}
 
-	return false
+	return bypassNone
 }
 
 // getTotalMemory returns the total system memory in bytes
@@ -2142,7 +2186,7 @@ func (s *Sidekick) tryServeStreamed(w http.ResponseWriter, r *http.Request, cach
 	http.ServeContent(w, r, "", cachedModTime(cacheMeta), reader)
 
 	if canRange {
-		metrics.RecordCacheOperation("get", "range_hit", "default")
+		metrics.RecordRangeOperation("hit")
 	}
 	metrics.RecordResponseTime("hit", "default", time.Since(startTime))
 	return true, nil
@@ -2254,15 +2298,54 @@ func (s *Sidekick) shouldReturn304(meta *Metadata, ifNoneMatch, ifModifiedSince 
 	return false
 }
 
+// bypassReason records WHY a request skipped the cache. It exists because
+// "Sidekick declines to store this" and "nobody may store this" are different
+// statements with different correct headers.
+type bypassReason int
+
+const (
+	bypassNone bypassReason = iota
+	// bypassPrivate: the response is specific to a user or session and must not be
+	// stored by ANY cache.
+	bypassPrivate
+	// bypassPolicy: Sidekick chooses not to store it, but it is ordinary public
+	// content. The origin's own cacheability directives are left alone so the
+	// browser and any CDN can still cache it.
+	bypassPolicy
+	// bypassDebug: a diagnostic request, which must not pollute any cache.
+	bypassDebug
+)
+
 // cacheState identifies which path produced a response, for the purpose of
 // choosing downstream cache headers.
 type cacheState int
 
 const (
-	cacheStateBypass cacheState = iota
+	cacheStateBypassPrivate cacheState = iota
+	cacheStateBypassPolicy
+	cacheStateBypassDebug
 	cacheStateMiss
 	cacheStateHit
 	cacheStateNotModified
+)
+
+// bypassState maps a bypass reason onto the cache state used for header selection.
+func bypassState(reason bypassReason) cacheState {
+	switch reason {
+	case bypassPolicy:
+		return cacheStateBypassPolicy
+	case bypassDebug:
+		return cacheStateBypassDebug
+	default:
+		// bypassPrivate, and anything unrecognized, take the safe branch.
+		return cacheStateBypassPrivate
+	}
+}
+
+// Values for the bypass_cache_control option.
+const (
+	bypassCacheControlPreserve = "preserve"
+	bypassCacheControlNoStore  = "nostore"
 )
 
 // applyDownstreamCacheHeaders is the ONLY place in this package that writes
@@ -2305,6 +2388,17 @@ func (s *Sidekick) applyDownstreamCacheHeaders(hdr http.Header, dims keyDims, st
 		return
 	}
 
+	// Legacy escape hatch: restore the old blanket no-store on every non-hit path.
+	// Exists so a bad rollout can be neutralized with a config push rather than a
+	// redeploy; it should not be needed.
+	if s.BypassCacheControl == bypassCacheControlNoStore &&
+		state != cacheStateHit && state != cacheStateNotModified {
+		hdr.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		hdr.Set("Pragma", "no-cache")
+		hdr.Del("Age")
+		return
+	}
+
 	switch state {
 	case cacheStateHit, cacheStateNotModified:
 		if s.CacheTTL <= 0 || cacheMeta == nil || cacheMeta.Timestamp <= 0 {
@@ -2324,13 +2418,35 @@ func (s *Sidekick) applyDownstreamCacheHeaders(hdr http.Header, dims keyDims, st
 		hdr.Set("Cache-Control", fmt.Sprintf("public, max-age=%d", remainingTTL))
 		hdr.Set("Age", fmt.Sprintf("%d", ageSeconds))
 
-	default:
-		// MISS and BYPASS keep the existing conservative behavior. Relaxing this so
-		// that a MISS is as cacheable downstream as a HIT is deliberately a separate
-		// change: it needs the bypass-reason classification (private vs policy) to
-		// avoid marking logged-in responses cacheable.
-		hdr.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	case cacheStateMiss:
+		// A MISS is exactly as cacheable downstream as a HIT — it simply was not in
+		// Sidekick's cache yet. Marking it no-store meant the first viewer's copy
+		// was discarded everywhere, so CloudFront re-fetched the same object from
+		// origin forever. Emitting the same headers a HIT would makes the two
+		// indistinguishable to an intermediary, which is the correct contract.
+		if s.CacheTTL <= 0 {
+			return
+		}
+		hdr.Set("Cache-Control", fmt.Sprintf("public, max-age=%d", s.CacheTTL))
+		hdr.Set("Age", "0")
+
+	case cacheStateBypassPrivate:
+		hdr.Set("Cache-Control", "private, no-store")
+		// Pragma is an HTTP/1.0 REQUEST header with no defined meaning in a
+		// response. Kept only here, where the belt-and-braces is worth the noise.
 		hdr.Set("Pragma", "no-cache")
+		hdr.Del("Age")
+
+	case cacheStateBypassDebug:
+		hdr.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		hdr.Del("Age")
+
+	case cacheStateBypassPolicy:
+		// Deliberately leaves Cache-Control alone. Sidekick declining to store a
+		// response says nothing about whether the browser or a CDN may, so the
+		// origin's own directives stand. Any stale Age from the origin is dropped
+		// because Sidekick did not serve this from its cache.
+		hdr.Del("Age")
 	}
 }
 
