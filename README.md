@@ -167,6 +167,13 @@ example.com {
         cache_disk_max_size 10GB
         cache_disk_max_count 100000
         
+        # Largest body considered for compression before storing (default 1MB).
+        # Use -1 for unlimited. Above this, gzip/brotli cost more CPU and transient
+        # memory than the disk space they save. Bodies whose Content-Type is already
+        # compressed (video, audio, most images, archives, PDF, woff) are skipped
+        # regardless of size.
+        compress_max_size 1MB
+        
         # Cache key customization (defaults shown below if omitted)
         # Note: Set to "" (empty string) to disable, but this is not recommended
         cache_key_queries page sort filter     # Default: p,page,paged,s,category,tag,author

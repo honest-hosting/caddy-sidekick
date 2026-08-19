@@ -44,6 +44,10 @@ type Storage struct {
 	diskMaxCount    int
 	diskCache       atomic.Value // *DiskCache
 
+	// compressMaxSize is the largest body that will be considered for compression
+	// before storing. Bodies above it are stored verbatim. See compressData.
+	compressMaxSize int
+
 	// Mutex for file operations
 	fileMu sync.RWMutex
 	// Per-key mutexes for granular locking
@@ -70,6 +74,7 @@ func NewStorage(loc string, ttl int, memItemMaxSize int, memMaxSize int, memMaxC
 		diskItemMaxSize: diskItemMaxSize,
 		diskMaxSize:     diskMaxSize,
 		diskMaxCount:    diskMaxCount,
+		compressMaxSize: DefaultCompressMaxSize,
 		keyMutexes:      make(map[string]*sync.RWMutex),
 	}
 
@@ -98,6 +103,16 @@ func NewStorage(loc string, ttl int, memItemMaxSize int, memMaxSize int, memMaxC
 	}()
 
 	return s
+}
+
+// SetCompressMaxSize configures the largest body considered for compression before
+// storing. A value of 0 or less disables the size guard (unlimited).
+//
+// This is applied after construction rather than being another NewStorage parameter:
+// that constructor already takes nine positional values and is called from ~40 test
+// sites, so widening it buys churn rather than clarity.
+func (s *Storage) SetCompressMaxSize(n int) {
+	s.compressMaxSize = n
 }
 
 func (s *Storage) GetMemCache() *MemoryCache[string, *MemoryCacheItem] {

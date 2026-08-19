@@ -122,6 +122,17 @@ func NewMetadataWithPath(stateCode int, hdr http.Header, path string) *Metadata 
 	return meta
 }
 
+// HeaderValue returns the stored value for a canonical header name, or "" if the
+// header was not among those retained by SetHeader.
+func (m *Metadata) HeaderValue(name string) string {
+	for _, kv := range m.Header {
+		if len(kv) == 2 && kv[0] == name {
+			return kv[1]
+		}
+	}
+	return ""
+}
+
 func (m *Metadata) SetHeader(hdr http.Header) {
 	for key := range hdr {
 		ok := slices.Contains(hdrResCacheList, key)

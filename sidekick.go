@@ -66,6 +66,7 @@ type Sidekick struct {
 	CacheDiskMaxSize            int64 `json:"cache_disk_max_size,omitempty"`              // Total disk cache size limit
 	CacheDiskMaxPercent         int   `json:"cache_disk_max_percent,omitempty"`           // Disk cache as percent of available space (1-100)
 	CacheDiskMaxCount           int   `json:"cache_disk_max_count,omitempty"`             // Max number of items on disk
+	CompressMaxSize             int64 `json:"compress_max_size,omitempty"`                // Largest body considered for compression before storing
 
 	// Cache key configuration
 	CacheKeyHeaders []string `json:"cache_key_headers,omitempty"`
@@ -325,6 +326,13 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				s.CacheDiskMaxCount = count
 
+			case "compress_max_size":
+				size, err := parseSize(value)
+				if err != nil {
+					return d.Errf("invalid compress_max_size: %v", err)
+				}
+				s.CompressMaxSize = size
+
 			case "cache_memory_stream_to_disk_size":
 				size, err := parseSize(value)
 				if err != nil {
@@ -477,13 +485,17 @@ const (
 	// download-protection plugins gate behind a login check, and exempting them
 	// would let one visitor's gated copy be shared with everyone. Widen this
 	// per-site only when the site has no such plugin.
-	DefaultStaticAssetRegex  = `\.(css|js|mjs|map|jpg|jpeg|png|gif|webp|avif|svg|ico|woff|woff2|ttf|otf|eot)$`
-	DefaultTTL               = 300
-	DefaultDiskItemMaxSize   = 100 * 1024 * 1024                     // 100MB
-	DefaultDiskMaxSize       = 10 * 1024 * 1024 * 1024               // 10GB
-	DefaultDiskMaxCount      = 100000                                // 100K items on disk
-	DefaultStreamToDiskSize  = 10 * 1024 * 1024                      // 10MB
-	DefaultBufferSize        = 32 * 1024                             // 32KB buffer size
+	DefaultStaticAssetRegex = `\.(css|js|mjs|map|jpg|jpeg|png|gif|webp|avif|svg|ico|woff|woff2|ttf|otf|eot)$`
+	DefaultTTL              = 300
+	DefaultDiskItemMaxSize  = 100 * 1024 * 1024       // 100MB
+	DefaultDiskMaxSize      = 10 * 1024 * 1024 * 1024 // 10GB
+	DefaultDiskMaxCount     = 100000                  // 100K items on disk
+	DefaultStreamToDiskSize = 10 * 1024 * 1024        // 10MB
+	DefaultBufferSize       = 32 * 1024               // 32KB buffer size
+	// DefaultCompressMaxSize caps what is considered for compression before storing.
+	// Above this, gzip/brotli cost more CPU and transient memory than the disk space
+	// they save; for already-compressed payloads they save nothing at all.
+	DefaultCompressMaxSize   = 1 * 1024 * 1024                       // 1MB
 	DefaultWPMuPluginEnabled = true                                  // Enable mu-plugin management by default
 	DefaultWPMuPluginDir     = "/var/www/html/wp-content/mu-plugins" // Default mu-plugins directory
 )
@@ -786,6 +798,19 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 			zap.Int64("bytes", s.CacheMemoryStreamToDiskSize))
 	}
 
+	// Compression ceiling. -1 (unlimited) disables the guard and restores the old
+	// behavior of attempting compression on any body.
+	if s.CompressMaxSize == 0 {
+		if envVal := os.Getenv("SIDEKICK_COMPRESS_MAX_SIZE"); envVal != "" {
+			if size, err := parseSize(envVal); err == nil {
+				s.CompressMaxSize = size
+			}
+		}
+		if s.CompressMaxSize == 0 {
+			s.CompressMaxSize = DefaultCompressMaxSize
+		}
+	}
+
 	// Load WP mu-plugin configuration
 	// If not set by Caddyfile (which sets defaults in UnmarshalCaddyfile), set defaults
 	if s.WPMuPluginDir == "" {
@@ -1018,6 +1043,9 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 
 	s.Storage = NewStorage(s.CacheDir, s.CacheTTL, int(s.CacheMemoryItemMaxSize), memMaxSize, memMaxCount,
 		int(s.CacheDiskItemMaxSize), diskMaxSize, diskMaxCount, s.logger)
+	s.Storage.SetCompressMaxSize(int(s.CompressMaxSize))
+	s.logger.Debug("Compression ceiling configured",
+		zap.String("compress_max_size", humanizeBytes(s.CompressMaxSize)))
 
 	// Initialize global metrics collector only if metrics path is configured
 	if s.Metrics != "" {
