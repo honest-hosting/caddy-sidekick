@@ -167,6 +167,15 @@ example.com {
         cache_disk_max_size 10GB
         cache_disk_max_count 100000
         
+        # Range request support (see "Range Requests" below).
+        # On a cache miss carrying a Range header, fetch the full representation to
+        # populate the cache, then serve the requested range from it. Without this,
+        # range-requested URLs (video, audio, large downloads) never become cacheable.
+        range_fill true
+        # Abandon a fill whose body exceeds this and relay the response whole.
+        # Defaults to cache_disk_item_max_size. Use -1 for no limit.
+        range_fill_max_size 100MB
+        
         # Largest body considered for compression before storing (default 1MB).
         # Use -1 for unlimited. Above this, gzip/brotli cost more CPU and transient
         # memory than the disk space they save. Bodies whose Content-Type is already
@@ -469,6 +478,40 @@ The `cache_key_cookies` option supports wildcard patterns using `*` for prefix m
 - `wordpress_logged_in_*` matches any cookie starting with `wordpress_logged_in_`
 - `session_*` matches `session_id`, `session_token`, etc.
 - Exact names (without `*`) only match that specific cookie
+
+## Range Requests
+
+Sidekick stores exactly one representation per cache key: the full `200` response.
+Range requests are answered by reading a window out of that stored representation via
+`http.ServeContent`, which handles range parsing, `If-Range`, single and multipart
+ranges, `Content-Range`, `416` and `Accept-Ranges`.
+
+**A partial response is never stored.** This is a hard invariant, not a preference.
+The cache key does not include `Range`, so a stored `206` would become *the* entry for
+that URL and be served to every subsequent requester as though it were the whole
+object.
+
+Two halves make this work:
+
+- **Range-aware hits.** A `Range` request against a cached, identity-encoded `200` is
+  served as a correct `206` straight from cache. Compressed entries are excluded —
+  byte offsets are meaningless against a compressed representation — and are served
+  whole instead.
+- **Range fill (`range_fill`).** Browsers fetch video almost exclusively via `Range`,
+  including the opening `bytes=0-` probe, so without this a video URL would never
+  produce a cacheable response and would miss forever. On a miss carrying a `Range`,
+  Sidekick re-issues the request upstream with `Range` stripped, captures the full
+  body for the cache, and serves the client's requested range from that capture. Every
+  later range request for the URL is then a plain cache hit.
+
+If a fill turns out not to be a cacheable `200`, or the body outgrows
+`cache_disk_item_max_size` / `range_fill_max_size`, the fill is abandoned and the
+response is streamed to the client in full. The client always receives a complete,
+correct response; only the cache fill is lost.
+
+Note that the first range request for a cold object costs a full read of that object
+from the origin. Against a local `file_server` that is cheap. Set `range_fill false`
+if your origin makes it expensive.
 
 ## Shared Cache Safety
 

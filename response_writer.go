@@ -86,6 +86,16 @@ type ResponseWriter struct {
 	// Sidekick.applyDownstreamCacheHeaders.
 	keyDims keyDims
 
+	// captureOnly suppresses pass-through to the client while still capturing the
+	// body for the cache. Used by the range-fill path, which fetches the full
+	// representation and then serves only the requested range from the capture.
+	captureOnly bool
+
+	// fillAbandoned records that a capture-only fill was given up and the response
+	// was streamed to the client normally instead. The caller must not try to serve
+	// a range afterwards: the client has already received a complete response.
+	fillAbandoned bool
+
 	// Reference to parent
 	sidekick *Sidekick
 }
@@ -230,6 +240,9 @@ func (r *ResponseWriter) WriteHeader(status int) {
 	if bypass {
 		hdr.Set(r.cacheHeaderName, "BYPASS")
 		r.sidekick.applyDownstreamCacheHeaders(hdr, r.keyDims, cacheStateBypass, nil)
+		// Nothing will be cached, so there is no reason to hold the body back.
+		// Abandon the fill before any bytes are written and stream normally.
+		r.abandonCaptureBeforeBody()
 		r.ResponseWriter.WriteHeader(status)
 		return
 	}
@@ -238,7 +251,63 @@ func (r *ResponseWriter) WriteHeader(status int) {
 
 	hdr.Set(r.cacheHeaderName, "MISS")
 	r.sidekick.applyDownstreamCacheHeaders(hdr, r.keyDims, cacheStateMiss, nil)
+
+	// Only a complete 200 can have a range taken out of it. Anything else (206 from
+	// an origin that ignored the stripped Range, 3xx, 404) is served straight through.
+	if r.captureOnly && status != http.StatusOK {
+		r.abandonCaptureBeforeBody()
+	}
+
+	if !r.captureOnly {
+		r.ResponseWriter.WriteHeader(status)
+	}
+}
+
+// abandonCaptureBeforeBody gives up a capture-only fill while no body bytes have been
+// written yet. The caller writes the status line itself immediately afterwards.
+func (r *ResponseWriter) abandonCaptureBeforeBody() {
+	if !r.captureOnly {
+		return
+	}
+	r.captureOnly = false
+	r.fillAbandoned = true
+}
+
+// releaseCapture gives up a capture-only fill after some body has already been
+// buffered. It writes the status line, flushes everything captured so far to the
+// client, and reverts to pass-through for the remainder.
+//
+// This exists so that abandoning a fill mid-stream still produces a complete, correct
+// response. Without it the held-back bytes would simply be dropped and the client
+// would receive a truncated body.
+//
+// Caller must hold bufMu.
+func (r *ResponseWriter) releaseCaptureLocked() error {
+	r.captureOnly = false
+	r.fillAbandoned = true
+
+	status := int(atomic.LoadInt32(&r.status))
+	if status < 0 {
+		status = http.StatusOK
+	}
 	r.ResponseWriter.WriteHeader(status)
+
+	if r.isStreaming && r.tempFile != nil {
+		if _, err := r.tempFile.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("failed to rewind capture while abandoning fill: %w", err)
+		}
+		if _, err := io.Copy(r.ResponseWriter, r.tempFile); err != nil {
+			return fmt.Errorf("failed to flush capture while abandoning fill: %w", err)
+		}
+		return nil
+	}
+
+	if r.buffer.Len() > 0 {
+		if _, err := r.ResponseWriter.Write(r.buffer.Bytes()); err != nil {
+			return fmt.Errorf("failed to flush capture while abandoning fill: %w", err)
+		}
+	}
+	return nil
 }
 
 // Write will write the response body
@@ -248,8 +317,16 @@ func (r *ResponseWriter) Write(b []byte) (int, error) {
 		r.WriteHeader(200)
 	}
 
-	// Always write to the actual response writer first
-	n, err := r.ResponseWriter.Write(b)
+	// Always write to the actual response writer first, unless we are capturing the
+	// body without serving it (range fill), in which case the caller serves the
+	// requested range from the capture once the upstream response is complete.
+	var n int
+	var err error
+	if r.captureOnly {
+		n = len(b)
+	} else {
+		n, err = r.ResponseWriter.Write(b)
+	}
 
 	// save response data for caching
 	if atomic.LoadInt32(&r.needCache) == 1 {
@@ -262,6 +339,19 @@ func (r *ResponseWriter) Write(b []byte) (int, error) {
 		if r.maxCacheableSize == 0 || (r.maxCacheableSize > 0 && newSize > int64(r.maxCacheableSize)) {
 			// Too large to cache on disk or disk caching disabled
 			atomic.StoreInt32(&r.needCache, 0)
+
+			// A capture-only fill must not silently swallow the body it was holding:
+			// flush it and revert to pass-through before discarding the capture.
+			if r.captureOnly {
+				if relErr := r.releaseCaptureLocked(); relErr != nil {
+					r.Error("Failed to release capture", zap.Error(relErr))
+					return n, relErr
+				}
+				if _, wErr := r.ResponseWriter.Write(b); wErr != nil {
+					return n, wErr
+				}
+			}
+
 			if r.tempFile != nil {
 				if err := r.tempFile.Close(); err != nil {
 					r.Error("Failed to close temp file", zap.Error(err))
@@ -272,6 +362,7 @@ func (r *ResponseWriter) Write(b []byte) (int, error) {
 				r.tempFile = nil
 				r.tempFilePath = ""
 			}
+			r.isStreaming = false
 			r.buffer.Reset()
 			r.Debug("Bypass caching because data size exceeds disk limit", zap.Int64("size", newSize), zap.Int("limit", r.maxCacheableSize))
 			return n, err
@@ -302,6 +393,59 @@ func (r *ResponseWriter) Write(b []byte) (int, error) {
 	}
 
 	return n, err
+}
+
+// Status returns the status code the upstream produced, or 0 if it never wrote one.
+func (r *ResponseWriter) Status() int {
+	s := atomic.LoadInt32(&r.status)
+	if s < 0 {
+		return 0
+	}
+	return int(s)
+}
+
+// CapturedReader returns a seekable reader over the captured body along with its
+// length. When the body was spooled to disk the temp file is returned directly — it
+// is already an io.ReadSeeker, so the range is served straight off disk with no
+// additional copy in memory.
+//
+// Only valid in captureOnly mode, after the upstream handler has returned. The
+// returned reader stays owned by the ResponseWriter; Close() cleans it up.
+func (r *ResponseWriter) CapturedReader() (io.ReadSeeker, int64, error) {
+	r.bufMu.Lock()
+	defer r.bufMu.Unlock()
+
+	if r.isStreaming {
+		if r.tempFile == nil {
+			return nil, 0, fmt.Errorf("streaming capture has no temp file")
+		}
+		if _, err := r.tempFile.Seek(0, io.SeekStart); err != nil {
+			return nil, 0, fmt.Errorf("failed to rewind capture: %w", err)
+		}
+		return r.tempFile, r.totalSize, nil
+	}
+
+	return bytes.NewReader(r.buffer.Bytes()), int64(r.buffer.Len()), nil
+}
+
+// ReplayCaptured writes the captured status and body through to the client verbatim.
+// Used when a range fill cannot be completed — a non-200 upstream, or a capture that
+// could not be read back — so the client still receives a correct response.
+func (r *ResponseWriter) ReplayCaptured(w http.ResponseWriter) error {
+	reader, size, err := r.CapturedReader()
+	if err != nil {
+		return err
+	}
+
+	status := r.Status()
+	if status == 0 {
+		status = http.StatusOK
+	}
+
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	w.WriteHeader(status)
+	_, err = io.Copy(w, reader)
+	return err
 }
 
 // switchToStreaming switches from memory buffering to disk streaming

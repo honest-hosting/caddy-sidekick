@@ -67,6 +67,19 @@ type Sidekick struct {
 	CacheDiskMaxPercent         int   `json:"cache_disk_max_percent,omitempty"`           // Disk cache as percent of available space (1-100)
 	CacheDiskMaxCount           int   `json:"cache_disk_max_count,omitempty"`             // Max number of items on disk
 	CompressMaxSize             int64 `json:"compress_max_size,omitempty"`                // Largest body considered for compression before storing
+	// RangeFill controls whether a cache miss carrying a Range header fetches the
+	// full representation to populate the cache. Without it, range-requested URLs
+	// (video, audio, large downloads) never become cacheable at all.
+	//
+	// A pointer because this defaults to ENABLED: a plain bool cannot distinguish
+	// "not configured" from "explicitly disabled" once it round-trips through JSON
+	// with omitempty, so `range_fill false` in a Caddyfile would be silently
+	// re-enabled by the default. Read it via rangeFillEnabled().
+	RangeFill *bool `json:"range_fill,omitempty"`
+	// RangeFillMaxSize abandons a fill whose captured body exceeds this size,
+	// relaying the response verbatim instead. 0 means fall back to
+	// cache_disk_item_max_size; -1 disables the limit.
+	RangeFillMaxSize int64 `json:"range_fill_max_size,omitempty"`
 
 	// Cache key configuration
 	CacheKeyHeaders []string `json:"cache_key_headers,omitempty"`
@@ -332,6 +345,20 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid compress_max_size: %v", err)
 				}
 				s.CompressMaxSize = size
+
+			case "range_fill":
+				b, err := strconv.ParseBool(value)
+				if err != nil {
+					return d.Errf("range_fill must be true or false")
+				}
+				s.RangeFill = &b
+
+			case "range_fill_max_size":
+				size, err := parseSize(value)
+				if err != nil {
+					return d.Errf("invalid range_fill_max_size: %v", err)
+				}
+				s.RangeFillMaxSize = size
 
 			case "cache_memory_stream_to_disk_size":
 				size, err := parseSize(value)
@@ -811,6 +838,33 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 		}
 	}
 
+	// Range fill defaults to enabled; nil here means it was never configured.
+	if s.RangeFill == nil {
+		enabled := true
+		if envVal := os.Getenv("SIDEKICK_RANGE_FILL"); envVal != "" {
+			if b, err := strconv.ParseBool(envVal); err == nil {
+				enabled = b
+			}
+		}
+		s.RangeFill = &enabled
+	}
+
+	// A fill larger than what the cache would ever accept is wasted work, so the
+	// disk item ceiling is the natural default.
+	if s.RangeFillMaxSize == 0 {
+		if envVal := os.Getenv("SIDEKICK_RANGE_FILL_MAX_SIZE"); envVal != "" {
+			if size, err := parseSize(envVal); err == nil {
+				s.RangeFillMaxSize = size
+			}
+		}
+		if s.RangeFillMaxSize == 0 {
+			s.RangeFillMaxSize = s.CacheDiskItemMaxSize
+		}
+	}
+	s.logger.Debug("Range fill configured",
+		zap.Bool("enabled", s.rangeFillEnabled()),
+		zap.String("max_size", humanizeBytes(s.RangeFillMaxSize)))
+
 	// Load WP mu-plugin configuration
 	// If not set by Caddyfile (which sets defaults in UnmarshalCaddyfile), set defaults
 	if s.WPMuPluginDir == "" {
@@ -1134,21 +1188,26 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 
 	if err == nil {
 		// Cache HIT
-		// Check for 304 Not Modified
-		if s.shouldReturn304(cacheMeta, etag, modifiedSince) {
+
+		// Hoisted above the 304 check because canRange depends on it.
+		cachedEncoding := cacheMeta.HeaderValue("Content-Encoding")
+
+		// A Range request can only be satisfied from a full, identity-encoded 200:
+		// byte offsets are meaningless against a compressed or partial representation.
+		canRange := r.Header.Get("Range") != "" &&
+			cacheMeta.StateCode == http.StatusOK &&
+			(cachedEncoding == "" || cachedEncoding == "identity")
+
+		// Check for 304 Not Modified.
+		//
+		// Skipped for range requests: http.ServeContent below implements the full
+		// RFC 9110 §13.2.1 ladder including If-Range, and having two independent
+		// conditional implementations race means the less complete one can win.
+		if !canRange && s.shouldReturn304(cacheMeta, etag, modifiedSince) {
 			s.applyDownstreamCacheHeaders(w.Header(), keyDimensions, cacheStateNotModified, cacheMeta)
 			w.WriteHeader(http.StatusNotModified)
 			metrics.RecordResponseTime("hit", "default", time.Since(startTime))
 			return nil
-		}
-
-		// Check if the cached data already has Content-Encoding
-		var cachedEncoding string
-		for _, kv := range cacheMeta.Header {
-			if len(kv) == 2 && kv[0] == "Content-Encoding" {
-				cachedEncoding = kv[1]
-				break
-			}
 		}
 
 		var selectedEncoding string
@@ -1191,6 +1250,10 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 				s.logger.Debug("Client doesn't accept cached encoding, serving anyway",
 					zap.String("cachedEncoding", cachedEncoding))
 			}
+		} else if canRange {
+			// Serve the identity bytes untouched: the client asked for a byte range,
+			// and those offsets only mean anything against the stored representation.
+			selectedEncoding = ""
 		} else {
 			// Cached data is not compressed, compress based on client preference
 			for _, enc := range requestEncoding {
@@ -1266,6 +1329,18 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		// happened to send when this entry was stored.
 		s.applyDownstreamCacheHeaders(hdr, keyDimensions, cacheStateHit, cacheMeta)
 
+		if canRange {
+			// ServeContent implements the whole partial-content state machine:
+			// range parsing, If-Range, single and multipart ranges, Content-Range,
+			// 416 and Accept-Ranges. It sets Content-Length itself from the selected
+			// range, so it must not be pre-set here, and it reuses the Content-Type
+			// and Etag already staged above rather than sniffing.
+			http.ServeContent(w, r, "", cachedModTime(cacheMeta), bytes.NewReader(dataToServe))
+			metrics.RecordCacheOperation("get", "range_hit", "default")
+			metrics.RecordResponseTime("hit", "default", time.Since(startTime))
+			return nil
+		}
+
 		// Set correct Content-Length for the data we're sending
 		hdr.Set("Content-Length", strconv.Itoa(len(dataToServe)))
 
@@ -1299,12 +1374,14 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	buf.Reset()
 	nw := NewResponseWriter(w, r, storage, s.logger, s, once, cacheKey, buf, keyDimensions)
 	defer func() {
-		// Return buffer to pool
 		metrics.RecordResponseTime("miss", "default", time.Since(startTime))
-		s.bufferPool.Put(buf)
+		// Close() reads the captured body out of buf, so the buffer must not go back
+		// to the pool until after it returns — otherwise another request can check it
+		// out and Reset() it from under us.
 		if err := nw.Close(); err != nil {
 			s.logger.Error("Error closing response writer", zap.Error(err))
 		}
+		s.bufferPool.Put(buf)
 		// Clean up in-flight tracker after some time
 		go func() {
 			s.syncHandler.inFlightMu.Lock()
@@ -1313,7 +1390,65 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		}()
 	}()
 
+	// Range fill: nothing in the request path can cache a partial response, so a
+	// range request on a cold key would bypass forever and the entry would never be
+	// created. Fetch the FULL representation with Range stripped, capture it for the
+	// cache, then serve the client's actual range out of that capture. Every
+	// subsequent range request for this URL is then a plain cache hit.
+	if s.rangeFillEnabled() && r.Header.Get("Range") != "" {
+		return s.serveRangeFill(w, r, next, nw, metrics, startTime)
+	}
+
 	return next.ServeHTTP(nw, r)
+}
+
+// serveRangeFill handles a cache miss for a range request by fetching the whole
+// object once, so the cache is populated and the range is answered from it.
+func (s *Sidekick) serveRangeFill(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler,
+	nw *ResponseWriter, metrics *MetricsCollector, startTime time.Time) error {
+
+	fullReq := r.Clone(r.Context())
+	fullReq.Header.Del("Range")
+	fullReq.Header.Del("If-Range")
+
+	nw.captureOnly = true
+
+	if err := next.ServeHTTP(nw, fullReq); err != nil {
+		return err
+	}
+
+	// The fill was given up mid-flight — not a cacheable 200, or it outgrew the
+	// cacheable size — and the full response has already been streamed to the
+	// client. Nothing left to do; the client got a complete answer, just not a 206.
+	if nw.fillAbandoned {
+		s.logger.Debug("Range fill abandoned, response streamed in full",
+			zap.Int("status", nw.Status()), zap.String("path", r.URL.Path))
+		metrics.RecordResponseTime("miss", "default", time.Since(startTime))
+		return nil
+	}
+
+	reader, size, err := nw.CapturedReader()
+	if err != nil {
+		s.logger.Error("Range fill capture unreadable, replaying verbatim", zap.Error(err))
+		return nw.ReplayCaptured(w)
+	}
+
+	// Oversized objects are relayed whole rather than ranged. maxCacheableSize
+	// normally trips first, so this is the backstop for the case where the two
+	// limits are configured independently.
+	if s.RangeFillMaxSize > 0 && size > s.RangeFillMaxSize {
+		s.logger.Debug("Range fill exceeded range_fill_max_size, replaying verbatim",
+			zap.Int64("size", size), zap.Int64("limit", s.RangeFillMaxSize))
+		return nw.ReplayCaptured(w)
+	}
+
+	hdr := w.Header()
+	hdr.Del("Content-Length") // ServeContent computes this from the selected range
+
+	http.ServeContent(w, r, "", time.Time{}, reader)
+	metrics.RecordCacheOperation("get", "range_fill", "default")
+	metrics.RecordResponseTime("miss", "default", time.Since(startTime))
+	return nil
 }
 
 func (s *Sidekick) handlePurgeRequest(w http.ResponseWriter, r *http.Request, storage *Storage) error {
@@ -1658,6 +1793,13 @@ type keyDims struct {
 	Cookies bool
 }
 
+// rangeFillEnabled reports whether range-fill is active. A nil RangeFill means the
+// module was constructed without Provision (as in unit tests), where the safe answer
+// is off; Provision always resolves it to an explicit value.
+func (s *Sidekick) rangeFillEnabled() bool {
+	return s.RangeFill != nil && *s.RangeFill
+}
+
 // isStaticAsset reports whether a path's response bytes cannot vary by cookie.
 // Such paths are served straight off disk, so one entry can safely be shared by
 // logged-in and anonymous visitors alike.
@@ -1787,26 +1929,84 @@ func (s *Sidekick) buildCacheKey(r *http.Request) (string, keyDims) {
 }
 
 // shouldReturn304 checks if we should return a 304 Not Modified response
+// cachedModTime returns the cached Last-Modified as a time.Time, or the zero time if
+// it is absent or unparseable. A zero modtime tells http.ServeContent to skip the
+// date-based conditional checks while still honoring the ETag ones.
+func cachedModTime(meta *Metadata) time.Time {
+	if meta == nil {
+		return time.Time{}
+	}
+	lm := meta.HeaderValue("Last-Modified")
+	if lm == "" {
+		return time.Time{}
+	}
+	t, err := http.ParseTime(lm)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// etagWeakMatch reports whether a candidate ETag from an If-None-Match list matches
+// the stored validator under RFC 9110 §8.8.3.2 weak comparison, where W/"x" and "x"
+// are considered equal.
+func etagWeakMatch(candidate, stored string) bool {
+	return strings.TrimPrefix(candidate, "W/") == strings.TrimPrefix(stored, "W/")
+}
+
+// shouldReturn304 evaluates the conditional request headers for a cache hit,
+// following the RFC 9110 §13.2.1 precedence for steps 3 and 4:
+//
+//  3. If-None-Match, when present, decides on its own.
+//  4. If-Modified-Since is consulted ONLY when If-None-Match is absent.
+//
+// Range requests do not reach here — http.ServeContent owns conditionals on that
+// path so If-Range is handled by a single, complete implementation.
 func (s *Sidekick) shouldReturn304(meta *Metadata, ifNoneMatch, ifModifiedSince string) bool {
-	// Check ETag
+	if meta == nil {
+		return false
+	}
+
+	// Step 3: If-None-Match takes precedence and is decisive when present.
 	if ifNoneMatch != "" {
-		for _, kv := range meta.Header {
-			if len(kv) == 2 && kv[0] == "Etag" && kv[1] == ifNoneMatch {
+		storedETag := meta.HeaderValue("Etag")
+		if storedETag == "" {
+			return false
+		}
+
+		// "*" matches any existing representation.
+		if strings.TrimSpace(ifNoneMatch) == "*" {
+			return true
+		}
+
+		// The header is a comma-separated list of entity tags.
+		for _, candidate := range strings.Split(ifNoneMatch, ",") {
+			candidate = strings.TrimSpace(candidate)
+			if candidate == "" {
+				continue
+			}
+			if etagWeakMatch(candidate, storedETag) {
 				return true
 			}
 		}
+		return false
 	}
 
-	// Check Last-Modified
+	// Step 4: only reached when If-None-Match is absent.
 	if ifModifiedSince != "" {
-		for _, kv := range meta.Header {
-			if len(kv) == 2 && kv[0] == "Last-Modified" {
-				// Simple string comparison - could be enhanced with proper date parsing
-				if kv[1] == ifModifiedSince {
-					return true
-				}
-			}
+		lastModified := cachedModTime(meta)
+		if lastModified.IsZero() {
+			return false
 		}
+
+		since, err := http.ParseTime(ifModifiedSince)
+		if err != nil {
+			return false
+		}
+
+		// 304 when the representation has not been modified since the client's copy.
+		// Compared at second granularity, which is all HTTP-date carries.
+		return !lastModified.Truncate(time.Second).After(since.Truncate(time.Second))
 	}
 
 	return false
