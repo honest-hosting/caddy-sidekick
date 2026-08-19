@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"sync"
 	"testing"
 	"time"
 
@@ -186,7 +185,7 @@ func TestPurgeHandler(t *testing.T) {
 
 	// Initialize sync handler
 	s.syncHandler = &SyncHandler{
-		inFlight: make(map[string]*sync.Once),
+		inFlight: make(map[string]*inflightFill),
 	}
 
 	// Initialize storage
@@ -517,7 +516,7 @@ func TestPurgePathVariations(t *testing.T) {
 
 	// Initialize sync handler
 	s.syncHandler = &SyncHandler{
-		inFlight: make(map[string]*sync.Once),
+		inFlight: make(map[string]*inflightFill),
 	}
 
 	// Initialize storage
@@ -695,7 +694,7 @@ func TestPurgeBackwardCompatibility(t *testing.T) {
 
 	// Initialize sync handler
 	s.syncHandler = &SyncHandler{
-		inFlight: make(map[string]*sync.Once),
+		inFlight: make(map[string]*inflightFill),
 	}
 
 	// Initialize storage

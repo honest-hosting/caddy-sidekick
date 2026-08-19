@@ -34,6 +34,10 @@ type MetricsCollector struct {
 	// Request metrics - simplified to track HIT/MISS/BYPASS/TOTAL
 	cacheRequests *prometheus.CounterVec
 
+	// Range-specific outcomes. Tracked separately because they happen IN ADDITION
+	// to the underlying hit/miss rather than instead of it.
+	rangeOperations *prometheus.CounterVec
+
 	// Response time histogram
 	responseTime *prometheus.HistogramVec
 
@@ -188,6 +192,17 @@ func (m *MetricsCollector) initMetrics() {
 	m.registry.MustRegister(m.cacheRequests)
 	_ = prometheus.DefaultRegisterer.Register(m.cacheRequests)
 
+	// Range-specific outcomes
+	m.rangeOperations = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "caddy_sidekick_range_operations_total",
+			Help: "Range request outcomes: fills, hits served from a cached representation, and collapsed followers",
+		},
+		[]string{"operation"},
+	)
+	m.registry.MustRegister(m.rangeOperations)
+	_ = prometheus.DefaultRegisterer.Register(m.rangeOperations)
+
 	// Response time
 	m.responseTime = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -213,6 +228,9 @@ func (m *MetricsCollector) initMetrics() {
 		for _, result := range []string{"hit", "miss", "bypass", "total"} {
 			m.cacheRequests.WithLabelValues(result, cacheType).Add(0)
 		}
+	}
+	for _, op := range []string{"hit", "fill", "collapsed", "collapse_fallback"} {
+		m.rangeOperations.WithLabelValues(op).Add(0)
 	}
 }
 
@@ -374,6 +392,28 @@ func (m *MetricsCollector) RecordCacheOperation(operation, status, serverName st
 	case "purge":
 		// Purge operations don't affect request counts
 		return
+	}
+}
+
+// RecordRangeOperation counts range-specific outcomes: a range served from a cached
+// representation ("hit"), a cold range that fetched the full object ("fill"), a
+// follower served behind a leader's fill ("collapsed"), and a follower that gave up
+// waiting and went to the origin ("collapse_fallback").
+//
+// Deliberately separate from RecordCacheOperation. These occur IN ADDITION to the
+// underlying hit/miss, so routing them through that method double-counted
+// totalRequests — and because "range_*" matched no case in its switch, recorded
+// nothing else at all. Without this the new paths were invisible in production.
+func (m *MetricsCollector) RecordRangeOperation(operation string) {
+	if m == nil {
+		return
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.rangeOperations != nil {
+		m.rangeOperations.WithLabelValues(operation).Inc()
 	}
 }
 

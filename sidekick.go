@@ -34,16 +34,27 @@ var (
 )
 
 type Sidekick struct {
-	logger             *zap.Logger
-	CacheDir           string   `json:"cache_dir,omitempty"`
-	PurgePath          string   `json:"purge_path,omitempty"`
-	PurgeURL           string   `json:"purge_url,omitempty"`
-	PurgeHeader        string   `json:"purge_header,omitempty"`
-	PurgeToken         string   `json:"purge_token,omitempty"`
-	Metrics            string   `json:"metrics,omitempty"`       // Admin API path to expose metrics (e.g., "/metrics/sidekick")
-	NoCache            []string `json:"nocache,omitempty"`       // Path prefixes to bypass
-	NoCacheRegex       string   `json:"nocache_regex,omitempty"` // Regex pattern to bypass
-	NoCacheHome        bool     `json:"nocache_home,omitempty"`  // Whether to skip caching home page
+	logger       *zap.Logger
+	CacheDir     string   `json:"cache_dir,omitempty"`
+	PurgePath    string   `json:"purge_path,omitempty"`
+	PurgeURL     string   `json:"purge_url,omitempty"`
+	PurgeHeader  string   `json:"purge_header,omitempty"`
+	PurgeToken   string   `json:"purge_token,omitempty"`
+	Metrics      string   `json:"metrics,omitempty"`       // Admin API path to expose metrics (e.g., "/metrics/sidekick")
+	NoCache      []string `json:"nocache,omitempty"`       // Path prefixes to bypass
+	NoCacheRegex string   `json:"nocache_regex,omitempty"` // Regex pattern to bypass
+	NoCacheHome  bool     `json:"nocache_home,omitempty"`  // Whether to skip caching home page
+	// BypassCacheControl selects how downstream cache headers are chosen:
+	//   "preserve" (default) — headers follow the reason a request bypassed, and a
+	//     MISS is advertised as cacheable just like a HIT.
+	//   "nostore" — legacy blanket "no-cache, no-store, must-revalidate" on every
+	//     non-hit path. An escape hatch, not a recommended setting.
+	// Cookie-varied responses are forced private under BOTH values.
+	BypassCacheControl string `json:"bypass_cache_control,omitempty"`
+	// StaticAssetRegex matches paths whose response bytes cannot vary by cookie.
+	// Such paths are exempt from the WordPress login-cookie bypass and from
+	// cookie-based cache keying, so one shared entry serves every visitor.
+	StaticAssetRegex   string   `json:"static_asset_regex,omitempty"`
 	CacheResponseCodes []string `json:"cache_response_codes,omitempty"`
 	CacheTTL           int      `json:"cache_ttl,omitempty"` // TTL in seconds
 	Storage            *Storage
@@ -62,6 +73,25 @@ type Sidekick struct {
 	CacheDiskMaxSize            int64 `json:"cache_disk_max_size,omitempty"`              // Total disk cache size limit
 	CacheDiskMaxPercent         int   `json:"cache_disk_max_percent,omitempty"`           // Disk cache as percent of available space (1-100)
 	CacheDiskMaxCount           int   `json:"cache_disk_max_count,omitempty"`             // Max number of items on disk
+	CompressMaxSize             int64 `json:"compress_max_size,omitempty"`                // Largest body considered for compression before storing
+	// RangeFill controls whether a cache miss carrying a Range header fetches the
+	// full representation to populate the cache. Without it, range-requested URLs
+	// (video, audio, large downloads) never become cacheable at all.
+	//
+	// A pointer because this defaults to ENABLED: a plain bool cannot distinguish
+	// "not configured" from "explicitly disabled" once it round-trips through JSON
+	// with omitempty, so `range_fill false` in a Caddyfile would be silently
+	// re-enabled by the default. Read it via rangeFillEnabled().
+	RangeFill *bool `json:"range_fill,omitempty"`
+	// RangeFillMaxSize abandons a fill whose captured body exceeds this size,
+	// relaying the response verbatim instead. 0 means fall back to
+	// cache_disk_item_max_size; -1 disables the limit.
+	RangeFillMaxSize int64 `json:"range_fill_max_size,omitempty"`
+	// RangeFillCollapseWait bounds how long a concurrent request will wait for an
+	// in-flight fill of the same key before giving up and going to the origin
+	// itself. Kept short: waiting longer than the origin would have taken makes the
+	// collapse a pessimization.
+	RangeFillCollapseWait caddy.Duration `json:"range_fill_collapse_wait,omitempty"`
 
 	// Cache key configuration
 	CacheKeyHeaders []string `json:"cache_key_headers,omitempty"`
@@ -69,6 +99,7 @@ type Sidekick struct {
 	CacheKeyCookies []string `json:"cache_key_cookies,omitempty"`
 
 	pathRx           *regexp.Regexp
+	staticAssetRx    *regexp.Regexp
 	bypassDebugQuery string // Internal field for debug query bypass
 
 	// Synchronization handler (initialized during Provision)
@@ -83,8 +114,52 @@ type SyncHandler struct {
 	// Mutex for cache operations
 	cacheMu sync.RWMutex
 	// Track in-flight cache operations per key to prevent duplicates
-	inFlight   map[string]*sync.Once
+	inFlight   map[string]*inflightFill
 	inFlightMu sync.Mutex
+}
+
+// inflightFill tracks an upstream fetch that is populating one cache key, so that
+// concurrent requests for the same key can wait for it instead of each performing
+// their own full fetch.
+type inflightFill struct {
+	// once dedupes the cache STORE across everyone sharing this key.
+	once *sync.Once
+	// done is closed when the leader's fetch has completed and its result (if any)
+	// has been stored. Followers wait on this.
+	done chan struct{}
+	// closeOnce guards done against a double close when several requests share the
+	// record and each releases it.
+	closeOnce sync.Once
+}
+
+// acquireFill returns the in-flight record for a key, creating it if absent. The
+// second return value reports whether this caller created it and is therefore the
+// leader responsible for the upstream fetch.
+func (h *SyncHandler) acquireFill(key string) (*inflightFill, bool) {
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+
+	if f, ok := h.inFlight[key]; ok {
+		return f, false
+	}
+
+	f := &inflightFill{once: &sync.Once{}, done: make(chan struct{})}
+	h.inFlight[key] = f
+	return f, true
+}
+
+// releaseFill removes the record and wakes any followers waiting on it.
+//
+// The delete is conditional on the record still being the current one for that key,
+// so a late release from a previous generation cannot evict a newer fill.
+func (h *SyncHandler) releaseFill(key string, f *inflightFill) {
+	h.inFlightMu.Lock()
+	if cur, ok := h.inFlight[key]; ok && cur == f {
+		delete(h.inFlight, key)
+	}
+	h.inFlightMu.Unlock()
+
+	f.closeOnce.Do(func() { close(f.done) })
 }
 
 func init() {
@@ -202,6 +277,24 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				s.NoCacheHome = b
 
+			case "bypass_cache_control":
+				value = strings.ToLower(strings.TrimSpace(value))
+				if value != bypassCacheControlPreserve && value != bypassCacheControlNoStore {
+					return d.Errf("bypass_cache_control must be %q or %q",
+						bypassCacheControlPreserve, bypassCacheControlNoStore)
+				}
+				s.BypassCacheControl = value
+
+			case "static_asset_regex":
+				value = strings.TrimSpace(value)
+				if len(value) != 0 {
+					_, err := regexp.Compile(value)
+					if err != nil {
+						return err
+					}
+				}
+				s.StaticAssetRegex = value
+
 			case "cache_response_codes":
 				codes := strings.Split(value, ",")
 				for d.NextArg() {
@@ -309,6 +402,37 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid cache_disk_max_count: %v", err)
 				}
 				s.CacheDiskMaxCount = count
+
+			case "compress_max_size":
+				size, err := parseSize(value)
+				if err != nil {
+					return d.Errf("invalid compress_max_size: %v", err)
+				}
+				s.CompressMaxSize = size
+
+			case "range_fill":
+				b, err := strconv.ParseBool(value)
+				if err != nil {
+					return d.Errf("range_fill must be true or false")
+				}
+				s.RangeFill = &b
+
+			case "range_fill_max_size":
+				size, err := parseSize(value)
+				if err != nil {
+					return d.Errf("invalid range_fill_max_size: %v", err)
+				}
+				s.RangeFillMaxSize = size
+
+			case "range_fill_collapse_wait":
+				dur, err := caddy.ParseDuration(value)
+				if err != nil {
+					return d.Errf("invalid range_fill_collapse_wait: %v", err)
+				}
+				if dur < 0 {
+					return d.Errf("range_fill_collapse_wait must not be negative")
+				}
+				s.RangeFillCollapseWait = caddy.Duration(dur)
 
 			case "cache_memory_stream_to_disk_size":
 				size, err := parseSize(value)
@@ -455,20 +579,36 @@ const (
 	DefaultPurgeToken          = "dead-beef"
 	CacheHeaderName            = "X-Sidekick-Cache" // Not configurable
 	DefaultNoCacheRegex        = `\.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot|otf|mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe|doc|docx|xls|xlsx|ppt|pptx)$`
-	DefaultTTL                 = 300
-	DefaultDiskItemMaxSize     = 100 * 1024 * 1024                     // 100MB
-	DefaultDiskMaxSize         = 10 * 1024 * 1024 * 1024               // 10GB
-	DefaultDiskMaxCount        = 100000                                // 100K items on disk
-	DefaultStreamToDiskSize    = 10 * 1024 * 1024                      // 10MB
-	DefaultBufferSize          = 32 * 1024                             // 32KB buffer size
-	DefaultWPMuPluginEnabled   = true                                  // Enable mu-plugin management by default
-	DefaultWPMuPluginDir       = "/var/www/html/wp-content/mu-plugins" // Default mu-plugins directory
+	// DefaultStaticAssetRegex is deliberately conservative. It covers the asset
+	// types whose bytes are served straight off disk and cannot vary by cookie,
+	// and it deliberately EXCLUDES pdf/zip/archives/office documents and media
+	// (mp4, mov, webm, mp3): those are the formats membership and
+	// download-protection plugins gate behind a login check, and exempting them
+	// would let one visitor's gated copy be shared with everyone. Widen this
+	// per-site only when the site has no such plugin.
+	DefaultStaticAssetRegex = `\.(css|js|mjs|map|jpg|jpeg|png|gif|webp|avif|svg|ico|woff|woff2|ttf|otf|eot)$`
+	DefaultTTL              = 300
+	DefaultDiskItemMaxSize  = 100 * 1024 * 1024       // 100MB
+	DefaultDiskMaxSize      = 10 * 1024 * 1024 * 1024 // 10GB
+	DefaultDiskMaxCount     = 100000                  // 100K items on disk
+	DefaultStreamToDiskSize = 10 * 1024 * 1024        // 10MB
+	DefaultBufferSize       = 32 * 1024               // 32KB buffer size
+	// DefaultCompressMaxSize caps what is considered for compression before storing.
+	// Above this, gzip/brotli cost more CPU and transient memory than the disk space
+	// they save; for already-compressed payloads they save nothing at all.
+	DefaultCompressMaxSize = 1 * 1024 * 1024 // 1MB
+	// DefaultRangeFillCollapseWait bounds a follower's wait for an in-flight fill.
+	// Short on purpose: a follower that waits longer than the origin would have taken
+	// to answer its range directly has been made slower, not faster.
+	DefaultRangeFillCollapseWait = 2 * time.Second
+	DefaultWPMuPluginEnabled     = true                                  // Enable mu-plugin management by default
+	DefaultWPMuPluginDir         = "/var/www/html/wp-content/mu-plugins" // Default mu-plugins directory
 )
 
 func (s *Sidekick) Provision(ctx caddy.Context) error {
 	s.logger = ctx.Logger(s)
 	s.syncHandler = &SyncHandler{
-		inFlight: make(map[string]*sync.Once),
+		inFlight: make(map[string]*inflightFill),
 	}
 
 	// Validate mutually exclusive options
@@ -548,6 +688,20 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("invalid nocache_regex pattern: %v", err)
 		}
 		s.pathRx = rx
+	}
+
+	if s.StaticAssetRegex == "" {
+		s.StaticAssetRegex = os.Getenv("SIDEKICK_STATIC_ASSET_REGEX")
+		if s.StaticAssetRegex == "" {
+			s.StaticAssetRegex = DefaultStaticAssetRegex
+		}
+	}
+	if s.StaticAssetRegex != "" {
+		rx, err := regexp.Compile(s.StaticAssetRegex)
+		if err != nil {
+			return fmt.Errorf("invalid static_asset_regex pattern: %v", err)
+		}
+		s.staticAssetRx = rx
 	}
 
 	if !s.NoCacheHome {
@@ -748,6 +902,72 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 			zap.String("size", humanizeBytes(s.CacheMemoryStreamToDiskSize)),
 			zap.Int64("bytes", s.CacheMemoryStreamToDiskSize))
 	}
+
+	// Compression ceiling. -1 (unlimited) disables the guard and restores the old
+	// behavior of attempting compression on any body.
+	if s.CompressMaxSize == 0 {
+		if envVal := os.Getenv("SIDEKICK_COMPRESS_MAX_SIZE"); envVal != "" {
+			if size, err := parseSize(envVal); err == nil {
+				s.CompressMaxSize = size
+			}
+		}
+		if s.CompressMaxSize == 0 {
+			s.CompressMaxSize = DefaultCompressMaxSize
+		}
+	}
+
+	if s.BypassCacheControl == "" {
+		s.BypassCacheControl = strings.ToLower(strings.TrimSpace(os.Getenv("SIDEKICK_BYPASS_CACHE_CONTROL")))
+	}
+	switch s.BypassCacheControl {
+	case "":
+		s.BypassCacheControl = bypassCacheControlPreserve
+	case bypassCacheControlPreserve, bypassCacheControlNoStore:
+		// valid
+	default:
+		return fmt.Errorf("bypass_cache_control must be %q or %q, got %q",
+			bypassCacheControlPreserve, bypassCacheControlNoStore, s.BypassCacheControl)
+	}
+	s.logger.Debug("Downstream cache header policy configured",
+		zap.String("bypass_cache_control", s.BypassCacheControl))
+
+	// Range fill defaults to enabled; nil here means it was never configured.
+	if s.RangeFill == nil {
+		enabled := true
+		if envVal := os.Getenv("SIDEKICK_RANGE_FILL"); envVal != "" {
+			if b, err := strconv.ParseBool(envVal); err == nil {
+				enabled = b
+			}
+		}
+		s.RangeFill = &enabled
+	}
+
+	// A fill larger than what the cache would ever accept is wasted work, so the
+	// disk item ceiling is the natural default.
+	if s.RangeFillMaxSize == 0 {
+		if envVal := os.Getenv("SIDEKICK_RANGE_FILL_MAX_SIZE"); envVal != "" {
+			if size, err := parseSize(envVal); err == nil {
+				s.RangeFillMaxSize = size
+			}
+		}
+		if s.RangeFillMaxSize == 0 {
+			s.RangeFillMaxSize = s.CacheDiskItemMaxSize
+		}
+	}
+	if s.RangeFillCollapseWait == 0 {
+		if envVal := os.Getenv("SIDEKICK_RANGE_FILL_COLLAPSE_WAIT"); envVal != "" {
+			if dur, err := caddy.ParseDuration(envVal); err == nil && dur >= 0 {
+				s.RangeFillCollapseWait = caddy.Duration(dur)
+			}
+		}
+		if s.RangeFillCollapseWait == 0 {
+			s.RangeFillCollapseWait = caddy.Duration(DefaultRangeFillCollapseWait)
+		}
+	}
+	s.logger.Debug("Range fill configured",
+		zap.Bool("enabled", s.rangeFillEnabled()),
+		zap.String("max_size", humanizeBytes(s.RangeFillMaxSize)),
+		zap.Duration("collapse_wait", time.Duration(s.RangeFillCollapseWait)))
 
 	// Load WP mu-plugin configuration
 	// If not set by Caddyfile (which sets defaults in UnmarshalCaddyfile), set defaults
@@ -981,6 +1201,9 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 
 	s.Storage = NewStorage(s.CacheDir, s.CacheTTL, int(s.CacheMemoryItemMaxSize), memMaxSize, memMaxCount,
 		int(s.CacheDiskItemMaxSize), diskMaxSize, diskMaxCount, s.logger)
+	s.Storage.SetCompressMaxSize(int(s.CompressMaxSize))
+	s.logger.Debug("Compression ceiling configured",
+		zap.String("compress_max_size", humanizeBytes(s.CompressMaxSize)))
 
 	// Initialize global metrics collector only if metrics path is configured
 	if s.Metrics != "" {
@@ -1021,7 +1244,6 @@ func (Sidekick) CaddyModule() caddy.ModuleInfo {
 
 // ServeHTTP implements the caddy.Handler interface.
 func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	bypass := false
 	startTime := time.Now()
 	s.logger.Debug("HTTP Version", zap.String("Version", r.Proto))
 
@@ -1040,14 +1262,16 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	}
 
 	// Check bypass conditions
-	bypass = s.shouldBypass(r)
+	reason := s.shouldBypass(r)
 
 	hdr := w.Header()
-	if bypass {
-		hdr.Set(CacheHeaderName, "BYPASS")
-		setNoCacheHeaders(hdr)
+	if reason != bypassNone {
+		// Wrapped so the cache headers are applied AFTER the upstream handler has
+		// written its own — see bypassResponseWriter.
+		bw := newBypassResponseWriter(w, s, s.computeKeyDims(r), bypassState(reason))
 		metrics.RecordCacheOperation("bypass", "true", "default")
-		err := next.ServeHTTP(w, r)
+		err := next.ServeHTTP(bw, r)
+		bw.applyHeaders() // handlers that wrote nothing still get the headers
 		metrics.RecordResponseTime("bypass", "default", time.Since(startTime))
 		return err
 	}
@@ -1057,10 +1281,21 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	modifiedSince := r.Header.Get("If-Modified-Since")
 
 	// Build cache key with configurable components
-	cacheKey := s.buildCacheKey(r)
+	cacheKey, keyDimensions := s.buildCacheKey(r)
 
 	// Parse Accept-Encoding header
 	requestEncoding := strings.Split(strings.Join(reqHdr["Accept-Encoding"], ","), ",")
+
+	// Streaming fast path. When the stored bytes can go to the client unchanged,
+	// serve them from an open file instead of reading the whole entry into memory —
+	// otherwise a cached 34MB video costs 34MB of transient heap per viewer. Falls
+	// through to the buffered path below for anything needing a transform.
+	if !clientWantsCompression(requestEncoding) {
+		served, err := s.tryServeStreamed(w, r, cacheKey, keyDimensions, etag, modifiedSince, metrics, startTime)
+		if served {
+			return err
+		}
+	}
 
 	// Try to get from cache with read lock
 	s.syncHandler.cacheMu.RLock()
@@ -1069,21 +1304,26 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 
 	if err == nil {
 		// Cache HIT
-		// Check for 304 Not Modified
-		if s.shouldReturn304(cacheMeta, etag, modifiedSince) {
-			s.setCacheControlHeaders(w.Header(), cacheMeta)
+
+		// Hoisted above the 304 check because canRange depends on it.
+		cachedEncoding := cacheMeta.HeaderValue("Content-Encoding")
+
+		// A Range request can only be satisfied from a full, identity-encoded 200:
+		// byte offsets are meaningless against a compressed or partial representation.
+		canRange := r.Header.Get("Range") != "" &&
+			cacheMeta.StateCode == http.StatusOK &&
+			(cachedEncoding == "" || cachedEncoding == "identity")
+
+		// Check for 304 Not Modified.
+		//
+		// Skipped for range requests: http.ServeContent below implements the full
+		// RFC 9110 §13.2.1 ladder including If-Range, and having two independent
+		// conditional implementations race means the less complete one can win.
+		if !canRange && s.shouldReturn304(cacheMeta, etag, modifiedSince) {
+			s.applyDownstreamCacheHeaders(w.Header(), keyDimensions, cacheStateNotModified, cacheMeta)
 			w.WriteHeader(http.StatusNotModified)
 			metrics.RecordResponseTime("hit", "default", time.Since(startTime))
 			return nil
-		}
-
-		// Check if the cached data already has Content-Encoding
-		var cachedEncoding string
-		for _, kv := range cacheMeta.Header {
-			if len(kv) == 2 && kv[0] == "Content-Encoding" {
-				cachedEncoding = kv[1]
-				break
-			}
 		}
 
 		var selectedEncoding string
@@ -1126,6 +1366,10 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 				s.logger.Debug("Client doesn't accept cached encoding, serving anyway",
 					zap.String("cachedEncoding", cachedEncoding))
 			}
+		} else if canRange {
+			// Serve the identity bytes untouched: the client asked for a byte range,
+			// and those offsets only mean anything against the stored representation.
+			selectedEncoding = ""
 		} else {
 			// Cached data is not compressed, compress based on client preference
 			for _, enc := range requestEncoding {
@@ -1157,10 +1401,9 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		}
 
 	serveResponse:
-		// Serve from cache
+		// Serve from cache. Cache-Control/Age/Vary are applied further down, after
+		// the cached metadata headers, so the chokepoint has the final say.
 		hdr.Set(CacheHeaderName, "HIT")
-		hdr.Set("Vary", "Accept-Encoding")
-		s.setCacheControlHeaders(hdr, cacheMeta)
 		if selectedEncoding != "" {
 			hdr.Set("Content-Encoding", selectedEncoding)
 		}
@@ -1183,17 +1426,18 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 				zap.String("hex", fmt.Sprintf("%x", preview)))
 		}
 
-		// Set headers from cache metadata
-		for _, kv := range cacheMeta.Header {
-			if len(kv) != 2 {
-				continue
-			}
-			// Skip headers we manage directly
-			if kv[0] == "Content-Encoding" || kv[0] == "Content-Length" ||
-				kv[0] == "Cache-Control" || kv[0] == "Age" || kv[0] == "Pragma" {
-				continue
-			}
-			hdr.Set(kv[0], kv[1])
+		s.applyCachedHeaders(hdr, cacheMeta, keyDimensions)
+
+		if canRange {
+			// ServeContent implements the whole partial-content state machine:
+			// range parsing, If-Range, single and multipart ranges, Content-Range,
+			// 416 and Accept-Ranges. It sets Content-Length itself from the selected
+			// range, so it must not be pre-set here, and it reuses the Content-Type
+			// and Etag already staged above rather than sniffing.
+			http.ServeContent(w, r, "", cachedModTime(cacheMeta), bytes.NewReader(dataToServe))
+			metrics.RecordRangeOperation("hit")
+			metrics.RecordResponseTime("hit", "default", time.Since(startTime))
+			return nil
 		}
 
 		// Set correct Content-Length for the data we're sending
@@ -1215,35 +1459,164 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 
 	s.logger.Debug("sidekick - cache miss - "+cacheKey, zap.Error(err))
 
-	// Use sync.Once to prevent duplicate cache operations for the same key
-	s.syncHandler.inFlightMu.Lock()
-	once, exists := s.syncHandler.inFlight[cacheKey]
-	if !exists {
-		once = &sync.Once{}
-		s.syncHandler.inFlight[cacheKey] = once
+	// Register (or join) the in-flight fetch for this key.
+	fill, isLeader := s.syncHandler.acquireFill(cacheKey)
+
+	isRangeFill := s.rangeFillEnabled() && r.Header.Get("Range") != ""
+
+	// Best-effort request collapsing, deliberately scoped to range fills. A range
+	// fill reads the WHOLE object upstream, so N concurrent cold requests for one
+	// video would otherwise mean N full reads and N temp files. Ordinary misses are
+	// cheap and are left alone.
+	if isRangeFill && !isLeader {
+		return s.awaitFill(w, r, next, fill, cacheKey, keyDimensions, metrics, startTime)
 	}
-	s.syncHandler.inFlightMu.Unlock()
 
 	// Create custom writer to capture response
 	buf := s.bufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
-	nw := NewResponseWriter(w, r, storage, s.logger, s, once, cacheKey, buf)
+	nw := NewResponseWriter(w, r, storage, s.logger, s, fill.once, cacheKey, buf, keyDimensions)
 	defer func() {
-		// Return buffer to pool
 		metrics.RecordResponseTime("miss", "default", time.Since(startTime))
-		s.bufferPool.Put(buf)
+		// Close() reads the captured body out of buf, so the buffer must not go back
+		// to the pool until after it returns — otherwise another request can check it
+		// out and Reset() it from under us.
 		if err := nw.Close(); err != nil {
 			s.logger.Error("Error closing response writer", zap.Error(err))
 		}
-		// Clean up in-flight tracker after some time
-		go func() {
-			s.syncHandler.inFlightMu.Lock()
-			delete(s.syncHandler.inFlight, cacheKey)
-			s.syncHandler.inFlightMu.Unlock()
-		}()
+		s.bufferPool.Put(buf)
+		// Release only after the store has completed, so a follower woken by this
+		// finds the entry actually present. The previous implementation deleted the
+		// record immediately in a goroutine, which made it useless for coordination.
+		s.syncHandler.releaseFill(cacheKey, fill)
 	}()
 
+	// Range fill: nothing in the request path can cache a partial response, so a
+	// range request on a cold key would bypass forever and the entry would never be
+	// created. Fetch the FULL representation with Range stripped, capture it for the
+	// cache, then serve the client's actual range out of that capture. Every
+	// subsequent range request for this URL is then a plain cache hit.
+	if s.rangeFillEnabled() && r.Header.Get("Range") != "" {
+		return s.serveRangeFill(w, r, next, nw, metrics, startTime)
+	}
+
 	return next.ServeHTTP(nw, r)
+}
+
+// awaitFill is the follower side of request collapsing. It waits, briefly, for the
+// leader's fill to land and then serves the range from cache.
+//
+// It is best-effort by construction and degrades open: on timeout, on client
+// disconnect, or if the leader produced nothing cacheable, the request falls through
+// to a plain pass-through of the ORIGINAL range request. The origin answers it
+// directly, which is correct and cheap. A follower therefore never blocks
+// indefinitely and never fails a request that would otherwise have succeeded — the
+// worst case is exactly the behavior we had before collapsing existed.
+func (s *Sidekick) awaitFill(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler,
+	fill *inflightFill, cacheKey string, dims keyDims,
+	metrics *MetricsCollector, startTime time.Time) error {
+
+	wait := time.Duration(s.RangeFillCollapseWait)
+	if wait <= 0 {
+		wait = DefaultRangeFillCollapseWait
+	}
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-fill.done:
+		s.syncHandler.cacheMu.RLock()
+		cacheData, cacheMeta, err := s.Storage.Get(cacheKey)
+		s.syncHandler.cacheMu.RUnlock()
+
+		// Serve the range from what the leader stored, subject to the same
+		// preconditions as an ordinary range hit.
+		if err == nil && cacheMeta != nil && cacheMeta.StateCode == http.StatusOK {
+			enc := cacheMeta.HeaderValue("Content-Encoding")
+			if enc == "" || enc == "identity" {
+				hdr := w.Header()
+				hdr.Set(CacheHeaderName, "HIT")
+				s.applyCachedHeaders(hdr, cacheMeta, dims)
+				hdr.Del("Content-Length")
+
+				http.ServeContent(w, r, "", cachedModTime(cacheMeta), bytes.NewReader(cacheData))
+				metrics.RecordRangeOperation("collapsed")
+				metrics.RecordResponseTime("hit", "default", time.Since(startTime))
+				return nil
+			}
+		}
+
+		s.logger.Debug("Collapsed range follower found no usable entry, passing through",
+			zap.String("path", r.URL.Path), zap.Error(err))
+
+	case <-r.Context().Done():
+		// Client went away; nothing useful left to do.
+		return r.Context().Err()
+
+	case <-timer.C:
+		s.logger.Debug("Collapsed range follower timed out, passing through",
+			zap.String("path", r.URL.Path), zap.Duration("waited", wait))
+	}
+
+	// Degrade open: let the origin answer the original range request directly.
+	// Policy, not private — this is ordinary public content that Sidekick simply is
+	// not serving from cache right now, so the origin's directives should stand.
+	bw := newBypassResponseWriter(w, s, dims, cacheStateBypassPolicy)
+	metrics.RecordRangeOperation("collapse_fallback")
+	err := next.ServeHTTP(bw, r)
+	bw.applyHeaders()
+	metrics.RecordResponseTime("bypass", "default", time.Since(startTime))
+	return err
+}
+
+// serveRangeFill handles a cache miss for a range request by fetching the whole
+// object once, so the cache is populated and the range is answered from it.
+func (s *Sidekick) serveRangeFill(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler,
+	nw *ResponseWriter, metrics *MetricsCollector, startTime time.Time) error {
+
+	fullReq := r.Clone(r.Context())
+	fullReq.Header.Del("Range")
+	fullReq.Header.Del("If-Range")
+
+	nw.captureOnly = true
+
+	if err := next.ServeHTTP(nw, fullReq); err != nil {
+		return err
+	}
+
+	// The fill was given up mid-flight — not a cacheable 200, or it outgrew the
+	// cacheable size — and the full response has already been streamed to the
+	// client. Nothing left to do; the client got a complete answer, just not a 206.
+	if nw.fillAbandoned {
+		s.logger.Debug("Range fill abandoned, response streamed in full",
+			zap.Int("status", nw.Status()), zap.String("path", r.URL.Path))
+		metrics.RecordResponseTime("miss", "default", time.Since(startTime))
+		return nil
+	}
+
+	reader, size, err := nw.CapturedReader()
+	if err != nil {
+		s.logger.Error("Range fill capture unreadable, replaying verbatim", zap.Error(err))
+		return nw.ReplayCaptured(w)
+	}
+
+	// Oversized objects are relayed whole rather than ranged. maxCacheableSize
+	// normally trips first, so this is the backstop for the case where the two
+	// limits are configured independently.
+	if s.RangeFillMaxSize > 0 && size > s.RangeFillMaxSize {
+		s.logger.Debug("Range fill exceeded range_fill_max_size, replaying verbatim",
+			zap.Int64("size", size), zap.Int64("limit", s.RangeFillMaxSize))
+		return nw.ReplayCaptured(w)
+	}
+
+	hdr := w.Header()
+	hdr.Del("Content-Length") // ServeContent computes this from the selected range
+
+	http.ServeContent(w, r, "", time.Time{}, reader)
+	metrics.RecordRangeOperation("fill")
+	metrics.RecordResponseTime("miss", "default", time.Since(startTime))
+	return nil
 }
 
 func (s *Sidekick) handlePurgeRequest(w http.ResponseWriter, r *http.Request, storage *Storage) error {
@@ -1429,40 +1802,64 @@ func (s *Sidekick) handlePurgeRequest(w http.ResponseWriter, r *http.Request, st
 	return nil
 }
 
-func (s *Sidekick) shouldBypass(r *http.Request) bool {
+// shouldBypass reports whether a request skips the cache, and WHY.
+//
+// The reason matters downstream: "Sidekick declines to store this" and "nobody may
+// store this" are different statements, and collapsing them is what made every
+// bypassed response no-store regardless of whether it was actually private.
+func (s *Sidekick) shouldBypass(r *http.Request) bypassReason {
 	// Check debug query parameter
 	if s.bypassDebugQuery != "" && r.URL.Query().Has(s.bypassDebugQuery) {
-		return true
+		return bypassDebug
 	}
 
-	// Check path prefixes
+	// Check path prefixes. These are treated as PRIVATE: the prefix list names
+	// application areas (/wp-admin, /wp-json, /sitepro) whose responses are
+	// user-specific, not merely inconvenient to cache.
 	for _, prefix := range s.NoCache {
 		if prefix != "" && strings.HasPrefix(r.URL.Path, prefix) {
 			s.logger.Debug("sidekick - bypass prefix", zap.String("prefix", prefix))
-			return true
+			return bypassPrivate
 		}
 	}
 
-	// Check regex pattern
+	// Check regex pattern. This is POLICY: the pattern names file types Sidekick
+	// chooses not to store. The bytes are ordinary public content, so the browser
+	// and any CDN should still be allowed to cache them.
 	if s.pathRx != nil && s.pathRx.MatchString(r.URL.Path) {
 		s.logger.Debug("sidekick - bypass regex", zap.String("regex", s.NoCacheRegex))
-		return true
+		return bypassPolicy
 	}
 
-	// Check home page
+	// Check home page. Also policy: an anonymous home page is public content that
+	// Sidekick simply is not storing. A personalized one is still protected, because
+	// a request carrying a configured cookie is forced private by keyDims regardless
+	// of how it bypassed.
 	if s.NoCacheHome && r.URL.Path == "/" {
-		return true
+		return bypassPolicy
 	}
 
-	// Check WordPress login cookie
-	cookies := r.Cookies()
-	for _, cookie := range cookies {
-		if strings.HasPrefix(cookie.Name, "wordpress_logged_in") {
-			return true
+	// Check WordPress login cookie.
+	//
+	// Static assets are exempt. WordPress scopes wordpress_logged_in_<hash> to "/"
+	// (wp-includes/pluggable.php, COOKIEPATH), so a logged-in visitor sends it with
+	// EVERY request — including stylesheets, scripts, fonts and images. Without this
+	// exemption those requests all bypass the cache and hit the origin, even though
+	// their bytes are identical to what an anonymous visitor receives.
+	//
+	// This is evaluated last on purpose: the nocache prefixes, nocache_regex and
+	// nocache_home checks above all take precedence, so an explicitly excluded path
+	// stays excluded even if it looks like a static asset.
+	if !s.isStaticAsset(r.URL.Path) {
+		cookies := r.Cookies()
+		for _, cookie := range cookies {
+			if strings.HasPrefix(cookie.Name, "wordpress_logged_in") {
+				return bypassPrivate
+			}
 		}
 	}
 
-	return false
+	return bypassNone
 }
 
 // getTotalMemory returns the total system memory in bytes
@@ -1559,8 +1956,86 @@ func humanizeBytes(bytes int64) string {
 	return fmt.Sprintf("%.1f%s", float64(bytes)/float64(div), units[exp+1])
 }
 
-// buildCacheKey builds a cache key based on configured components
-func (s *Sidekick) buildCacheKey(r *http.Request) string {
+// keyDims records which request dimensions were folded into the cache key for a
+// given request. It exists so that the code deciding what varies the key and the
+// code deciding whether the response may be stored by a SHARED cache (CloudFront,
+// a corporate proxy, anything downstream) are driven by the same value and cannot
+// drift apart.
+//
+// The invariant: if Cookies is true, the response is specific to whoever sent that
+// cookie and must never be advertised as shareable. See applyDownstreamCacheHeaders.
+type keyDims struct {
+	// Headers lists the configured cache_key_headers actually present on the request.
+	Headers []string
+	// Cookies reports whether any cache_key_cookies pattern matched a cookie on
+	// the request, meaning the cache key — and therefore the response — is
+	// specific to that cookie value.
+	Cookies bool
+}
+
+// rangeFillEnabled reports whether range-fill is active. A nil RangeFill means the
+// module was constructed without Provision (as in unit tests), where the safe answer
+// is off; Provision always resolves it to an explicit value.
+func (s *Sidekick) rangeFillEnabled() bool {
+	return s.RangeFill != nil && *s.RangeFill
+}
+
+// isStaticAsset reports whether a path's response bytes cannot vary by cookie.
+// Such paths are served straight off disk, so one entry can safely be shared by
+// logged-in and anonymous visitors alike.
+func (s *Sidekick) isStaticAsset(path string) bool {
+	return s.staticAssetRx != nil && s.staticAssetRx.MatchString(path)
+}
+
+// computeKeyDims determines which request dimensions vary the cache key. It is the
+// single source of truth for that question: buildCacheKey uses it to build the key,
+// and applyDownstreamCacheHeaders uses it to decide shareability.
+func (s *Sidekick) computeKeyDims(r *http.Request) keyDims {
+	var dims keyDims
+
+	for _, hdr := range s.CacheKeyHeaders {
+		// Host is part of the key unconditionally and is already implied by the
+		// request URL, so it never belongs in Vary.
+		if strings.EqualFold(hdr, "Host") {
+			continue
+		}
+		if r.Header.Get(hdr) != "" {
+			dims.Headers = append(dims.Headers, hdr)
+		}
+	}
+
+	// Static assets are exempt from cookie keying: their bytes are identical for
+	// every visitor, so varying on a session cookie would fragment the cache into
+	// per-session copies of the same file and force each copy to be marked private.
+	if s.isStaticAsset(r.URL.Path) {
+		return dims
+	}
+
+	for _, cookiePattern := range s.CacheKeyCookies {
+		if strings.Contains(cookiePattern, "*") {
+			prefix := strings.TrimSuffix(cookiePattern, "*")
+			for _, cookie := range r.Cookies() {
+				if strings.HasPrefix(cookie.Name, prefix) {
+					dims.Cookies = true
+					break
+				}
+			}
+		} else if _, err := r.Cookie(cookiePattern); err == nil {
+			dims.Cookies = true
+		}
+		if dims.Cookies {
+			break
+		}
+	}
+
+	return dims
+}
+
+// buildCacheKey builds a cache key based on configured components. It also returns
+// the dimensions that varied the key, which the caller MUST pass to
+// applyDownstreamCacheHeaders so a cookie-varied response is never marked shareable.
+func (s *Sidekick) buildCacheKey(r *http.Request) (string, keyDims) {
+	dims := s.computeKeyDims(r)
 	h := md5.New()
 
 	// Always include hostname to prevent cross-domain cache pollution.
@@ -1607,79 +2082,372 @@ func (s *Sidekick) buildCacheKey(r *http.Request) string {
 		}
 	}
 
-	// Include configured cookies (with wildcard support)
-	for _, cookiePattern := range s.CacheKeyCookies {
-		// Check if pattern contains wildcard
-		if strings.Contains(cookiePattern, "*") {
-			// Convert wildcard to prefix matching
-			prefix := strings.TrimSuffix(cookiePattern, "*")
-			for _, cookie := range r.Cookies() {
-				if strings.HasPrefix(cookie.Name, prefix) {
-					h.Write([]byte(cookie.Name + "=" + cookie.Value))
+	// Include configured cookies (with wildcard support). Skipped entirely for
+	// static assets — see computeKeyDims — so those keys are cookie-free and the
+	// resulting entry can be shared by every visitor.
+	if dims.Cookies {
+		for _, cookiePattern := range s.CacheKeyCookies {
+			// Check if pattern contains wildcard
+			if strings.Contains(cookiePattern, "*") {
+				// Convert wildcard to prefix matching
+				prefix := strings.TrimSuffix(cookiePattern, "*")
+				for _, cookie := range r.Cookies() {
+					if strings.HasPrefix(cookie.Name, prefix) {
+						h.Write([]byte(cookie.Name + "=" + cookie.Value))
+					}
 				}
-			}
-		} else {
-			// Exact match
-			if cookie, err := r.Cookie(cookiePattern); err == nil {
-				h.Write([]byte(cookiePattern + "=" + cookie.Value))
+			} else {
+				// Exact match
+				if cookie, err := r.Cookie(cookiePattern); err == nil {
+					h.Write([]byte(cookiePattern + "=" + cookie.Value))
+				}
 			}
 		}
 	}
 
-	return fmt.Sprintf("%x", h.Sum(nil))
+	return fmt.Sprintf("%x", h.Sum(nil)), dims
 }
 
 // shouldReturn304 checks if we should return a 304 Not Modified response
+// clientWantsCompression reports whether the buffered HIT path would compress an
+// identity-encoded entry on the fly for this client.
+//
+// It mirrors the negotiation loop in ServeHTTP, including its first-match-wins
+// semantics, and exists so the caller can decide whether the stored bytes may be
+// streamed straight through before touching the body at all.
+func clientWantsCompression(requestEncodings []string) bool {
+	for _, enc := range requestEncodings {
+		enc = strings.TrimSpace(enc)
+		if idx := strings.Index(enc, ";"); idx != -1 {
+			enc = enc[:idx]
+		}
+		switch enc {
+		case "br", "gzip", "zstd":
+			return true
+		case "identity", "*":
+			return false
+		}
+	}
+	return false
+}
+
+// tryServeStreamed serves a cache hit directly from storage without materializing the
+// body. It reports whether it handled the request; false means the caller should fall
+// through to the buffered path.
+//
+// Deliberately narrow: only a full, identity-encoded 200 is served this way. Cached
+// redirects and error statuses need their own status code written, and compressed
+// entries keep the existing whole-body handling so that Range never applies to
+// encoded bytes.
+func (s *Sidekick) tryServeStreamed(w http.ResponseWriter, r *http.Request, cacheKey string,
+	dims keyDims, etag, modifiedSince string,
+	metrics *MetricsCollector, startTime time.Time) (bool, error) {
+
+	s.syncHandler.cacheMu.RLock()
+	reader, cacheMeta, size, err := s.Storage.GetReader(cacheKey)
+	s.syncHandler.cacheMu.RUnlock()
+
+	if err != nil {
+		// Miss, expired, or compressed on disk — the buffered path deals with it.
+		return false, nil
+	}
+
+	enc := cacheMeta.HeaderValue("Content-Encoding")
+	if cacheMeta.StateCode != http.StatusOK || (enc != "" && enc != "identity") {
+		_ = reader.Close()
+		return false, nil
+	}
+
+	defer func() {
+		if cerr := reader.Close(); cerr != nil {
+			s.logger.Debug("Failed to close streamed cache reader", zap.Error(cerr))
+		}
+	}()
+
+	canRange := r.Header.Get("Range") != ""
+
+	// Conditional handling matches the buffered path: ServeContent owns it for range
+	// requests, the local implementation handles everything else.
+	if !canRange && s.shouldReturn304(cacheMeta, etag, modifiedSince) {
+		s.applyDownstreamCacheHeaders(w.Header(), dims, cacheStateNotModified, cacheMeta)
+		w.WriteHeader(http.StatusNotModified)
+		metrics.RecordResponseTime("hit", "default", time.Since(startTime))
+		return true, nil
+	}
+
+	s.logger.Debug("Serving cached response from storage without buffering",
+		zap.String("path", r.URL.Path), zap.Int64("size", size), zap.Bool("range", canRange))
+
+	hdr := w.Header()
+	hdr.Set(CacheHeaderName, "HIT")
+	s.applyCachedHeaders(hdr, cacheMeta, dims)
+	hdr.Del("Content-Length") // ServeContent derives it from what it actually sends
+
+	http.ServeContent(w, r, "", cachedModTime(cacheMeta), reader)
+
+	if canRange {
+		metrics.RecordRangeOperation("hit")
+	}
+	metrics.RecordResponseTime("hit", "default", time.Since(startTime))
+	return true, nil
+}
+
+// applyCachedHeaders restores the stored response headers onto hdr and then applies
+// the downstream cache-header chokepoint.
+//
+// The chokepoint runs LAST so that Cache-Control, Age, Pragma and Vary always come
+// from the shareability decision rather than from whatever the origin happened to
+// send when the entry was stored.
+func (s *Sidekick) applyCachedHeaders(hdr http.Header, cacheMeta *Metadata, dims keyDims) {
+	for _, kv := range cacheMeta.Header {
+		if len(kv) != 2 {
+			continue
+		}
+		// Skip headers we manage directly
+		if kv[0] == "Content-Encoding" || kv[0] == "Content-Length" ||
+			kv[0] == "Cache-Control" || kv[0] == "Age" || kv[0] == "Pragma" ||
+			kv[0] == "Vary" {
+			continue
+		}
+		hdr.Set(kv[0], kv[1])
+	}
+
+	s.applyDownstreamCacheHeaders(hdr, dims, cacheStateHit, cacheMeta)
+}
+
+// cachedModTime returns the cached Last-Modified as a time.Time, or the zero time if
+// it is absent or unparseable. A zero modtime tells http.ServeContent to skip the
+// date-based conditional checks while still honoring the ETag ones.
+func cachedModTime(meta *Metadata) time.Time {
+	if meta == nil {
+		return time.Time{}
+	}
+	lm := meta.HeaderValue("Last-Modified")
+	if lm == "" {
+		return time.Time{}
+	}
+	t, err := http.ParseTime(lm)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// etagWeakMatch reports whether a candidate ETag from an If-None-Match list matches
+// the stored validator under RFC 9110 §8.8.3.2 weak comparison, where W/"x" and "x"
+// are considered equal.
+func etagWeakMatch(candidate, stored string) bool {
+	return strings.TrimPrefix(candidate, "W/") == strings.TrimPrefix(stored, "W/")
+}
+
+// shouldReturn304 evaluates the conditional request headers for a cache hit,
+// following the RFC 9110 §13.2.1 precedence for steps 3 and 4:
+//
+//  3. If-None-Match, when present, decides on its own.
+//  4. If-Modified-Since is consulted ONLY when If-None-Match is absent.
+//
+// Range requests do not reach here — http.ServeContent owns conditionals on that
+// path so If-Range is handled by a single, complete implementation.
 func (s *Sidekick) shouldReturn304(meta *Metadata, ifNoneMatch, ifModifiedSince string) bool {
-	// Check ETag
+	if meta == nil {
+		return false
+	}
+
+	// Step 3: If-None-Match takes precedence and is decisive when present.
 	if ifNoneMatch != "" {
-		for _, kv := range meta.Header {
-			if len(kv) == 2 && kv[0] == "Etag" && kv[1] == ifNoneMatch {
+		storedETag := meta.HeaderValue("Etag")
+		if storedETag == "" {
+			return false
+		}
+
+		// "*" matches any existing representation.
+		if strings.TrimSpace(ifNoneMatch) == "*" {
+			return true
+		}
+
+		// The header is a comma-separated list of entity tags.
+		for _, candidate := range strings.Split(ifNoneMatch, ",") {
+			candidate = strings.TrimSpace(candidate)
+			if candidate == "" {
+				continue
+			}
+			if etagWeakMatch(candidate, storedETag) {
 				return true
 			}
 		}
+		return false
 	}
 
-	// Check Last-Modified
+	// Step 4: only reached when If-None-Match is absent.
 	if ifModifiedSince != "" {
-		for _, kv := range meta.Header {
-			if len(kv) == 2 && kv[0] == "Last-Modified" {
-				// Simple string comparison - could be enhanced with proper date parsing
-				if kv[1] == ifModifiedSince {
-					return true
-				}
-			}
+		lastModified := cachedModTime(meta)
+		if lastModified.IsZero() {
+			return false
 		}
+
+		since, err := http.ParseTime(ifModifiedSince)
+		if err != nil {
+			return false
+		}
+
+		// 304 when the representation has not been modified since the client's copy.
+		// Compared at second granularity, which is all HTTP-date carries.
+		return !lastModified.Truncate(time.Second).After(since.Truncate(time.Second))
 	}
 
 	return false
 }
 
-// setCacheControlHeaders sets Cache-Control and Age headers for HIT/304 responses
-// based on the TTL configuration and the cache entry's age.
-func (s *Sidekick) setCacheControlHeaders(hdr http.Header, cacheMeta *Metadata) {
-	if s.CacheTTL <= 0 || cacheMeta == nil || cacheMeta.Timestamp <= 0 {
+// bypassReason records WHY a request skipped the cache. It exists because
+// "Sidekick declines to store this" and "nobody may store this" are different
+// statements with different correct headers.
+type bypassReason int
+
+const (
+	bypassNone bypassReason = iota
+	// bypassPrivate: the response is specific to a user or session and must not be
+	// stored by ANY cache.
+	bypassPrivate
+	// bypassPolicy: Sidekick chooses not to store it, but it is ordinary public
+	// content. The origin's own cacheability directives are left alone so the
+	// browser and any CDN can still cache it.
+	bypassPolicy
+	// bypassDebug: a diagnostic request, which must not pollute any cache.
+	bypassDebug
+)
+
+// cacheState identifies which path produced a response, for the purpose of
+// choosing downstream cache headers.
+type cacheState int
+
+const (
+	cacheStateBypassPrivate cacheState = iota
+	cacheStateBypassPolicy
+	cacheStateBypassDebug
+	cacheStateMiss
+	cacheStateHit
+	cacheStateNotModified
+)
+
+// bypassState maps a bypass reason onto the cache state used for header selection.
+func bypassState(reason bypassReason) cacheState {
+	switch reason {
+	case bypassPolicy:
+		return cacheStateBypassPolicy
+	case bypassDebug:
+		return cacheStateBypassDebug
+	default:
+		// bypassPrivate, and anything unrecognized, take the safe branch.
+		return cacheStateBypassPrivate
+	}
+}
+
+// Values for the bypass_cache_control option.
+const (
+	bypassCacheControlPreserve = "preserve"
+	bypassCacheControlNoStore  = "nostore"
+)
+
+// applyDownstreamCacheHeaders is the ONLY place in this package that writes
+// Cache-Control, Pragma, Age or Vary on a response. Every serving path routes
+// through it so that the shareability decision is made once, from the same keyDims
+// value that varied the cache key.
+//
+// The safety rule it enforces: a response whose cache key was varied by a cookie is
+// specific to that visitor's session and must never be stored by a shared cache. It
+// is emitted as "private, no-store" with Cookie in Vary. Sidekick's own cache still
+// segments such entries correctly by key — the restriction is about what CloudFront,
+// proxies and other intermediaries are permitted to do with the response.
+//
+// Callers MUST pass the keyDims returned by buildCacheKey (or computeKeyDims on
+// paths that never build a key). Passing a zero keyDims for a request that did carry
+// a matching cookie would reintroduce the leak this function exists to prevent.
+func (s *Sidekick) applyDownstreamCacheHeaders(hdr http.Header, dims keyDims, state cacheState, cacheMeta *Metadata) {
+	// Vary must be consistent across HIT, MISS and BYPASS for the same URL, or a
+	// shared cache can store one variant and serve it for another. It lists every
+	// request dimension that varies the cache key.
+	vary := make([]string, 0, len(dims.Headers)+2)
+	vary = append(vary, "Accept-Encoding")
+	for _, h := range dims.Headers {
+		if !strings.EqualFold(h, "Accept-Encoding") {
+			vary = append(vary, h)
+		}
+	}
+	if dims.Cookies {
+		vary = append(vary, "Cookie")
+	}
+	hdr.Set("Vary", strings.Join(vary, ", "))
+
+	// A cookie-varied response is private to one session, whatever produced it.
+	// Vary: Cookie above is defense in depth for intermediaries that honor Vary but
+	// mishandle private; this header is the actual guarantee.
+	if dims.Cookies {
+		hdr.Set("Cache-Control", "private, no-store")
+		hdr.Set("Pragma", "no-cache")
+		hdr.Del("Age")
 		return
 	}
 
-	ageSeconds := time.Now().Unix() - cacheMeta.Timestamp
-	if ageSeconds < 0 {
-		ageSeconds = 0
+	// Legacy escape hatch: restore the old blanket no-store on every non-hit path.
+	// Exists so a bad rollout can be neutralized with a config push rather than a
+	// redeploy; it should not be needed.
+	if s.BypassCacheControl == bypassCacheControlNoStore &&
+		state != cacheStateHit && state != cacheStateNotModified {
+		hdr.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		hdr.Set("Pragma", "no-cache")
+		hdr.Del("Age")
+		return
 	}
 
-	remainingTTL := int64(s.CacheTTL) - ageSeconds
-	if remainingTTL < 0 {
-		remainingTTL = 0
+	switch state {
+	case cacheStateHit, cacheStateNotModified:
+		if s.CacheTTL <= 0 || cacheMeta == nil || cacheMeta.Timestamp <= 0 {
+			return
+		}
+
+		ageSeconds := time.Now().Unix() - cacheMeta.Timestamp
+		if ageSeconds < 0 {
+			ageSeconds = 0
+		}
+
+		remainingTTL := int64(s.CacheTTL) - ageSeconds
+		if remainingTTL < 0 {
+			remainingTTL = 0
+		}
+
+		hdr.Set("Cache-Control", fmt.Sprintf("public, max-age=%d", remainingTTL))
+		hdr.Set("Age", fmt.Sprintf("%d", ageSeconds))
+
+	case cacheStateMiss:
+		// A MISS is exactly as cacheable downstream as a HIT — it simply was not in
+		// Sidekick's cache yet. Marking it no-store meant the first viewer's copy
+		// was discarded everywhere, so CloudFront re-fetched the same object from
+		// origin forever. Emitting the same headers a HIT would makes the two
+		// indistinguishable to an intermediary, which is the correct contract.
+		if s.CacheTTL <= 0 {
+			return
+		}
+		hdr.Set("Cache-Control", fmt.Sprintf("public, max-age=%d", s.CacheTTL))
+		hdr.Set("Age", "0")
+
+	case cacheStateBypassPrivate:
+		hdr.Set("Cache-Control", "private, no-store")
+		// Pragma is an HTTP/1.0 REQUEST header with no defined meaning in a
+		// response. Kept only here, where the belt-and-braces is worth the noise.
+		hdr.Set("Pragma", "no-cache")
+		hdr.Del("Age")
+
+	case cacheStateBypassDebug:
+		hdr.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		hdr.Del("Age")
+
+	case cacheStateBypassPolicy:
+		// Deliberately leaves Cache-Control alone. Sidekick declining to store a
+		// response says nothing about whether the browser or a CDN may, so the
+		// origin's own directives stand. Any stale Age from the origin is dropped
+		// because Sidekick did not serve this from its cache.
+		hdr.Del("Age")
 	}
-
-	hdr.Set("Cache-Control", fmt.Sprintf("public, max-age=%d", remainingTTL))
-	hdr.Set("Age", fmt.Sprintf("%d", ageSeconds))
-}
-
-// setNoCacheHeaders sets headers to prevent upstream caching for MISS/BYPASS responses.
-func setNoCacheHeaders(hdr http.Header) {
-	hdr.Set("Cache-Control", "no-cache, no-store, must-revalidate")
-	hdr.Set("Pragma", "no-cache")
 }
 
 // Cleanup implements caddy.CleanerUpper

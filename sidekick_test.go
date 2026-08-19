@@ -245,8 +245,8 @@ func TestBuildCacheKey_WildcardCookies(t *testing.T) {
 				req2.AddCookie(cookie)
 			}
 
-			key1 := s.buildCacheKey(req1)
-			key2 := s.buildCacheKey(req2)
+			key1, _ := s.buildCacheKey(req1)
+			key2, _ := s.buildCacheKey(req2)
 
 			if tc.expectDifferent {
 				assert.NotEqual(t, key1, key2, "Cache keys should be different")
@@ -288,7 +288,7 @@ func TestBuildCacheKey_WildcardCookies(t *testing.T) {
 						req3.AddCookie(modifiedCookie)
 					}
 
-					key3 := s.buildCacheKey(req3)
+					key3, _ := s.buildCacheKey(req3)
 					// Keys should be different when cookie values change
 					assert.NotEqual(t, key1, key3, "Cache keys should differ when cookie values change")
 				}
@@ -311,8 +311,8 @@ func TestBuildCacheKey_WildcardCookieValues(t *testing.T) {
 	req2 := httptest.NewRequest("GET", "/test", nil)
 	req2.AddCookie(&http.Cookie{Name: "test_cookie", Value: "value2"})
 
-	key1 := s.buildCacheKey(req1)
-	key2 := s.buildCacheKey(req2)
+	key1, _ := s.buildCacheKey(req1)
+	key2, _ := s.buildCacheKey(req2)
 
 	// Keys should be different for different cookie values
 	assert.NotEqual(t, key1, key2, "Different cookie values should produce different cache keys")
@@ -336,9 +336,9 @@ func TestBuildCacheKey_HostIsolation(t *testing.T) {
 	req2 := httptest.NewRequest("GET", "https://other.com/", nil)
 	req3 := httptest.NewRequest("GET", "https://example.com/", nil)
 
-	key1 := s.buildCacheKey(req1)
-	key2 := s.buildCacheKey(req2)
-	key3 := s.buildCacheKey(req3)
+	key1, _ := s.buildCacheKey(req1)
+	key2, _ := s.buildCacheKey(req2)
+	key3, _ := s.buildCacheKey(req3)
 
 	assert.NotEqual(t, key1, key2, "Different hostnames should produce different cache keys")
 	assert.Equal(t, key1, key3, "Same hostname and path should produce the same cache key")
@@ -355,8 +355,8 @@ func TestBuildCacheKey_HostHeader(t *testing.T) {
 	req1 := httptest.NewRequest("GET", "https://example.com/test", nil)
 	req2 := httptest.NewRequest("GET", "https://other.com/test", nil)
 
-	key1 := s.buildCacheKey(req1)
-	key2 := s.buildCacheKey(req2)
+	key1, _ := s.buildCacheKey(req1)
+	key2, _ := s.buildCacheKey(req2)
 
 	assert.NotEqual(t, key1, key2, "cache_key_headers with Host should differentiate domains")
 }
@@ -421,9 +421,14 @@ func TestShouldBypass_PrefixMatching(t *testing.T) {
 			}
 
 			req := httptest.NewRequest("GET", tc.requestPath, nil)
-			bypass := s.shouldBypass(req)
+			reason := s.shouldBypass(req)
 
-			assert.Equal(t, tc.shouldBypass, bypass, "Bypass result mismatch for path %s", tc.requestPath)
+			assert.Equal(t, tc.shouldBypass, reason != bypassNone,
+				"Bypass result mismatch for path %s", tc.requestPath)
+			if tc.shouldBypass {
+				assert.Equal(t, bypassPrivate, reason,
+					"nocache prefixes name private application areas, so they bypass as private")
+			}
 		})
 	}
 }
@@ -504,7 +509,7 @@ func TestSetCacheControlHeaders(t *testing.T) {
 			}
 
 			hdr := http.Header{}
-			s.setCacheControlHeaders(hdr, meta)
+			s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateHit, meta)
 
 			if tc.expectCC == "" {
 				assert.Empty(t, hdr.Get("Cache-Control"), "Cache-Control should not be set")
@@ -520,16 +525,74 @@ func TestSetCacheControlHeaders(t *testing.T) {
 func TestSetCacheControlHeaders_NilMetadata(t *testing.T) {
 	s := &Sidekick{CacheTTL: 300}
 	hdr := http.Header{}
-	s.setCacheControlHeaders(hdr, nil)
+	s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateHit, nil)
 	assert.Empty(t, hdr.Get("Cache-Control"), "should not set Cache-Control with nil metadata")
 	assert.Empty(t, hdr.Get("Age"), "should not set Age with nil metadata")
 }
 
-func TestSetNoCacheHeaders(t *testing.T) {
+// TestDownstreamCacheHeadersByState replaces the old TestSetNoCacheHeaders, which
+// asserted the blanket "no-store on everything that is not a HIT" behavior. That was
+// the bug: it told browsers and CloudFront to discard responses they were entitled to
+// keep, so the same object was re-fetched from origin forever.
+func TestDownstreamCacheHeadersByState(t *testing.T) {
+	s := &Sidekick{CacheTTL: 300, BypassCacheControl: bypassCacheControlPreserve}
+
+	t.Run("miss is as cacheable as a hit", func(t *testing.T) {
+		hdr := http.Header{}
+		s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateMiss, nil)
+		assert.Equal(t, "public, max-age=300", hdr.Get("Cache-Control"))
+		assert.Equal(t, "0", hdr.Get("Age"))
+		assert.Empty(t, hdr.Get("Pragma"), "Pragma is meaningless in a response")
+	})
+
+	t.Run("private bypass is locked down", func(t *testing.T) {
+		hdr := http.Header{}
+		s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateBypassPrivate, nil)
+		assert.Equal(t, "private, no-store", hdr.Get("Cache-Control"))
+		assert.Equal(t, "no-cache", hdr.Get("Pragma"))
+		assert.Empty(t, hdr.Get("Age"))
+	})
+
+	t.Run("policy bypass leaves the origin alone", func(t *testing.T) {
+		hdr := http.Header{}
+		hdr.Set("Cache-Control", "public, max-age=31536000, immutable")
+		s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateBypassPolicy, nil)
+		assert.Equal(t, "public, max-age=31536000, immutable", hdr.Get("Cache-Control"),
+			"declining to store a response says nothing about whether others may")
+	})
+
+	t.Run("policy bypass adds nothing when the origin said nothing", func(t *testing.T) {
+		hdr := http.Header{}
+		s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateBypassPolicy, nil)
+		assert.Empty(t, hdr.Get("Cache-Control"))
+	})
+
+	t.Run("debug bypass never caches", func(t *testing.T) {
+		hdr := http.Header{}
+		hdr.Set("Cache-Control", "public, max-age=600")
+		s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateBypassDebug, nil)
+		assert.Equal(t, "no-cache, no-store, must-revalidate", hdr.Get("Cache-Control"))
+	})
+}
+
+// TestBypassCacheControlLegacyMode covers the escape hatch: the old blanket behavior
+// must be restorable with a config push rather than a redeploy.
+func TestBypassCacheControlLegacyMode(t *testing.T) {
+	s := &Sidekick{CacheTTL: 300, BypassCacheControl: bypassCacheControlNoStore}
+
+	for _, state := range []cacheState{
+		cacheStateMiss, cacheStateBypassPrivate, cacheStateBypassPolicy, cacheStateBypassDebug,
+	} {
+		hdr := http.Header{}
+		hdr.Set("Cache-Control", "public, max-age=600")
+		s.applyDownstreamCacheHeaders(hdr, keyDims{}, state, nil)
+		assert.Equal(t, "no-cache, no-store, must-revalidate", hdr.Get("Cache-Control"))
+	}
+
+	// A HIT is still cacheable — the escape hatch covers non-hit paths only.
 	hdr := http.Header{}
-	setNoCacheHeaders(hdr)
-	assert.Equal(t, "no-cache, no-store, must-revalidate", hdr.Get("Cache-Control"))
-	assert.Equal(t, "no-cache", hdr.Get("Pragma"))
+	s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateHit, &Metadata{Timestamp: time.Now().Unix()})
+	assert.Contains(t, hdr.Get("Cache-Control"), "public")
 }
 
 func TestCacheControlHeaders_NotOverwrittenByMetadata(t *testing.T) {
@@ -552,20 +615,22 @@ func TestCacheControlHeaders_NotOverwrittenByMetadata(t *testing.T) {
 
 	hdr := http.Header{}
 
-	// Set computed cache-control headers (as done in HIT path)
-	s.setCacheControlHeaders(hdr, meta)
-
-	// Simulate the metadata restoration loop with the skip logic
+	// Simulate the metadata restoration loop with the skip logic, then apply the
+	// chokepoint — this is the order the HIT path uses, so the computed values win
+	// over anything the origin stored.
 	for _, kv := range meta.Header {
 		if len(kv) != 2 {
 			continue
 		}
 		if kv[0] == "Content-Encoding" || kv[0] == "Content-Length" ||
-			kv[0] == "Cache-Control" || kv[0] == "Age" || kv[0] == "Pragma" {
+			kv[0] == "Cache-Control" || kv[0] == "Age" || kv[0] == "Pragma" ||
+			kv[0] == "Vary" {
 			continue
 		}
 		hdr.Set(kv[0], kv[1])
 	}
+
+	s.applyDownstreamCacheHeaders(hdr, keyDims{}, cacheStateHit, meta)
 
 	// Verify our computed values survived
 	assert.Equal(t, "public, max-age=240", hdr.Get("Cache-Control"),

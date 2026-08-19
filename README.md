@@ -142,6 +142,17 @@ example.com {
         # Exclude large media files from cache
         nocache_regex "\\.(mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe)$"
         
+        # How downstream cache headers are chosen (see "Downstream Cacheability").
+        # "preserve" (default) picks headers from the reason a request bypassed;
+        # "nostore" restores the legacy blanket no-store on every non-HIT path.
+        bypass_cache_control preserve
+        
+        # Paths whose bytes cannot vary by cookie (see "Shared cache safety" below).
+        # These are exempt from the WordPress login-cookie bypass and from cookie
+        # cache keying, so one shared entry serves logged-in and anonymous visitors.
+        # Default shown; widen only if the site has no download-gating plugin.
+        static_asset_regex "\\.(css|js|mjs|map|jpg|jpeg|png|gif|webp|avif|svg|ico|woff|woff2|ttf|otf|eot)$"
+        
         # Purge endpoint configuration (required when cache is enabled)
         purge_path /__sidekick/purge
         purge_header X-Sidekick-Purge
@@ -160,6 +171,25 @@ example.com {
         cache_disk_item_max_size 100MB
         cache_disk_max_size 10GB
         cache_disk_max_count 100000
+        
+        # Range request support (see "Range Requests" below).
+        # On a cache miss carrying a Range header, fetch the full representation to
+        # populate the cache, then serve the requested range from it. Without this,
+        # range-requested URLs (video, audio, large downloads) never become cacheable.
+        range_fill true
+        # Abandon a fill whose body exceeds this and relay the response whole.
+        # Defaults to cache_disk_item_max_size. Use -1 for no limit.
+        range_fill_max_size 100MB
+        # How long a concurrent request waits for an in-flight fill of the same
+        # object before going to the origin itself (default 2s).
+        range_fill_collapse_wait 2s
+        
+        # Largest body considered for compression before storing (default 1MB).
+        # Use -1 for unlimited. Above this, gzip/brotli cost more CPU and transient
+        # memory than the disk space they save. Bodies whose Content-Type is already
+        # compressed (video, audio, most images, archives, PDF, woff) are skipped
+        # regardless of size.
+        compress_max_size 1MB
         
         # Cache key customization (defaults shown below if omitted)
         # Note: Set to "" (empty string) to disable, but this is not recommended
@@ -456,6 +486,142 @@ The `cache_key_cookies` option supports wildcard patterns using `*` for prefix m
 - `wordpress_logged_in_*` matches any cookie starting with `wordpress_logged_in_`
 - `session_*` matches `session_id`, `session_token`, etc.
 - Exact names (without `*`) only match that specific cookie
+
+## Range Requests
+
+Sidekick stores exactly one representation per cache key: the full `200` response.
+Range requests are answered by reading a window out of that stored representation via
+`http.ServeContent`, which handles range parsing, `If-Range`, single and multipart
+ranges, `Content-Range`, `416` and `Accept-Ranges`.
+
+**A partial response is never stored.** This is a hard invariant, not a preference.
+The cache key does not include `Range`, so a stored `206` would become *the* entry for
+that URL and be served to every subsequent requester as though it were the whole
+object.
+
+Two halves make this work:
+
+- **Range-aware hits.** A `Range` request against a cached, identity-encoded `200` is
+  served as a correct `206` straight from cache. Compressed entries are excluded —
+  byte offsets are meaningless against a compressed representation — and are served
+  whole instead.
+- **Range fill (`range_fill`).** Browsers fetch video almost exclusively via `Range`,
+  including the opening `bytes=0-` probe, so without this a video URL would never
+  produce a cacheable response and would miss forever. On a miss carrying a `Range`,
+  Sidekick re-issues the request upstream with `Range` stripped, captures the full
+  body for the cache, and serves the client's requested range from that capture. Every
+  later range request for the URL is then a plain cache hit.
+
+If a fill turns out not to be a cacheable `200`, or the body outgrows
+`cache_disk_item_max_size` / `range_fill_max_size`, the fill is abandoned and the
+response is streamed to the client in full. The client always receives a complete,
+correct response; only the cache fill is lost.
+
+Note that the first range request for a cold object costs a full read of that object
+from the origin. Against a local `file_server` that is cheap. Set `range_fill false`
+if your origin makes it expensive.
+
+### Streaming From Disk
+
+When the stored bytes can go to the client unchanged, Sidekick serves them from an
+open file rather than reading the entry into memory first. A cached 34MB video is
+therefore never fully resident in RAM, no matter how many viewers are streaming it —
+which is what makes `cache_memory_stream_to_disk_size` describe real behavior on both
+the write and the read side.
+
+The buffered path is still used when the body has to be transformed: an
+identity-encoded entry being compressed on the fly for a client that asked for gzip or
+brotli, or an entry that was compressed on disk and must be decompressed. Cached
+redirects and error statuses also take the buffered path, since they need their own
+status code rather than the `200`/`206` that streaming produces.
+
+Nothing about this is configurable — it is chosen automatically per request based on
+whether a transform is needed.
+
+### Request Collapsing
+
+A range fill reads the whole object, so several viewers seeking into the same cold
+video at once would otherwise mean several full reads. The first request for a key
+becomes the leader and performs the fill; concurrent range requests for that key wait
+up to `range_fill_collapse_wait` and are then served from the resulting cache entry.
+
+Collapsing is best-effort and degrades open. If the wait expires, the client
+disconnects, or the leader produced nothing cacheable, the follower falls through to a
+plain pass-through of its original range request, which the origin answers directly.
+A follower never blocks indefinitely and never fails a request that would otherwise
+have succeeded — the worst case is the behavior you had before collapsing existed.
+
+Only range fills are collapsed. Ordinary misses are cheap and keep their existing
+concurrent behavior rather than serializing behind a leader.
+
+## Downstream Cacheability
+
+Sidekick chooses response cache headers from **why** a request skipped the cache, not
+merely that it did. "Sidekick declines to store this" and "nobody may store this" are
+different statements, and treating them the same meant every bypassed response was
+marked `no-store` — telling browsers and CloudFront to discard content they were
+entitled to keep, so the same object was re-fetched from origin forever.
+
+| Situation | Emitted |
+|---|---|
+| HIT / 304 | `public, max-age=<remaining ttl>` + `Age` |
+| MISS | `public, max-age=<ttl>` + `Age: 0` — a MISS is as cacheable as a HIT, it just was not in the cache yet |
+| Bypass: `nocache` prefixes, WordPress login cookie | `private, no-store` |
+| Bypass: `nocache_regex`, `nocache_home`, uncacheable response | origin's own `Cache-Control`, untouched |
+| Bypass: debug query | `no-cache, no-store, must-revalidate` |
+| **Any** cookie-varied request | `private, no-store` — overrides everything above |
+
+The `nocache` prefix list is treated as private because it names application areas
+(`/wp-admin`, `/wp-json`, `/sitepro`) whose responses are user-specific.
+`nocache_regex` is treated as policy because it names file types Sidekick chooses not
+to store — ordinary public content the browser and CDN should still cache.
+
+Responses the origin itself marks `no-store` or `private` are never cached by Sidekick
+and are passed through as `private, no-store`.
+
+Set `bypass_cache_control nostore` to restore the old blanket behavior on every
+non-HIT path. It is an escape hatch, not a recommended setting; cookie-varied
+responses stay private under both values.
+
+## Shared Cache Safety
+
+When a request carries a cookie matching `cache_key_cookies`, the cache key — and
+therefore the response — is specific to that visitor's session. Sidekick emits such
+responses as:
+
+```
+Cache-Control: private, no-store
+Vary: Accept-Encoding, Cookie
+```
+
+This keeps them out of CloudFront, corporate proxies and any other shared cache, while
+Sidekick's own cache still segments them correctly by key. Anonymous responses are
+unaffected and remain `public`, so CDN hit rate for ordinary traffic is unchanged.
+
+All downstream cache headers (`Cache-Control`, `Pragma`, `Age`, `Vary`) are written in
+exactly one place, `applyDownstreamCacheHeaders`, from the same value that varied the
+cache key. A unit test walks the package AST and fails the build if any other function
+writes them, so adding a cookie to `cache_key_cookies` cannot silently make a
+session-specific response shareable.
+
+### Static Asset Exemption
+
+WordPress scopes `wordpress_logged_in_<hash>` to `/`, so a logged-in visitor sends it
+with **every** request — including stylesheets, scripts, fonts and images. Without an
+exemption those all bypass the cache and hit the origin, even though their bytes are
+identical to what an anonymous visitor receives.
+
+Paths matching `static_asset_regex` are therefore exempt from both the login-cookie
+bypass and cookie cache keying, so a single shared entry serves everyone.
+
+The default pattern is deliberately conservative. It **excludes** `pdf`, `zip`,
+archives, office documents and media (`mp4`, `mov`, `webm`, `mp3`), because those are
+the formats membership and download-protection plugins gate behind a login check —
+exempting them could share one visitor's gated copy with everyone. Widen the pattern
+for a site only when you know it has no such plugin.
+
+The `nocache` prefixes, `nocache_regex` and `nocache_home` are all evaluated **before**
+this exemption, so an explicitly excluded path stays excluded even if it looks static.
 
 ## NoCache Path Matching
 

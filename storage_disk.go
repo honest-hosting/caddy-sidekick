@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,9 +16,12 @@ import (
 // DiskCacheItem represents an item stored in disk cache
 type DiskCacheItem struct {
 	*Metadata
-	Path       string    // File path on disk
-	Size       int64     // Size in bytes
-	AccessTime time.Time // Last access time
+	Path string // File path on disk
+	Size int64  // Size in bytes
+	// AccessTime is when the entry was added to (or loaded into) the index. It is
+	// not refreshed on read — see DiskCache.Get. Eviction recency is tracked by the
+	// LRU list, not by this field.
+	AccessTime time.Time
 	ModTime    time.Time // Last modification time
 }
 
@@ -67,9 +71,11 @@ func (dc *DiskCache) Get(key string) (*DiskCacheItem, error) {
 		return nil, ErrCacheNotFound
 	}
 
-	// Update access time
-	(*item).AccessTime = time.Now()
-
+	// Deliberately does NOT stamp AccessTime here. Storage.Get holds only a read
+	// lock, so concurrent readers of the same key would all write that field at
+	// once — a data race, and one the race detector flags under concurrent range
+	// requests. Nothing reads AccessTime: recency for eviction comes from the LRU
+	// list, which lru.Get above has already updated under its own lock.
 	return *item, nil
 }
 
@@ -363,7 +369,7 @@ func (s *Storage) storeDataToDisk(cacheDir, dataFilePath string, data []byte, md
 	}
 
 	// Compress data if beneficial
-	compressedData, compressionType := s.compressData(data)
+	compressedData, compressionType := s.compressData(data, md)
 
 	// Update metadata with compression info
 	if compressionType != "" {
@@ -403,16 +409,9 @@ func (s *Storage) readDiskCacheData(key string, cacheDir string) ([]byte, *Metad
 	}
 
 	// Check TTL
-	if s.ttl > 0 && md.Timestamp > 0 {
-		if time.Since(time.Unix(md.Timestamp, 0)) > time.Duration(s.ttl)*time.Second {
-			// Cache expired, clean it up asynchronously
-			s.asyncOps.Add(1)
-			go func() {
-				defer s.asyncOps.Done()
-				_ = s.Purge(key)
-			}()
-			return nil, nil, ErrCacheExpired
-		}
+	if s.isExpired(md.Timestamp) {
+		s.purgeAsync(key)
+		return nil, nil, ErrCacheExpired
 	}
 
 	// Read data file
@@ -434,14 +433,7 @@ func (s *Storage) readDiskCacheData(key string, cacheDir string) ([]byte, *Metad
 	}
 
 	// Decompress if needed
-	var compressionType string
-	for _, header := range md.Header {
-		if len(header) >= 2 && header[0] == "X-Compression-Type" {
-			compressionType = header[1]
-			break
-		}
-	}
-
+	compressionType := md.HeaderValue("X-Compression-Type")
 	if compressionType != "" && compressionType != "none" {
 		switch compressionType {
 		case "gzip":
@@ -460,8 +452,75 @@ func (s *Storage) readDiskCacheData(key string, cacheDir string) ([]byte, *Metad
 	return data, md, nil
 }
 
-// compressData compresses data using gzip or brotli if it reduces size
-func (s *Storage) compressData(data []byte) ([]byte, string) {
+// incompressibleContentTypes lists media types whose payload is already compressed,
+// so running gzip or brotli over them only burns CPU to produce a larger result.
+var incompressibleContentTypes = map[string]bool{
+	"application/zip":              true,
+	"application/gzip":             true,
+	"application/x-gzip":           true,
+	"application/x-bzip2":          true,
+	"application/x-xz":             true,
+	"application/zstd":             true,
+	"application/x-7z-compressed":  true,
+	"application/x-rar-compressed": true,
+	"application/pdf":              true,
+	"font/woff":                    true,
+	"font/woff2":                   true,
+	"application/font-woff":        true,
+}
+
+// compressibleImageTypes are the image types that are NOT already compressed and do
+// benefit from compression, carved out of the blanket "image/" rule below.
+var compressibleImageTypes = map[string]bool{
+	"image/svg+xml":            true,
+	"image/bmp":                true,
+	"image/x-ms-bmp":           true,
+	"image/x-icon":             true,
+	"image/vnd.microsoft.icon": true,
+}
+
+// isIncompressibleContentType reports whether a media type's payload is already
+// compressed. video/*, audio/* and image/* are compressed formats as a rule, with a
+// small carve-out for the text-based and raw ones.
+func isIncompressibleContentType(contentType string) bool {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	if idx := strings.Index(ct, ";"); idx != -1 {
+		ct = strings.TrimSpace(ct[:idx])
+	}
+	if ct == "" {
+		return false
+	}
+
+	if strings.HasPrefix(ct, "video/") || strings.HasPrefix(ct, "audio/") {
+		return true
+	}
+	if strings.HasPrefix(ct, "image/") {
+		return !compressibleImageTypes[ct]
+	}
+
+	return incompressibleContentTypes[ct]
+}
+
+// compressionBaseline returns the size a subsequent compressor must beat to be worth
+// selecting: gzip's output when gzip succeeded, otherwise the original size.
+//
+// Guarding on gzipErr matters. When CompressGzip returns an error, gzipData is nil and
+// len(gzipData) is 0, so comparing a candidate against it directly is unsatisfiable —
+// no compressor could ever be selected on that path.
+func compressionBaseline(dataSize int, gzipData []byte, gzipErr error) int {
+	if gzipErr == nil && len(gzipData) > 0 {
+		return len(gzipData)
+	}
+	return dataSize
+}
+
+// compressData compresses data using gzip or brotli if it reduces size.
+//
+// Compression is skipped entirely for bodies that cannot benefit. Without those
+// guards a large media object is run through gzip AND brotli in full on every store,
+// allocating a copy per attempt, only for both results to be discarded by the ratio
+// check below — pure CPU and allocation cost on exactly the largest objects.
+func (s *Storage) compressData(data []byte, md *Metadata) ([]byte, string) {
 	dataSize := len(data)
 
 	// Only compress if data is large enough to benefit
@@ -469,9 +528,36 @@ func (s *Storage) compressData(data []byte) ([]byte, string) {
 		return data, ""
 	}
 
+	// Above the configured ceiling, store verbatim. Compressing a multi-megabyte
+	// body costs more CPU and transient memory than the disk space it saves.
+	if s.compressMaxSize > 0 && dataSize > s.compressMaxSize {
+		if s.logger != nil {
+			s.logger.Debug("Skipping compression: body exceeds compress_max_size",
+				zap.Int("size", dataSize),
+				zap.Int("limit", s.compressMaxSize))
+		}
+		return data, ""
+	}
+
+	if md != nil {
+		// Already compressed on the wire by the origin; recompressing is pointless.
+		if ce := md.HeaderValue("Content-Encoding"); ce != "" && ce != "none" && ce != "identity" {
+			return data, ""
+		}
+
+		if ct := md.HeaderValue("Content-Type"); isIncompressibleContentType(ct) {
+			if s.logger != nil {
+				s.logger.Debug("Skipping compression: content type is already compressed",
+					zap.String("content_type", ct),
+					zap.Int("size", dataSize))
+			}
+			return data, ""
+		}
+	}
+
 	// Try gzip compression
-	gzipData, err := CompressGzip(data)
-	if err == nil && len(gzipData) < dataSize {
+	gzipData, gzipErr := CompressGzip(data)
+	if gzipErr == nil && len(gzipData) < dataSize {
 		ratio := float64(len(gzipData)) / float64(dataSize)
 
 		// Only use compression if it saves at least 10%
@@ -486,10 +572,13 @@ func (s *Storage) compressData(data []byte) ([]byte, string) {
 		}
 	}
 
-	// Try brotli compression for larger files
+	// Try brotli compression for larger files. Note this is only reached when gzip
+	// did NOT clear the ratio threshold above (or failed): gzip short-circuits.
 	if dataSize > 10240 { // Only for files > 10KB
+		baseline := compressionBaseline(dataSize, gzipData, gzipErr)
+
 		brData, err := CompressBrotli(data)
-		if err == nil && len(brData) < len(gzipData) && len(brData) < dataSize {
+		if err == nil && len(brData) < baseline && len(brData) < dataSize {
 			ratio := float64(len(brData)) / float64(dataSize)
 			if ratio < 0.9 {
 				if s.logger != nil {

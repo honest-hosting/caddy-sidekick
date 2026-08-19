@@ -37,6 +37,9 @@ type testConfig struct {
 	cacheWriteWait     time.Duration
 }
 
+// caddyfileCacheTTL mirrors "cache_ttl 60" in etc/Caddyfile.
+const caddyfileCacheTTL = 60
+
 // newTestConfig creates a test configuration with defaults
 func newTestConfig() *testConfig {
 	return &testConfig{
@@ -60,7 +63,7 @@ func TestIntegrationMemoryCacheBasic(t *testing.T) {
 		t.Fatalf("Expected status 200, got %d", resp1.StatusCode)
 	}
 	checkCacheHeader(t, resp1, "MISS")
-	checkNoCacheHeaders(t, resp1)
+	checkCacheControlMISS(t, resp1, caddyfileCacheTTL)
 
 	// Wait for cache to be written
 	time.Sleep(cfg.cacheWriteWait)
@@ -1442,13 +1445,13 @@ func TestIntegrationCacheControlHeaders(t *testing.T) {
 	// ("name" is in cache_key_queries so it creates a distinct cache entry)
 	url := baseURL + "/cacheable?name=cc-header-test"
 
-	// First request - should be MISS with no-cache headers
+	// First request - should be MISS, advertised as cacheable downstream
 	resp1, _ := makeRequest(t, "GET", url, nil, nil)
 	if resp1.StatusCode != 200 {
 		t.Fatalf("Expected status 200, got %d", resp1.StatusCode)
 	}
 	checkCacheHeader(t, resp1, "MISS")
-	checkNoCacheHeaders(t, resp1)
+	checkCacheControlMISS(t, resp1, testTTL)
 
 	// Wait for cache to be written
 	time.Sleep(500 * time.Millisecond)
@@ -1493,11 +1496,34 @@ func TestIntegrationCacheControlHeaders(t *testing.T) {
 	}
 }
 
-// TestIntegrationBypassCacheControlHeaders tests that bypass responses include
-// no-cache directives.
+// TestIntegrationBypassCacheControlHeaders tests that bypass responses carry headers
+// chosen from WHY they bypassed, not a blanket no-store.
 func TestIntegrationBypassCacheControlHeaders(t *testing.T) {
-	// Test a bypass path
-	resp, _ := makeRequest(t, "GET", baseURL+"/wp-admin/index.php", nil, nil)
-	checkCacheHeader(t, resp, "BYPASS")
-	checkNoCacheHeaders(t, resp)
+	// A nocache path prefix names a private application area, so it must be locked
+	// out of every cache.
+	t.Run("prefix bypass is private", func(t *testing.T) {
+		for _, path := range []string{"/wp-admin/index.php", "/wp-json/wp/v2/posts"} {
+			resp, _ := makeRequest(t, "GET", baseURL+path, nil, nil)
+			checkCacheHeader(t, resp, "BYPASS")
+			checkPrivateHeaders(t, resp)
+		}
+	})
+
+	// A nocache_regex match names a file type Sidekick chooses not to store. That is
+	// ordinary public content, so the origin's own directives must survive.
+	t.Run("regex bypass is policy", func(t *testing.T) {
+		for _, path := range []string{"/file.mp4", "/archive.zip"} {
+			resp, _ := makeRequest(t, "GET", baseURL+path, nil, nil)
+			checkCacheHeader(t, resp, "BYPASS")
+			checkPolicyBypassHeaders(t, resp)
+		}
+	})
+
+	// A logged-in visitor is private on any non-static path.
+	t.Run("login cookie is private", func(t *testing.T) {
+		headers := map[string]string{"Cookie": "wordpress_logged_in_abc=session"}
+		resp, _ := makeRequest(t, "GET", baseURL+"/cacheable", nil, headers)
+		checkCacheHeader(t, resp, "BYPASS")
+		checkPrivateHeaders(t, resp)
+	})
 }
