@@ -80,7 +80,7 @@ func rangeTestSidekick(t *testing.T) (*Sidekick, *originHandler) {
 		RangeFill:              &enabled,
 		RangeFillMaxSize:       100 * 1024 * 1024,
 		logger:                 zap.NewNop(),
-		syncHandler:            &SyncHandler{inFlight: make(map[string]*sync.Once)},
+		syncHandler:            &SyncHandler{inFlight: make(map[string]*inflightFill)},
 	}
 	s.bufferPool = newTestBufferPool()
 	// Big enough that bodies land on disk rather than in the memory tier.

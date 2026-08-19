@@ -80,6 +80,11 @@ type Sidekick struct {
 	// relaying the response verbatim instead. 0 means fall back to
 	// cache_disk_item_max_size; -1 disables the limit.
 	RangeFillMaxSize int64 `json:"range_fill_max_size,omitempty"`
+	// RangeFillCollapseWait bounds how long a concurrent request will wait for an
+	// in-flight fill of the same key before giving up and going to the origin
+	// itself. Kept short: waiting longer than the origin would have taken makes the
+	// collapse a pessimization.
+	RangeFillCollapseWait caddy.Duration `json:"range_fill_collapse_wait,omitempty"`
 
 	// Cache key configuration
 	CacheKeyHeaders []string `json:"cache_key_headers,omitempty"`
@@ -102,8 +107,52 @@ type SyncHandler struct {
 	// Mutex for cache operations
 	cacheMu sync.RWMutex
 	// Track in-flight cache operations per key to prevent duplicates
-	inFlight   map[string]*sync.Once
+	inFlight   map[string]*inflightFill
 	inFlightMu sync.Mutex
+}
+
+// inflightFill tracks an upstream fetch that is populating one cache key, so that
+// concurrent requests for the same key can wait for it instead of each performing
+// their own full fetch.
+type inflightFill struct {
+	// once dedupes the cache STORE across everyone sharing this key.
+	once *sync.Once
+	// done is closed when the leader's fetch has completed and its result (if any)
+	// has been stored. Followers wait on this.
+	done chan struct{}
+	// closeOnce guards done against a double close when several requests share the
+	// record and each releases it.
+	closeOnce sync.Once
+}
+
+// acquireFill returns the in-flight record for a key, creating it if absent. The
+// second return value reports whether this caller created it and is therefore the
+// leader responsible for the upstream fetch.
+func (h *SyncHandler) acquireFill(key string) (*inflightFill, bool) {
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+
+	if f, ok := h.inFlight[key]; ok {
+		return f, false
+	}
+
+	f := &inflightFill{once: &sync.Once{}, done: make(chan struct{})}
+	h.inFlight[key] = f
+	return f, true
+}
+
+// releaseFill removes the record and wakes any followers waiting on it.
+//
+// The delete is conditional on the record still being the current one for that key,
+// so a late release from a previous generation cannot evict a newer fill.
+func (h *SyncHandler) releaseFill(key string, f *inflightFill) {
+	h.inFlightMu.Lock()
+	if cur, ok := h.inFlight[key]; ok && cur == f {
+		delete(h.inFlight, key)
+	}
+	h.inFlightMu.Unlock()
+
+	f.closeOnce.Do(func() { close(f.done) })
 }
 
 func init() {
@@ -360,6 +409,16 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				s.RangeFillMaxSize = size
 
+			case "range_fill_collapse_wait":
+				dur, err := caddy.ParseDuration(value)
+				if err != nil {
+					return d.Errf("invalid range_fill_collapse_wait: %v", err)
+				}
+				if dur < 0 {
+					return d.Errf("range_fill_collapse_wait must not be negative")
+				}
+				s.RangeFillCollapseWait = caddy.Duration(dur)
+
 			case "cache_memory_stream_to_disk_size":
 				size, err := parseSize(value)
 				if err != nil {
@@ -522,15 +581,19 @@ const (
 	// DefaultCompressMaxSize caps what is considered for compression before storing.
 	// Above this, gzip/brotli cost more CPU and transient memory than the disk space
 	// they save; for already-compressed payloads they save nothing at all.
-	DefaultCompressMaxSize   = 1 * 1024 * 1024                       // 1MB
-	DefaultWPMuPluginEnabled = true                                  // Enable mu-plugin management by default
-	DefaultWPMuPluginDir     = "/var/www/html/wp-content/mu-plugins" // Default mu-plugins directory
+	DefaultCompressMaxSize = 1 * 1024 * 1024 // 1MB
+	// DefaultRangeFillCollapseWait bounds a follower's wait for an in-flight fill.
+	// Short on purpose: a follower that waits longer than the origin would have taken
+	// to answer its range directly has been made slower, not faster.
+	DefaultRangeFillCollapseWait = 2 * time.Second
+	DefaultWPMuPluginEnabled     = true                                  // Enable mu-plugin management by default
+	DefaultWPMuPluginDir         = "/var/www/html/wp-content/mu-plugins" // Default mu-plugins directory
 )
 
 func (s *Sidekick) Provision(ctx caddy.Context) error {
 	s.logger = ctx.Logger(s)
 	s.syncHandler = &SyncHandler{
-		inFlight: make(map[string]*sync.Once),
+		inFlight: make(map[string]*inflightFill),
 	}
 
 	// Validate mutually exclusive options
@@ -861,9 +924,20 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 			s.RangeFillMaxSize = s.CacheDiskItemMaxSize
 		}
 	}
+	if s.RangeFillCollapseWait == 0 {
+		if envVal := os.Getenv("SIDEKICK_RANGE_FILL_COLLAPSE_WAIT"); envVal != "" {
+			if dur, err := caddy.ParseDuration(envVal); err == nil && dur >= 0 {
+				s.RangeFillCollapseWait = caddy.Duration(dur)
+			}
+		}
+		if s.RangeFillCollapseWait == 0 {
+			s.RangeFillCollapseWait = caddy.Duration(DefaultRangeFillCollapseWait)
+		}
+	}
 	s.logger.Debug("Range fill configured",
 		zap.Bool("enabled", s.rangeFillEnabled()),
-		zap.String("max_size", humanizeBytes(s.RangeFillMaxSize)))
+		zap.String("max_size", humanizeBytes(s.RangeFillMaxSize)),
+		zap.Duration("collapse_wait", time.Duration(s.RangeFillCollapseWait)))
 
 	// Load WP mu-plugin configuration
 	// If not set by Caddyfile (which sets defaults in UnmarshalCaddyfile), set defaults
@@ -1310,24 +1384,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 				zap.String("hex", fmt.Sprintf("%x", preview)))
 		}
 
-		// Set headers from cache metadata
-		for _, kv := range cacheMeta.Header {
-			if len(kv) != 2 {
-				continue
-			}
-			// Skip headers we manage directly
-			if kv[0] == "Content-Encoding" || kv[0] == "Content-Length" ||
-				kv[0] == "Cache-Control" || kv[0] == "Age" || kv[0] == "Pragma" ||
-				kv[0] == "Vary" {
-				continue
-			}
-			hdr.Set(kv[0], kv[1])
-		}
-
-		// Applied after the cached metadata headers so that Cache-Control, Age and
-		// Vary come from the single chokepoint rather than from whatever the origin
-		// happened to send when this entry was stored.
-		s.applyDownstreamCacheHeaders(hdr, keyDimensions, cacheStateHit, cacheMeta)
+		s.applyCachedHeaders(hdr, cacheMeta, keyDimensions)
 
 		if canRange {
 			// ServeContent implements the whole partial-content state machine:
@@ -1360,19 +1417,23 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 
 	s.logger.Debug("sidekick - cache miss - "+cacheKey, zap.Error(err))
 
-	// Use sync.Once to prevent duplicate cache operations for the same key
-	s.syncHandler.inFlightMu.Lock()
-	once, exists := s.syncHandler.inFlight[cacheKey]
-	if !exists {
-		once = &sync.Once{}
-		s.syncHandler.inFlight[cacheKey] = once
+	// Register (or join) the in-flight fetch for this key.
+	fill, isLeader := s.syncHandler.acquireFill(cacheKey)
+
+	isRangeFill := s.rangeFillEnabled() && r.Header.Get("Range") != ""
+
+	// Best-effort request collapsing, deliberately scoped to range fills. A range
+	// fill reads the WHOLE object upstream, so N concurrent cold requests for one
+	// video would otherwise mean N full reads and N temp files. Ordinary misses are
+	// cheap and are left alone.
+	if isRangeFill && !isLeader {
+		return s.awaitFill(w, r, next, fill, cacheKey, keyDimensions, metrics, startTime)
 	}
-	s.syncHandler.inFlightMu.Unlock()
 
 	// Create custom writer to capture response
 	buf := s.bufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
-	nw := NewResponseWriter(w, r, storage, s.logger, s, once, cacheKey, buf, keyDimensions)
+	nw := NewResponseWriter(w, r, storage, s.logger, s, fill.once, cacheKey, buf, keyDimensions)
 	defer func() {
 		metrics.RecordResponseTime("miss", "default", time.Since(startTime))
 		// Close() reads the captured body out of buf, so the buffer must not go back
@@ -1382,12 +1443,10 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 			s.logger.Error("Error closing response writer", zap.Error(err))
 		}
 		s.bufferPool.Put(buf)
-		// Clean up in-flight tracker after some time
-		go func() {
-			s.syncHandler.inFlightMu.Lock()
-			delete(s.syncHandler.inFlight, cacheKey)
-			s.syncHandler.inFlightMu.Unlock()
-		}()
+		// Release only after the store has completed, so a follower woken by this
+		// finds the entry actually present. The previous implementation deleted the
+		// record immediately in a goroutine, which made it useless for coordination.
+		s.syncHandler.releaseFill(cacheKey, fill)
 	}()
 
 	// Range fill: nothing in the request path can cache a partial response, so a
@@ -1400,6 +1459,72 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	}
 
 	return next.ServeHTTP(nw, r)
+}
+
+// awaitFill is the follower side of request collapsing. It waits, briefly, for the
+// leader's fill to land and then serves the range from cache.
+//
+// It is best-effort by construction and degrades open: on timeout, on client
+// disconnect, or if the leader produced nothing cacheable, the request falls through
+// to a plain pass-through of the ORIGINAL range request. The origin answers it
+// directly, which is correct and cheap. A follower therefore never blocks
+// indefinitely and never fails a request that would otherwise have succeeded — the
+// worst case is exactly the behavior we had before collapsing existed.
+func (s *Sidekick) awaitFill(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler,
+	fill *inflightFill, cacheKey string, dims keyDims,
+	metrics *MetricsCollector, startTime time.Time) error {
+
+	wait := time.Duration(s.RangeFillCollapseWait)
+	if wait <= 0 {
+		wait = DefaultRangeFillCollapseWait
+	}
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-fill.done:
+		s.syncHandler.cacheMu.RLock()
+		cacheData, cacheMeta, err := s.Storage.Get(cacheKey)
+		s.syncHandler.cacheMu.RUnlock()
+
+		// Serve the range from what the leader stored, subject to the same
+		// preconditions as an ordinary range hit.
+		if err == nil && cacheMeta != nil && cacheMeta.StateCode == http.StatusOK {
+			enc := cacheMeta.HeaderValue("Content-Encoding")
+			if enc == "" || enc == "identity" {
+				hdr := w.Header()
+				hdr.Set(CacheHeaderName, "HIT")
+				s.applyCachedHeaders(hdr, cacheMeta, dims)
+				hdr.Del("Content-Length")
+
+				http.ServeContent(w, r, "", cachedModTime(cacheMeta), bytes.NewReader(cacheData))
+				metrics.RecordCacheOperation("get", "range_collapsed", "default")
+				metrics.RecordResponseTime("hit", "default", time.Since(startTime))
+				return nil
+			}
+		}
+
+		s.logger.Debug("Collapsed range follower found no usable entry, passing through",
+			zap.String("path", r.URL.Path), zap.Error(err))
+
+	case <-r.Context().Done():
+		// Client went away; nothing useful left to do.
+		return r.Context().Err()
+
+	case <-timer.C:
+		s.logger.Debug("Collapsed range follower timed out, passing through",
+			zap.String("path", r.URL.Path), zap.Duration("waited", wait))
+	}
+
+	// Degrade open: let the origin answer the original range request directly.
+	hdr := w.Header()
+	hdr.Set(CacheHeaderName, "BYPASS")
+	s.applyDownstreamCacheHeaders(hdr, dims, cacheStateBypass, nil)
+	metrics.RecordCacheOperation("get", "range_collapse_fallback", "default")
+	err := next.ServeHTTP(w, r)
+	metrics.RecordResponseTime("bypass", "default", time.Since(startTime))
+	return err
 }
 
 // serveRangeFill handles a cache miss for a range request by fetching the whole
@@ -1929,6 +2054,29 @@ func (s *Sidekick) buildCacheKey(r *http.Request) (string, keyDims) {
 }
 
 // shouldReturn304 checks if we should return a 304 Not Modified response
+// applyCachedHeaders restores the stored response headers onto hdr and then applies
+// the downstream cache-header chokepoint.
+//
+// The chokepoint runs LAST so that Cache-Control, Age, Pragma and Vary always come
+// from the shareability decision rather than from whatever the origin happened to
+// send when the entry was stored.
+func (s *Sidekick) applyCachedHeaders(hdr http.Header, cacheMeta *Metadata, dims keyDims) {
+	for _, kv := range cacheMeta.Header {
+		if len(kv) != 2 {
+			continue
+		}
+		// Skip headers we manage directly
+		if kv[0] == "Content-Encoding" || kv[0] == "Content-Length" ||
+			kv[0] == "Cache-Control" || kv[0] == "Age" || kv[0] == "Pragma" ||
+			kv[0] == "Vary" {
+			continue
+		}
+		hdr.Set(kv[0], kv[1])
+	}
+
+	s.applyDownstreamCacheHeaders(hdr, dims, cacheStateHit, cacheMeta)
+}
+
 // cachedModTime returns the cached Last-Modified as a time.Time, or the zero time if
 // it is absent or unparseable. A zero modtime tells http.ServeContent to skip the
 // date-based conditional checks while still honoring the ETag ones.

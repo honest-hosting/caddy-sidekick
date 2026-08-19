@@ -310,34 +310,55 @@ func TestConcurrentMemoryAccess(t *testing.T) {
 	wg.Wait()
 }
 
-// TestCacheKeyMutexCleanup tests that key mutexes are properly cleaned up
-func TestCacheKeyMutexCleanup(t *testing.T) {
+// TestCacheKeyMutexSharding covers the replacement for the old per-key mutex map,
+// which grew without bound because entries were only removed by Purge — so every
+// distinct URL ever requested leaked a mutex for the process lifetime.
+//
+// The sharded array has no lifecycle to leak. What still has to hold is that a given
+// key always resolves to the same mutex, which is what makes the per-key locking in
+// Get/SetWithKey/Purge meaningful.
+func TestCacheKeyMutexSharding(t *testing.T) {
 	cleanupTestDir(t)
 	defer cleanupTestDir(t)
 
 	logger := getTestLogger()
 	storage := NewStorage(testCacheDir, testTTL, smallDataSize, largeDataSize, 100, 0, 0, 0, logger)
 
-	key := "mutex-test"
-	data := generateTestData(smallDataSize)
-	metadata := createTestMetadata()
-
-	// Set data
-	err := storage.SetWithKey(key, metadata, data)
-	if err != nil {
-		t.Fatalf("Failed to set data: %v", err)
+	// Stable: the same key resolves to the same mutex every time.
+	for _, key := range []string{"mutex-test", "another-key", ""} {
+		first := storage.getKeyMutex(key)
+		for i := 0; i < 10; i++ {
+			if storage.getKeyMutex(key) != first {
+				t.Fatalf("key %q resolved to a different mutex on lookup %d", key, i)
+			}
+		}
 	}
 
-	// Purge should cleanup the mutex
-	_ = storage.Purge(key)
+	// Bounded: 10k distinct keys resolve to at most keyMutexShards mutexes, so the
+	// structure cannot grow with traffic the way the old map did.
+	distinct := make(map[*sync.RWMutex]bool)
+	for i := 0; i < 10000; i++ {
+		distinct[storage.getKeyMutex(fmt.Sprintf("key-%d", i))] = true
+	}
+	if len(distinct) > keyMutexShards {
+		t.Fatalf("got %d distinct mutexes for 10000 keys, want at most %d",
+			len(distinct), keyMutexShards)
+	}
+	// Sanity check that the hash actually spreads rather than collapsing to one shard.
+	if len(distinct) < keyMutexShards/2 {
+		t.Errorf("poor shard distribution: only %d of %d shards used", len(distinct), keyMutexShards)
+	}
 
-	// Check that mutex was cleaned up
-	storage.keyMutexesMu.Lock()
-	_, exists := storage.keyMutexes[key]
-	storage.keyMutexesMu.Unlock()
-
-	if exists {
-		t.Error("Key mutex should have been cleaned up after purge")
+	// Purge still works; it simply no longer has a mutex to clean up.
+	key := "mutex-test"
+	if err := storage.SetWithKey(key, createTestMetadata(), generateTestData(smallDataSize)); err != nil {
+		t.Fatalf("Failed to set data: %v", err)
+	}
+	if err := storage.Purge(key); err != nil {
+		t.Fatalf("Purge failed: %v", err)
+	}
+	if _, _, err := storage.Get(key); err == nil {
+		t.Error("entry should be gone after purge")
 	}
 }
 

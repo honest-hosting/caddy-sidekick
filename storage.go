@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path"
 	"path/filepath"
@@ -19,6 +20,10 @@ var (
 	ErrCacheExpired  = errors.New("cache expired")
 	ErrCacheNotFound = errors.New("cache not found")
 )
+
+// keyMutexShards is the number of per-key lock shards. Large enough that unrelated
+// keys rarely collide, small enough to stay a trivial fixed allocation.
+const keyMutexShards = 256
 
 var CachedContentEncoding = []string{
 	"none",
@@ -50,9 +55,15 @@ type Storage struct {
 
 	// Mutex for file operations
 	fileMu sync.RWMutex
-	// Per-key mutexes for granular locking
-	keyMutexes   map[string]*sync.RWMutex
-	keyMutexesMu sync.Mutex
+	// Per-key mutexes for granular locking, sharded by key hash.
+	//
+	// A fixed array rather than a map keyed by cache key: the map grew without
+	// bound because entries were only ever removed by Purge, so every distinct URL
+	// ever requested leaked a mutex for the process lifetime. Sharding gives the
+	// same granularity guarantee (the same key always maps to the same mutex) with
+	// no lifecycle to manage. Distinct keys may share a shard, which costs
+	// occasional false contention and nothing else.
+	keyMutexes [keyMutexShards]sync.RWMutex
 	// WaitGroup for tracking async operations
 	asyncOps sync.WaitGroup
 }
@@ -75,7 +86,6 @@ func NewStorage(loc string, ttl int, memItemMaxSize int, memMaxSize int, memMaxC
 		diskMaxSize:     diskMaxSize,
 		diskMaxCount:    diskMaxCount,
 		compressMaxSize: DefaultCompressMaxSize,
-		keyMutexes:      make(map[string]*sync.RWMutex),
 	}
 
 	// Initialize memory cache
@@ -131,25 +141,12 @@ func (s *Storage) GetDiskCache() *DiskCache {
 	return cache.(*DiskCache)
 }
 
-// getKeyMutex returns a mutex for a specific key to ensure per-key locking
+// getKeyMutex returns the mutex guarding a specific key. The same key always maps to
+// the same shard, so per-key mutual exclusion holds; different keys may share one.
 func (s *Storage) getKeyMutex(key string) *sync.RWMutex {
-	s.keyMutexesMu.Lock()
-	defer s.keyMutexesMu.Unlock()
-
-	if mu, exists := s.keyMutexes[key]; exists {
-		return mu
-	}
-
-	mu := &sync.RWMutex{}
-	s.keyMutexes[key] = mu
-	return mu
-}
-
-// cleanupKeyMutex removes a key-specific mutex when no longer needed
-func (s *Storage) cleanupKeyMutex(key string) {
-	s.keyMutexesMu.Lock()
-	defer s.keyMutexesMu.Unlock()
-	delete(s.keyMutexes, key)
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return &s.keyMutexes[h.Sum32()%keyMutexShards]
 }
 
 func (s *Storage) Get(key string) ([]byte, *Metadata, error) {
@@ -352,7 +349,6 @@ func (s *Storage) Purge(key string) error {
 	keyMu := s.getKeyMutex(key)
 	keyMu.Lock()
 	defer keyMu.Unlock()
-	defer s.cleanupKeyMutex(key)
 
 	// Remove from memory cache
 	memCache := s.GetMemCache()

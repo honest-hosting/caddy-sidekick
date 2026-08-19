@@ -16,9 +16,12 @@ import (
 // DiskCacheItem represents an item stored in disk cache
 type DiskCacheItem struct {
 	*Metadata
-	Path       string    // File path on disk
-	Size       int64     // Size in bytes
-	AccessTime time.Time // Last access time
+	Path string // File path on disk
+	Size int64  // Size in bytes
+	// AccessTime is when the entry was added to (or loaded into) the index. It is
+	// not refreshed on read — see DiskCache.Get. Eviction recency is tracked by the
+	// LRU list, not by this field.
+	AccessTime time.Time
 	ModTime    time.Time // Last modification time
 }
 
@@ -68,9 +71,11 @@ func (dc *DiskCache) Get(key string) (*DiskCacheItem, error) {
 		return nil, ErrCacheNotFound
 	}
 
-	// Update access time
-	(*item).AccessTime = time.Now()
-
+	// Deliberately does NOT stamp AccessTime here. Storage.Get holds only a read
+	// lock, so concurrent readers of the same key would all write that field at
+	// once — a data race, and one the race detector flags under concurrent range
+	// requests. Nothing reads AccessTime: recency for eviction comes from the LRU
+	// list, which lru.Get above has already updated under its own lock.
 	return *item, nil
 }
 

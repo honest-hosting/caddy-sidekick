@@ -175,6 +175,9 @@ example.com {
         # Abandon a fill whose body exceeds this and relay the response whole.
         # Defaults to cache_disk_item_max_size. Use -1 for no limit.
         range_fill_max_size 100MB
+        # How long a concurrent request waits for an in-flight fill of the same
+        # object before going to the origin itself (default 2s).
+        range_fill_collapse_wait 2s
         
         # Largest body considered for compression before storing (default 1MB).
         # Use -1 for unlimited. Above this, gzip/brotli cost more CPU and transient
@@ -512,6 +515,22 @@ correct response; only the cache fill is lost.
 Note that the first range request for a cold object costs a full read of that object
 from the origin. Against a local `file_server` that is cheap. Set `range_fill false`
 if your origin makes it expensive.
+
+### Request Collapsing
+
+A range fill reads the whole object, so several viewers seeking into the same cold
+video at once would otherwise mean several full reads. The first request for a key
+becomes the leader and performs the fill; concurrent range requests for that key wait
+up to `range_fill_collapse_wait` and are then served from the resulting cache entry.
+
+Collapsing is best-effort and degrades open. If the wait expires, the client
+disconnects, or the leader produced nothing cacheable, the follower falls through to a
+plain pass-through of its original range request, which the origin answers directly.
+A follower never blocks indefinitely and never fails a request that would otherwise
+have succeeded — the worst case is the behavior you had before collapsing existed.
+
+Only range fills are collapsed. Ordinary misses are cheap and keep their existing
+concurrent behavior rather than serializing behind a leader.
 
 ## Shared Cache Safety
 
