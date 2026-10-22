@@ -77,6 +77,14 @@ func (w *bypassResponseWriter) applyHeaders() {
 
 	hdr := w.Header()
 	hdr.Set(CacheHeaderName, "BYPASS")
+	// Keep the origin's own vary statement visible to downstream caches; the
+	// chokepoint below rewrites Vary from dims.
+	decision := parseResponseVary(hdr)
+	hdr.Del(VaryCookieHeader)
+	if w.sidekick.respectVaryEnabled() {
+		w.dims.Vary = decision.spec
+		w.dims.Passthrough = decision.passthrough
+	}
 	w.sidekick.applyDownstreamCacheHeaders(hdr, w.dims, w.state, nil)
 }
 
@@ -146,6 +154,11 @@ type ResponseWriter struct {
 	cacheKey string
 	cacheMu  *sync.RWMutex
 	bufMu    sync.Mutex
+
+	// baseKey is the key before any learned vary dimensions. When the origin's
+	// response declares what it varies on, cacheKey is re-derived from baseKey so
+	// the entry is stored under the variant this request belongs to.
+	baseKey string
 
 	// keyDims records which request dimensions varied the cache key, and drives
 	// whether this response may be stored by a shared cache. See
@@ -318,6 +331,34 @@ func (r *ResponseWriter) WriteHeader(status int) {
 			r.Debug("Bypass caching because the origin marked the response uncacheable",
 				zap.String("cache_control", cc))
 		}
+	}
+
+	// Respect what the origin says this response varies on. The private
+	// X-Sidekick-Vary declaration is consumed here and never sent downstream.
+	decision := parseResponseVary(hdr)
+	hdr.Del(VaryCookieHeader)
+	r.keyDims.Vary = decision.spec
+	r.keyDims.Passthrough = decision.passthrough
+	if r.sidekick.respectVaryEnabled() && !bypass {
+		if decision.uncacheable() {
+			// Vary: Cookie or * — one entry per session is not a cache.
+			bypass = true
+			r.Debug("Bypass caching because the origin varies on Cookie or *",
+				zap.Strings("vary", decision.passthrough))
+		} else if r.baseKey != "" {
+			if !r.sidekick.varyIdx.set(r.baseKey, decision.spec) {
+				bypass = true
+				r.Debug("Bypass caching because the vary index is full")
+			} else if decision.spec.empty() {
+				r.cacheKey = r.baseKey
+			} else {
+				r.cacheKey = decision.spec.variantKey(r.baseKey, r.Request)
+			}
+		}
+	} else if !r.sidekick.respectVaryEnabled() {
+		// respect_vary off: legacy behavior, the key ignores origin declarations.
+		r.keyDims.Vary = varySpec{}
+		r.keyDims.Passthrough = nil
 	}
 
 	if bypass {
