@@ -487,6 +487,31 @@ The `cache_key_cookies` option supports wildcard patterns using `*` for prefix m
 - `session_*` matches `session_id`, `session_token`, etc.
 - Exact names (without `*`) only match that specific cookie
 
+### Respecting Vary (`respect_vary`, default `true`)
+
+The global cache key cannot know that one site prices pages by visitor country while
+every other site on the same server does not. With `respect_vary` the origin says so
+itself, per URL, and Sidekick stores one entry per variant:
+
+- **Header variants:** a standard `Vary` response header, for example
+  `Vary: Accept-Encoding, CF-IPCountry`. `Accept-Encoding` never splits the key
+  (Sidekick negotiates encodings itself).
+- **Cookie-value variants:** `X-Sidekick-Vary: cookie=name1,cookie=name2`, the same
+  model as LiteSpeed's `X-LiteSpeed-Vary`. The entry varies on the cookie's *value*;
+  visitors without the cookie share the default variant. The header is consumed and
+  never sent downstream.
+- `Vary: Cookie` and `Vary: *` are not stored (they mean one copy per session).
+
+The spec is learned from the first response for a URL and kept in a bounded in-memory
+index (`vary_index_max`, default 100000). After a restart the first request for a URL
+misses and the spec is learned again. Purging a path removes every variant.
+
+`vary_cdn_no_store` (default `true`) adds `CDN-Cache-Control: no-store` and
+`Cloudflare-CDN-Cache-Control: no-store` to varied responses, because most CDNs ignore
+`Vary` on HTML and would hand one variant to everyone. Browsers and Sidekick still
+cache them per variant. Set `respect_vary false` (or `SIDEKICK_RESPECT_VARY=false`)
+for the previous behavior.
+
 ## Range Requests
 
 Sidekick stores exactly one representation per cache key: the full `200` response.

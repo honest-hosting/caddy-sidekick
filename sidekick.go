@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -97,6 +98,19 @@ type Sidekick struct {
 	CacheKeyHeaders []string `json:"cache_key_headers,omitempty"`
 	CacheKeyQueries []string `json:"cache_key_queries,omitempty"`
 	CacheKeyCookies []string `json:"cache_key_cookies,omitempty"`
+
+	// RespectVary makes the origin's Vary response header (and the
+	// X-Sidekick-Vary cookie declaration) split the cache per URL, instead of
+	// requiring every possible dimension in the global cache key. Defaults to
+	// enabled; a pointer for the same reason as RangeFill.
+	RespectVary *bool `json:"respect_vary,omitempty"`
+	// VaryCDNNoStore withholds varied responses from shared CDNs via
+	// CDN-Cache-Control/Cloudflare-CDN-Cache-Control: no-store, because most CDNs
+	// ignore Vary on HTML and would merge the variants. Defaults to enabled.
+	VaryCDNNoStore *bool `json:"vary_cdn_no_store,omitempty"`
+	// VaryIndexMax bounds how many URLs may carry a learned vary spec.
+	VaryIndexMax int `json:"vary_index_max,omitempty"`
+	varyIdx      *varyIndex
 
 	pathRx           *regexp.Regexp
 	staticAssetRx    *regexp.Regexp
@@ -416,6 +430,27 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("range_fill must be true or false")
 				}
 				s.RangeFill = &b
+
+			case "respect_vary":
+				b, err := strconv.ParseBool(value)
+				if err != nil {
+					return d.Errf("respect_vary must be true or false")
+				}
+				s.RespectVary = &b
+
+			case "vary_cdn_no_store":
+				b, err := strconv.ParseBool(value)
+				if err != nil {
+					return d.Errf("vary_cdn_no_store must be true or false")
+				}
+				s.VaryCDNNoStore = &b
+
+			case "vary_index_max":
+				n, err := strconv.Atoi(value)
+				if err != nil || n <= 0 {
+					return d.Errf("vary_index_max must be a positive integer")
+				}
+				s.VaryIndexMax = n
 
 			case "range_fill_max_size":
 				size, err := parseSize(value)
@@ -942,6 +977,22 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 		s.RangeFill = &enabled
 	}
 
+	// Vary support defaults to enabled; nil means never configured.
+	if s.RespectVary == nil {
+		enabled := true
+		if envVal := os.Getenv("SIDEKICK_RESPECT_VARY"); envVal != "" {
+			if b, err := strconv.ParseBool(envVal); err == nil {
+				enabled = b
+			}
+		}
+		s.RespectVary = &enabled
+	}
+	if s.VaryCDNNoStore == nil {
+		enabled := true
+		s.VaryCDNNoStore = &enabled
+	}
+	s.varyIdx = newVaryIndex(s.VaryIndexMax)
+
 	// A fill larger than what the cache would ever accept is wasted work, so the
 	// disk item ceiling is the natural default.
 	if s.RangeFillMaxSize == 0 {
@@ -1280,8 +1331,10 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	etag := r.Header.Get("If-None-Match")
 	modifiedSince := r.Header.Get("If-Modified-Since")
 
-	// Build cache key with configurable components
-	cacheKey, keyDimensions := s.buildCacheKey(r)
+	// Build cache key with configurable components, then select the variant the
+	// origin previously declared this URL varies on (if any).
+	baseKey, keyDimensions := s.buildCacheKey(r)
+	cacheKey, keyDimensions := s.lookupKey(baseKey, r, keyDimensions)
 
 	// Parse Accept-Encoding header
 	requestEncoding := strings.Split(strings.Join(reqHdr["Accept-Encoding"], ","), ",")
@@ -1476,6 +1529,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	buf := s.bufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	nw := NewResponseWriter(w, r, storage, s.logger, s, fill.once, cacheKey, buf, keyDimensions)
+	nw.baseKey = baseKey
 	defer func() {
 		metrics.RecordResponseTime("miss", "default", time.Since(startTime))
 		// Close() reads the captured body out of buf, so the buffer must not go back
@@ -1971,6 +2025,12 @@ type keyDims struct {
 	// the request, meaning the cache key — and therefore the response — is
 	// specific to that cookie value.
 	Cookies bool
+	// Vary is what the origin declared this URL varies on (learned from its
+	// response). Such a response is shared among visitors with the same values,
+	// so it is not private, but CDNs that cannot key on it must not store it.
+	Vary varySpec
+	// Passthrough holds origin Vary tokens Sidekick cannot key on (Cookie, *).
+	Passthrough []string
 }
 
 // rangeFillEnabled reports whether range-fill is active. A nil RangeFill means the
@@ -2373,10 +2433,26 @@ func (s *Sidekick) applyDownstreamCacheHeaders(hdr http.Header, dims keyDims, st
 			vary = append(vary, h)
 		}
 	}
-	if dims.Cookies {
+	for _, h := range dims.Vary.Headers {
+		if !slices.ContainsFunc(vary, func(v string) bool { return strings.EqualFold(v, h) }) {
+			vary = append(vary, h)
+		}
+	}
+	if dims.Cookies || len(dims.Vary.Cookies) > 0 || slices.Contains(dims.Passthrough, "Cookie") {
 		vary = append(vary, "Cookie")
 	}
+	if slices.Contains(dims.Passthrough, "*") {
+		vary = []string{"*"}
+	}
 	hdr.Set("Vary", strings.Join(vary, ", "))
+
+	// Most CDNs (Cloudflare included) ignore Vary on HTML and would hand one
+	// variant to everyone. A varied response therefore stays out of shared CDN
+	// caches; browsers and Sidekick still cache it per variant.
+	if (!dims.Vary.empty() || len(dims.Passthrough) > 0) && s.varyCDNNoStoreEnabled() {
+		hdr.Set("CDN-Cache-Control", "no-store")
+		hdr.Set("Cloudflare-CDN-Cache-Control", "no-store")
+	}
 
 	// A cookie-varied response is private to one session, whatever produced it.
 	// Vary: Cookie above is defense in depth for intermediaries that honor Vary but
