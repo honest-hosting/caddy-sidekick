@@ -138,7 +138,7 @@ func TestProvision_DefaultCacheKeyOptions(t *testing.T) {
 		{
 			name:            "nil cache key options get defaults",
 			sidekick:        &Sidekick{},
-			expectedQueries: []string{"p", "page", "paged", "s", "category", "tag", "author"},
+			expectedQueries: strings.Split(DefaultCacheKeyQueries, ","),
 			expectedHeaders: []string{"Accept-Encoding"},
 			expectedCookies: []string{"wordpress_logged_in_*", "wordpress_sec_*", "wp-settings-*"},
 		},
@@ -317,11 +317,13 @@ func TestBuildCacheKey_WildcardCookieValues(t *testing.T) {
 	// Keys should be different for different cookie values
 	assert.NotEqual(t, key1, key2, "Different cookie values should produce different cache keys")
 
-	// Verify the cookie value is actually used in the hash
+	// Verify the cookie value is actually used in the hash. Every component is
+	// length-prefixed (buildCacheKeyFor): host, path, canonical query (empty here),
+	// then the cookie name and value. httptest sets r.Host to "example.com".
 	h := md5.New()
-	h.Write([]byte("example.com")) // httptest sets r.Host to "example.com"
-	h.Write([]byte("/test"))
-	h.Write([]byte("test_cookie=value1"))
+	for _, field := range []string{"example.com", "/test", "", "test_cookie", "value1"} {
+		_, _ = fmt.Fprintf(h, "%d:%s", len(field), field)
+	}
 	expectedKey1 := fmt.Sprintf("%x", h.Sum(nil))
 	assert.Equal(t, expectedKey1, key1, "Cache key should include cookie name and value")
 }

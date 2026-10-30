@@ -583,12 +583,18 @@ func TestIntegrationQueryParameterCaching(t *testing.T) {
 	resp3, _ := makeRequest(t, "GET", url2, nil, nil)
 	checkCacheHeader(t, resp3, "MISS")
 
-	// Parameter not in cache_key_queries - should still hit cache for first URL
+	// A parameter that is neither keyed nor ignored is not cached at all: Sidekick
+	// cannot know whether it changes the page, so it must not share the entry above.
 	url3 := baseURL + "/dynamic?name=Alice&page=1&ignored=value"
-	resp4, body4 := makeRequest(t, "GET", url3, nil, nil)
-	checkCacheHeader(t, resp4, "HIT")
-	if body1 != body4 {
-		t.Error("Ignored query parameter should not affect cache key")
+	resp4, _ := makeRequest(t, "GET", url3, nil, nil)
+	checkCacheHeader(t, resp4, "BYPASS")
+
+	// A per-click tracking ID (cache_ignore_queries default) shares the page's entry.
+	url4 := baseURL + "/dynamic?name=Alice&page=1&gclid=Cj0KCQjw"
+	resp5, body5 := makeRequest(t, "GET", url4, nil, nil)
+	checkCacheHeader(t, resp5, "HIT")
+	if body1 != body5 {
+		t.Error("A click ID should share the page's cache entry")
 	}
 }
 
@@ -1525,5 +1531,83 @@ func TestIntegrationBypassCacheControlHeaders(t *testing.T) {
 		resp, _ := makeRequest(t, "GET", baseURL+"/cacheable", nil, headers)
 		checkCacheHeader(t, resp, "BYPASS")
 		checkPrivateHeaders(t, resp)
+	})
+}
+
+// TestIntegrationQueryParamBypass covers issue #8: WordPress serves the REST API on any
+// path via ?rest_route=, which no path prefix can see. Those requests, the held-comment
+// view, authenticated requests and subsite system paths must all bypass as private,
+// and none of them may fill the plain page's cache entry.
+func TestIntegrationQueryParamBypass(t *testing.T) {
+	purgeCache(t, nil)
+	time.Sleep(1 * time.Second)
+
+	t.Run("nocache_query parameters are private on any path", func(t *testing.T) {
+		for _, query := range []string{
+			"rest_route=/vendor/v1/orders",
+			"rest_route=/vendor/v1/customers",
+			"rest.route=/",
+			"rest_route[]=/",
+			"unapproved=1&moderation-hash=abc",
+		} {
+			resp, _ := makeRequest(t, "GET", baseURL+"/cacheable?"+query, nil, nil)
+			checkCacheHeader(t, resp, "BYPASS")
+			checkPrivateHeaders(t, resp)
+		}
+
+		// None of the above may have filled the page's own entry.
+		resp, _ := makeRequest(t, "GET", baseURL+"/cacheable", nil, nil)
+		checkCacheHeader(t, resp, "MISS")
+	})
+
+	t.Run("authorization header is private", func(t *testing.T) {
+		headers := map[string]string{"Authorization": "Bearer integration-test"}
+		resp, _ := makeRequest(t, "GET", baseURL+"/cacheable", nil, headers)
+		checkCacheHeader(t, resp, "BYPASS")
+		checkPrivateHeaders(t, resp)
+	})
+
+	t.Run("comment author cookie is private", func(t *testing.T) {
+		headers := map[string]string{"Cookie": "comment_author_email_abc=someone%40example.com"}
+		resp, _ := makeRequest(t, "GET", baseURL+"/cacheable", nil, headers)
+		checkCacheHeader(t, resp, "BYPASS")
+		checkPrivateHeaders(t, resp)
+	})
+
+	// "/" sends no Cache-Control of its own, so Sidekick advertises the response the
+	// way it would a MISS.
+	t.Run("unkeyed parameter is not cached but advertised like a MISS", func(t *testing.T) {
+		resp, _ := makeRequest(t, "GET", baseURL+"/?unrecognized=1", nil, nil)
+		checkCacheHeader(t, resp, "BYPASS")
+		checkCacheControlMISS(t, resp, 60) // cache_ttl in etc/Caddyfile
+	})
+
+	// "/dynamic" sends "public, max-age=600" itself: when the origin speaks, its
+	// directives stand and Sidekick only drops Age.
+	t.Run("unkeyed parameter keeps the origin's own cache directives", func(t *testing.T) {
+		resp, _ := makeRequest(t, "GET", baseURL+"/dynamic?name=unkeyed&unrecognized=1", nil, nil)
+		checkCacheHeader(t, resp, "BYPASS")
+		if cc := resp.Header.Get("Cache-Control"); cc != "public, max-age=600" {
+			t.Errorf("Expected the origin's Cache-Control: public, max-age=600, got: %s", cc)
+		}
+		if age := resp.Header.Get("Age"); age != "" {
+			t.Errorf("Expected no Age on a response Sidekick did not serve from cache, got: %q", age)
+		}
+	})
+
+	t.Run("click id with a markup value cannot fill the page's entry", func(t *testing.T) {
+		resp, _ := makeRequest(t, "GET", baseURL+"/dynamic?name=gated&gclid=%3Cb%3Ex", nil, nil)
+		checkCacheHeader(t, resp, "BYPASS")
+
+		resp, _ = makeRequest(t, "GET", baseURL+"/dynamic?name=gated", nil, nil)
+		checkCacheHeader(t, resp, "MISS")
+	})
+
+	t.Run("subdirectory multisite system paths are private", func(t *testing.T) {
+		for _, path := range []string{"/blog/wp-json/wp/v2/posts", "/blog/wp-admin/index.php"} {
+			resp, _ := makeRequest(t, "GET", baseURL+path, nil, nil)
+			checkCacheHeader(t, resp, "BYPASS")
+			checkPrivateHeaders(t, resp)
+		}
 	})
 }

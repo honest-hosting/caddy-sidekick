@@ -44,6 +44,15 @@ type Sidekick struct {
 	NoCache      []string `json:"nocache,omitempty"`       // Path prefixes to bypass
 	NoCacheRegex string   `json:"nocache_regex,omitempty"` // Regex pattern to bypass
 	NoCacheHome  bool     `json:"nocache_home,omitempty"`  // Whether to skip caching home page
+	// NoCacheQuery lists query parameter names whose presence makes a request bypass
+	// the cache as private, matched by the name PHP registers (see phpQueryNames). It
+	// exists because WordPress serves its REST API on ANY path via ?rest_route=, which a
+	// path prefix can never see. A trailing '*' matches by prefix. Nil means the default.
+	//
+	// No omitempty: the Caddyfile is adapted to JSON before the module is loaded, and
+	// omitempty would turn an explicitly empty list into nil, silently restoring the
+	// default. Without it, nil round-trips as null and empty as [].
+	NoCacheQuery []string `json:"nocache_query"`
 	// BypassCacheControl selects how downstream cache headers are chosen:
 	//   "preserve" (default) — headers follow the reason a request bypassed, and a
 	//     MISS is advertised as cacheable just like a HIT.
@@ -95,8 +104,16 @@ type Sidekick struct {
 
 	// Cache key configuration
 	CacheKeyHeaders []string `json:"cache_key_headers,omitempty"`
+	// CacheKeyQueries lists the query parameters that vary the cache key; a trailing
+	// '*' matches by prefix and a bare "*" keys every parameter that is not ignored. A
+	// request carrying a parameter that is neither keyed nor ignored is NOT cached:
+	// Sidekick cannot know whether it changes the page. See classifyQuery.
 	CacheKeyQueries []string `json:"cache_key_queries,omitempty"`
-	CacheKeyCookies []string `json:"cache_key_cookies,omitempty"`
+	// CacheIgnoreQueries lists per-click tracking IDs left out of the key, so such a
+	// request shares the page's entry. Nil means the default; no omitempty, for the
+	// same reason as NoCacheQuery.
+	CacheIgnoreQueries []string `json:"cache_ignore_queries"`
+	CacheKeyCookies    []string `json:"cache_key_cookies,omitempty"`
 
 	pathRx           *regexp.Regexp
 	staticAssetRx    *regexp.Regexp
@@ -260,6 +277,22 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				s.NoCache = prefixes
 
+			case "nocache_query":
+				// Same conventions as cache_key_queries: comma-separated or multiple
+				// arguments, and an explicit "" means "no query-based bypass at all".
+				names := strings.Split(value, ",")
+				for d.NextArg() {
+					names = append(names, strings.Split(d.Val(), ",")...)
+				}
+				s.NoCacheQuery = nonEmptyTrimmed(names)
+
+			case "cache_ignore_queries":
+				names := strings.Split(value, ",")
+				for d.NextArg() {
+					names = append(names, strings.Split(d.Val(), ",")...)
+				}
+				s.CacheIgnoreQueries = nonEmptyTrimmed(names)
+
 			case "nocache_regex":
 				value = strings.TrimSpace(value)
 				if len(value) != 0 {
@@ -302,11 +335,7 @@ func (s *Sidekick) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				s.CacheResponseCodes = make([]string, len(codes))
 				for i, code := range codes {
-					code = strings.TrimSpace(code)
-					if strings.Contains(code, "XX") {
-						code = string(code[0])
-					}
-					s.CacheResponseCodes[i] = code
+					s.CacheResponseCodes[i] = normalizeResponseCode(code)
 				}
 
 			case "cache_ttl":
@@ -574,11 +603,25 @@ const (
 	DefaultMemoryCacheMaxSize  = 128 * 1024 * 1024 // 128MB
 	DefaultMemoryCacheMaxCount = 32 * 1024         // 32K items
 	DefaultBypassDebugQuery    = "sidekick-nocache"
-	DefaultPurgePath           = "/__sidekick/purge"
-	DefaultPurgeHeader         = "X-Sidekick-Purge"
-	DefaultPurgeToken          = "dead-beef"
-	CacheHeaderName            = "X-Sidekick-Cache" // Not configurable
-	DefaultNoCacheRegex        = `\.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot|otf|mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe|doc|docx|xls|xlsx|ppt|pptx)$`
+	// DefaultNoCache names WordPress's private application areas. /index.php/wp-json is
+	// the second form of the REST API path, registered unconditionally by core
+	// (rest_api_register_rewrites), and is otherwise cached like any other page.
+	DefaultNoCache = "/wp-admin,/wp-json,/index.php/wp-json"
+	// DefaultNoCacheQuery lists WordPress CORE query parameters whose responses are
+	// specific to the requester: rest_route is the REST API on any path, and
+	// unapproved + moderation-hash show a commenter their own comment while it is held
+	// for moderation. Plugin parameters are deliberately not included.
+	DefaultNoCacheQuery = "rest_route,unapproved,moderation-hash"
+	// Defaults for the remaining list options, named so the value applied when an
+	// option is unset and the base that +/- adjustments apply to are the same.
+	DefaultCacheResponseCodes = "200,404,405"
+	DefaultCacheKeyHeaders    = "Accept-Encoding"
+	DefaultCacheKeyCookies    = "wordpress_logged_in_*,wordpress_sec_*,wp-settings-*"
+	DefaultPurgePath          = "/__sidekick/purge"
+	DefaultPurgeHeader        = "X-Sidekick-Purge"
+	DefaultPurgeToken         = "dead-beef"
+	CacheHeaderName           = "X-Sidekick-Cache" // Not configurable
+	DefaultNoCacheRegex       = `\.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot|otf|mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe|doc|docx|xls|xlsx|ppt|pptx)$`
 	// DefaultStaticAssetRegex is deliberately conservative. It covers the asset
 	// types whose bytes are served straight off disk and cannot vary by cookie,
 	// and it deliberately EXCLUDES pdf/zip/archives/office documents and media
@@ -651,29 +694,36 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 	if s.CacheResponseCodes == nil {
 		codes := os.Getenv("SIDEKICK_CACHE_RESPONSE_CODES")
 		if codes == "" {
-			codes = "200,404,405"
+			codes = DefaultCacheResponseCodes
 		}
 		codeList := strings.Split(codes, ",")
 		s.CacheResponseCodes = make([]string, len(codeList))
 
 		for i, code := range codeList {
-			code = strings.TrimSpace(code)
-			if strings.Contains(code, "XX") {
-				code = string(code[0])
-			}
-			s.CacheResponseCodes[i] = code
+			s.CacheResponseCodes[i] = normalizeResponseCode(code)
 		}
 	}
 
 	if s.NoCache == nil {
 		prefixes := os.Getenv("SIDEKICK_NOCACHE")
 		if prefixes == "" {
-			prefixes = "/wp-admin,/wp-json"
+			prefixes = DefaultNoCache
 		}
 		s.NoCache = strings.Split(strings.TrimSpace(prefixes), ",")
 		for i := range s.NoCache {
 			s.NoCache[i] = strings.TrimSpace(s.NoCache[i])
 		}
+	}
+
+	if s.NoCacheQuery == nil {
+		names := os.Getenv("SIDEKICK_NOCACHE_QUERY")
+		if names == "" {
+			names = DefaultNoCacheQuery
+		}
+		s.NoCacheQuery = nonEmptyTrimmed(strings.Split(names, ","))
+	} else if len(s.NoCacheQuery) == 0 {
+		// Explicitly empty, warn but continue
+		s.logger.Warn("nocache_query is explicitly empty, so ?rest_route= REST API requests will be cached")
 	}
 
 	if s.NoCacheRegex == "" {
@@ -1021,7 +1071,7 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 			}
 		} else {
 			// Set default if not provided
-			s.CacheKeyHeaders = []string{"Accept-Encoding"}
+			s.CacheKeyHeaders = strings.Split(DefaultCacheKeyHeaders, ",")
 			s.logger.Info("Using default cache_key_headers", zap.Strings("headers", s.CacheKeyHeaders))
 		}
 	} else if len(s.CacheKeyHeaders) == 0 {
@@ -1044,12 +1094,20 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 			}
 		} else {
 			// Set default if not provided
-			s.CacheKeyQueries = []string{"p", "page", "paged", "s", "category", "tag", "author"}
+			s.CacheKeyQueries = strings.Split(DefaultCacheKeyQueries, ",")
 			s.logger.Info("Using default cache_key_queries", zap.Strings("queries", s.CacheKeyQueries))
 		}
 	} else if len(s.CacheKeyQueries) == 0 {
 		// Explicitly empty, warn but continue
-		s.logger.Warn("cache_key_queries is explicitly empty, which is not recommended")
+		s.logger.Warn("cache_key_queries is explicitly empty, so any request with a query parameter that is not ignored will bypass the cache")
+	}
+
+	if s.CacheIgnoreQueries == nil {
+		names := os.Getenv("SIDEKICK_CACHE_IGNORE_QUERIES")
+		if names == "" {
+			names = DefaultCacheIgnoreQueries
+		}
+		s.CacheIgnoreQueries = nonEmptyTrimmed(strings.Split(names, ","))
 	}
 
 	if s.CacheKeyCookies == nil {
@@ -1067,12 +1125,38 @@ func (s *Sidekick) Provision(ctx caddy.Context) error {
 			}
 		} else {
 			// Set default if not provided
-			s.CacheKeyCookies = []string{"wordpress_logged_in_*", "wordpress_sec_*", "wp-settings-*"}
+			s.CacheKeyCookies = strings.Split(DefaultCacheKeyCookies, ",")
 			s.logger.Info("Using default cache_key_cookies", zap.Strings("cookies", s.CacheKeyCookies))
 		}
 	} else if len(s.CacheKeyCookies) == 0 {
 		// Explicitly empty, warn but continue
 		s.logger.Warn("cache_key_cookies is explicitly empty, which is not recommended")
+	}
+
+	// Resolve +/- adjustments in list options against the built-in defaults (see
+	// listadjust.go). Plain lists, including the defaults just applied, pass through.
+	codeDefaults := strings.Split(DefaultCacheResponseCodes, ",")
+	for i := range codeDefaults {
+		codeDefaults[i] = normalizeResponseCode(codeDefaults[i])
+	}
+	for _, opt := range []struct {
+		name   string
+		values *[]string
+		def    []string
+	}{
+		{"nocache", &s.NoCache, strings.Split(DefaultNoCache, ",")},
+		{"nocache_query", &s.NoCacheQuery, strings.Split(DefaultNoCacheQuery, ",")},
+		{"cache_key_queries", &s.CacheKeyQueries, strings.Split(DefaultCacheKeyQueries, ",")},
+		{"cache_ignore_queries", &s.CacheIgnoreQueries, strings.Split(DefaultCacheIgnoreQueries, ",")},
+		{"cache_key_headers", &s.CacheKeyHeaders, strings.Split(DefaultCacheKeyHeaders, ",")},
+		{"cache_key_cookies", &s.CacheKeyCookies, strings.Split(DefaultCacheKeyCookies, ",")},
+		{"cache_response_codes", &s.CacheResponseCodes, codeDefaults},
+	} {
+		resolved, err := resolveListAdjustments(opt.name, *opt.values, opt.def)
+		if err != nil {
+			return err
+		}
+		*opt.values = resolved
 	}
 
 	// Convert size values for storage initialization
@@ -1261,19 +1345,16 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		return next.ServeHTTP(w, r)
 	}
 
+	// Classify the query once: the bypass decision and the cache key both come from it.
+	qc := s.classifyQuery(r.URL.RawQuery)
+
 	// Check bypass conditions
-	reason := s.shouldBypass(r)
+	reason := s.bypassReasonFor(r, qc)
 
 	hdr := w.Header()
 	if reason != bypassNone {
-		// Wrapped so the cache headers are applied AFTER the upstream handler has
-		// written its own — see bypassResponseWriter.
-		bw := newBypassResponseWriter(w, s, s.computeKeyDims(r), bypassState(reason))
-		metrics.RecordCacheOperation("bypass", "true", "default")
-		err := next.ServeHTTP(bw, r)
-		bw.applyHeaders() // handlers that wrote nothing still get the headers
-		metrics.RecordResponseTime("bypass", "default", time.Since(startTime))
-		return err
+		return s.serveBypass(w, r, next, s.computeKeyDims(r), bypassState(reason),
+			bypassMetricReason(reason), startTime)
 	}
 
 	// Check for conditional requests (If-None-Match, If-Modified-Since)
@@ -1281,7 +1362,7 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	modifiedSince := r.Header.Get("If-Modified-Since")
 
 	// Build cache key with configurable components
-	cacheKey, keyDimensions := s.buildCacheKey(r)
+	cacheKey, keyDimensions := s.buildCacheKeyFor(r, qc)
 
 	// Parse Accept-Encoding header
 	requestEncoding := strings.Split(strings.Join(reqHdr["Accept-Encoding"], ","), ",")
@@ -1459,6 +1540,14 @@ func (s *Sidekick) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 
 	s.logger.Debug("sidekick - cache miss - "+cacheKey, zap.Error(err))
 
+	// A click-ID value outside the safe character set may be served the page's entry
+	// (above) but must never fill it: the page is rendered with that value visible to
+	// PHP, and the entry is shared with every visitor to the page.
+	if qc.ReadOnly {
+		s.logger.Debug("sidekick - read-only miss", zap.String("param", qc.Param))
+		return s.serveBypass(w, r, next, keyDimensions, cacheStateBypassQuery, "query_readonly", startTime)
+	}
+
 	// Register (or join) the in-flight fetch for this key.
 	fill, isLeader := s.syncHandler.acquireFill(cacheKey)
 
@@ -1565,7 +1654,7 @@ func (s *Sidekick) awaitFill(w http.ResponseWriter, r *http.Request, next caddyh
 	bw := newBypassResponseWriter(w, s, dims, cacheStateBypassPolicy)
 	metrics.RecordRangeOperation("collapse_fallback")
 	err := next.ServeHTTP(bw, r)
-	bw.applyHeaders()
+	bw.applyHeaders(http.StatusOK)
 	metrics.RecordResponseTime("bypass", "default", time.Since(startTime))
 	return err
 }
@@ -1808,16 +1897,39 @@ func (s *Sidekick) handlePurgeRequest(w http.ResponseWriter, r *http.Request, st
 // store this" are different statements, and collapsing them is what made every
 // bypassed response no-store regardless of whether it was actually private.
 func (s *Sidekick) shouldBypass(r *http.Request) bypassReason {
+	return s.bypassReasonFor(r, s.classifyQuery(r.URL.RawQuery))
+}
+
+// bypassReasonFor is shouldBypass for a query that has already been classified, so
+// ServeHTTP parses the query once and keys and bypasses from the same queryClass.
+func (s *Sidekick) bypassReasonFor(r *http.Request, qc queryClass) bypassReason {
 	// Check debug query parameter
 	if s.bypassDebugQuery != "" && r.URL.Query().Has(s.bypassDebugQuery) {
 		return bypassDebug
+	}
+
+	// Check query parameters that make a request PRIVATE, before every policy rule:
+	// nocache_query (WordPress serves the REST API at ANY path when ?rest_route= is
+	// present, and the response is whatever that route returns, not the page the path
+	// names; a path prefix such as /wp-json can never see this form), and queries Go
+	// and PHP would read differently.
+	if qc.Reason == bypassPrivate {
+		s.logger.Debug("sidekick - bypass query", zap.String("param", qc.Param))
+		return bypassPrivate
+	}
+
+	// RFC 9111 §3.5: a shared cache must not reuse a response to an authenticated
+	// request. The key does not include Authorization, so storing one would hand an
+	// authenticated response to anyone requesting the same URL.
+	if r.Header.Get("Authorization") != "" {
+		return bypassPrivate
 	}
 
 	// Check path prefixes. These are treated as PRIVATE: the prefix list names
 	// application areas (/wp-admin, /wp-json, /sitepro) whose responses are
 	// user-specific, not merely inconvenient to cache.
 	for _, prefix := range s.NoCache {
-		if prefix != "" && strings.HasPrefix(r.URL.Path, prefix) {
+		if prefix != "" && matchesNoCachePrefix(r.URL.Path, prefix) {
 			s.logger.Debug("sidekick - bypass prefix", zap.String("prefix", prefix))
 			return bypassPrivate
 		}
@@ -1839,7 +1951,7 @@ func (s *Sidekick) shouldBypass(r *http.Request) bypassReason {
 		return bypassPolicy
 	}
 
-	// Check WordPress login cookie.
+	// Check WordPress per-visitor cookies (privateCookiePrefixes).
 	//
 	// Static assets are exempt. WordPress scopes wordpress_logged_in_<hash> to "/"
 	// (wp-includes/pluggable.php, COOKIEPATH), so a logged-in visitor sends it with
@@ -1853,13 +1965,120 @@ func (s *Sidekick) shouldBypass(r *http.Request) bypassReason {
 	if !s.isStaticAsset(r.URL.Path) {
 		cookies := r.Cookies()
 		for _, cookie := range cookies {
-			if strings.HasPrefix(cookie.Name, "wordpress_logged_in") {
-				return bypassPrivate
+			for _, prefix := range privateCookiePrefixes {
+				if strings.HasPrefix(cookie.Name, prefix) {
+					return bypassPrivate
+				}
 			}
 		}
 	}
 
+	// An unkeyed query parameter. Last on purpose: it advertises the response as
+	// cacheable downstream, so every private rule above must have had its say first.
+	if qc.Reason == bypassQuery {
+		s.logger.Debug("sidekick - bypass unkeyed query parameter", zap.String("param", qc.Param))
+		return bypassQuery
+	}
+
 	return bypassNone
+}
+
+// privateCookiePrefixes name WordPress core cookies that make a page specific to the
+// visitor carrying them:
+//
+//   - wordpress_logged_in_<hash>: a logged-in user.
+//   - comment_author_<hash>, comment_author_email_<hash>, comment_author_url_<hash>: a
+//     commenter who ticked "Save my name, email…". WordPress renders that visitor's
+//     own comments that are still held for moderation into the page
+//     (wp_get_unapproved_comment_author_email falls back to these cookies), so their
+//     view of the page is theirs alone.
+var privateCookiePrefixes = []string{"wordpress_logged_in", "comment_author_"}
+
+// noCacheQueryNames returns the configured nocache_query names. Nil means the module
+// was constructed without Provision (as in unit tests); the safe answer there is the
+// default, not "nothing", because these are private responses.
+func (s *Sidekick) noCacheQueryNames() []string {
+	if s.NoCacheQuery == nil {
+		return strings.Split(DefaultNoCacheQuery, ",")
+	}
+	return s.NoCacheQuery
+}
+
+// matchNoCacheQuery reports whether the query string carries a nocache_query parameter,
+// comparing against the names PHP will register rather than Go's parse, so that
+// "?rest.route=/" or "?rest_route[]=/" cannot slip past as something else.
+func (s *Sidekick) matchNoCacheQuery(rawQuery string) (string, bool) {
+	if rawQuery == "" {
+		return "", false
+	}
+	names := s.noCacheQueryNames()
+	if len(names) == 0 {
+		return "", false
+	}
+	for _, got := range phpQueryNames(rawQuery) {
+		for _, want := range names {
+			if prefix, ok := strings.CutSuffix(want, "*"); ok {
+				if strings.HasPrefix(got, prefix) {
+					return got, true
+				}
+			} else if got == want {
+				return got, true
+			}
+		}
+	}
+	return "", false
+}
+
+// matchesNoCachePrefix reports whether path falls under a nocache prefix, either at the
+// site root or beneath one leading subsite segment.
+//
+// The second form exists for WordPress subdirectory multisite, where every subsite's
+// system paths live under its own path (/<site>/wp-admin, /<site>/wp-json, ...).
+// WordPress itself routes these by stripping one optional leading segment matching
+// ([_0-9a-zA-Z-]+/)? (wp-admin/includes/network.php), and this mirrors that rule
+// exactly. On a single site the only effect is that a path such as /news/wp-admin
+// also bypasses, which can cost a cache hit but never serves wrong content.
+func matchesNoCachePrefix(path, prefix string) bool {
+	if strings.HasPrefix(path, prefix) {
+		return true
+	}
+	if !strings.HasPrefix(prefix, "/") || len(path) < 2 || path[0] != '/' {
+		return false
+	}
+	end := strings.IndexByte(path[1:], '/')
+	if end <= 0 || !isWPSiteSegment(path[1:1+end]) {
+		return false
+	}
+	return strings.HasPrefix(path[1+end:], prefix)
+}
+
+// isWPSiteSegment reports whether seg is a valid subdirectory-multisite site path
+// segment under WordPress's own rewrite rule, [_0-9a-zA-Z-]+.
+func isWPSiteSegment(seg string) bool {
+	if seg == "" {
+		return false
+	}
+	for i := 0; i < len(seg); i++ {
+		switch c := seg[i]; {
+		case c == '_', c == '-', '0' <= c && c <= '9', 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// nonEmptyTrimmed trims every entry and drops empty ones. It returns a non-nil empty
+// slice when nothing remains, because a nil list means "not configured, use the
+// default" while an empty one means "explicitly none".
+func nonEmptyTrimmed(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // getTotalMemory returns the total system memory in bytes
@@ -2035,8 +2254,20 @@ func (s *Sidekick) computeKeyDims(r *http.Request) keyDims {
 // the dimensions that varied the key, which the caller MUST pass to
 // applyDownstreamCacheHeaders so a cookie-varied response is never marked shareable.
 func (s *Sidekick) buildCacheKey(r *http.Request) (string, keyDims) {
+	return s.buildCacheKeyFor(r, s.classifyQuery(r.URL.RawQuery))
+}
+
+// buildCacheKeyFor is buildCacheKey for a query that has already been classified.
+//
+// Every component is written length-prefixed. Writing them back to back made the
+// boundaries ambiguous: path "/ab=1" hashed like "/a" with query "b=1", and a path
+// ending in "Accept-Encoding:gzip" like the bare path with that header.
+func (s *Sidekick) buildCacheKeyFor(r *http.Request, qc queryClass) (string, keyDims) {
 	dims := s.computeKeyDims(r)
 	h := md5.New()
+	field := func(v string) {
+		_, _ = fmt.Fprintf(h, "%d:%s", len(v), v)
+	}
 
 	// Always include hostname to prevent cross-domain cache pollution.
 	// In multi-domain setups (e.g., WordPress Multisite with a catch-all
@@ -2044,27 +2275,13 @@ func (s *Sidekick) buildCacheKey(r *http.Request) (string, keyDims) {
 	// separate cache entries. Note: r.Host is used instead of
 	// r.Header.Get("Host") because Go's net/http promotes the Host header
 	// to r.Host and removes it from the header map.
-	if r.Host != "" {
-		h.Write([]byte(r.Host))
-	}
+	field(r.Host)
 
 	// Always include path
-	h.Write([]byte(r.URL.Path))
+	field(r.URL.Path)
 
-	// Include configured query parameters
-	if len(s.CacheKeyQueries) > 0 {
-		query := r.URL.Query()
-		for _, q := range s.CacheKeyQueries {
-			if q == "*" {
-				// Include all query parameters
-				h.Write([]byte(query.Encode()))
-				break
-			}
-			if val := query.Get(q); val != "" {
-				h.Write([]byte(q + "=" + val))
-			}
-		}
-	}
+	// The keyed query parameters, canonically encoded (see classifyQuery).
+	field(qc.Canonical)
 
 	// Include configured headers.
 	// Special case: Go's net/http promotes the Host header to r.Host and
@@ -2078,7 +2295,8 @@ func (s *Sidekick) buildCacheKey(r *http.Request) (string, keyDims) {
 			val = r.Header.Get(hdr)
 		}
 		if val != "" {
-			h.Write([]byte(hdr + ":" + val))
+			field(hdr)
+			field(val)
 		}
 	}
 
@@ -2093,19 +2311,51 @@ func (s *Sidekick) buildCacheKey(r *http.Request) (string, keyDims) {
 				prefix := strings.TrimSuffix(cookiePattern, "*")
 				for _, cookie := range r.Cookies() {
 					if strings.HasPrefix(cookie.Name, prefix) {
-						h.Write([]byte(cookie.Name + "=" + cookie.Value))
+						field(cookie.Name)
+						field(cookie.Value)
 					}
 				}
 			} else {
 				// Exact match
 				if cookie, err := r.Cookie(cookiePattern); err == nil {
-					h.Write([]byte(cookiePattern + "=" + cookie.Value))
+					field(cookiePattern)
+					field(cookie.Value)
 				}
 			}
 		}
 	}
 
 	return fmt.Sprintf("%x", h.Sum(nil)), dims
+}
+
+// serveBypass passes a request to the upstream without touching the cache. The writer
+// is wrapped so cache headers are applied AFTER the upstream handler has written its
+// own — see bypassResponseWriter.
+func (s *Sidekick) serveBypass(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler,
+	dims keyDims, state cacheState, metricReason string, startTime time.Time) error {
+	metrics := GetMetrics()
+	bw := newBypassResponseWriter(w, s, dims, state)
+	metrics.RecordCacheOperation("bypass", "true", "default")
+	metrics.RecordBypassReason(metricReason)
+	err := next.ServeHTTP(bw, r)
+	bw.applyHeaders(http.StatusOK) // handlers that wrote nothing still get the headers
+	metrics.RecordResponseTime("bypass", "default", time.Since(startTime))
+	return err
+}
+
+// bypassMetricReason is the bounded label for the bypass counter. Never a parameter
+// name: those are request-controlled and would explode the metric's cardinality.
+func bypassMetricReason(reason bypassReason) string {
+	switch reason {
+	case bypassPolicy:
+		return "policy"
+	case bypassDebug:
+		return "debug"
+	case bypassQuery:
+		return "query"
+	default:
+		return "private"
+	}
 }
 
 // shouldReturn304 checks if we should return a 304 Not Modified response
@@ -2314,6 +2564,12 @@ const (
 	bypassPolicy
 	// bypassDebug: a diagnostic request, which must not pollute any cache.
 	bypassDebug
+	// bypassQuery: the query carries a parameter that is neither keyed nor ignored.
+	// Sidekick cannot know whether it changes the page, so it does not store the
+	// response; the content itself is ordinary public content, and downstream it is
+	// as cacheable as a MISS (cacheStateBypassQuery). Evaluated after every private
+	// rule, so a request that reaches it carries no private cookie or credentials.
+	bypassQuery
 )
 
 // cacheState identifies which path produced a response, for the purpose of
@@ -2327,6 +2583,10 @@ const (
 	cacheStateMiss
 	cacheStateHit
 	cacheStateNotModified
+	// cacheStateBypassQuery: not stored because of an unkeyed query parameter (or a
+	// click-ID value that may not fill the cache). Gets the headers a MISS would, as
+	// long as the response is one Sidekick would have stored; see bypassResponseWriter.
+	cacheStateBypassQuery
 )
 
 // bypassState maps a bypass reason onto the cache state used for header selection.
@@ -2336,6 +2596,8 @@ func bypassState(reason bypassReason) cacheState {
 		return cacheStateBypassPolicy
 	case bypassDebug:
 		return cacheStateBypassDebug
+	case bypassQuery:
+		return cacheStateBypassQuery
 	default:
 		// bypassPrivate, and anything unrecognized, take the safe branch.
 		return cacheStateBypassPrivate
@@ -2424,7 +2686,41 @@ func (s *Sidekick) applyDownstreamCacheHeaders(hdr http.Header, dims keyDims, st
 		// was discarded everywhere, so CloudFront re-fetched the same object from
 		// origin forever. Emitting the same headers a HIT would makes the two
 		// indistinguishable to an intermediary, which is the correct contract.
+		//
+		// Except when it sets a cookie: a shared cache may store the Set-Cookie and
+		// replay it to other visitors (a session cookie, a shared cart). Sidekick
+		// stores the body WITHOUT the cookie, so the HITs that follow are public;
+		// only this one response is kept out of shared caches.
+		if len(hdr.Values("Set-Cookie")) > 0 {
+			hdr.Set("Cache-Control", "private, no-store")
+			hdr.Del("Age")
+			return
+		}
 		if s.CacheTTL <= 0 {
+			return
+		}
+		hdr.Set("Cache-Control", fmt.Sprintf("public, max-age=%d", s.CacheTTL))
+		hdr.Set("Age", "0")
+
+	case cacheStateBypassQuery:
+		// Not stored only because of the query (classifyQuery). The bypass writer
+		// downgrades a response Sidekick would never have stored (status, deny-listed
+		// headers) to cacheStateBypassPolicy, so what reaches here is a response that
+		// would have been a cacheable MISS — and it gets a MISS's headers. Leaving the
+		// origin's silence alone instead let CloudFront apply its own default TTL
+		// (an hour, or a day under /wp-content/) to dynamic pages.
+		if hdr.Get("Cache-Control") != "" || hdr.Get("Expires") != "" {
+			// The origin spoke; its directives stand (including private/no-store).
+			hdr.Del("Age")
+			return
+		}
+		if len(hdr.Values("Set-Cookie")) > 0 {
+			hdr.Set("Cache-Control", "private, no-store")
+			hdr.Del("Age")
+			return
+		}
+		if s.CacheTTL <= 0 {
+			hdr.Del("Age")
 			return
 		}
 		hdr.Set("Cache-Control", fmt.Sprintf("public, max-age=%d", s.CacheTTL))

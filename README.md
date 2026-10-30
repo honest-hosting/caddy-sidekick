@@ -41,8 +41,9 @@ All environment variables use the `SIDEKICK_` prefix for namespace isolation:
 | `SIDEKICK_CACHE_DIR` | Cache storage directory | `/var/www/html/wp-content/cache` |
 | `SIDEKICK_METRICS` | Enable metrics and set admin API path (e.g., `/metrics/sidekick`) | _(disabled)_ |
 | `SIDEKICK_CACHE_RESPONSE_CODES` | HTTP status codes to cache (comma-separated) | `2XX,301,302` |
-| `SIDEKICK_NOCACHE` | Path prefixes to bypass cache (comma-separated, uses prefix matching) | `/wp-admin,/wp-json` |
-| `SIDEKICK_NOCACHE_HOME` | Skip caching home page | `false` |
+| `SIDEKICK_NOCACHE` | Path prefixes to bypass cache (comma-separated, uses prefix matching; see [NoCache Path Matching](#nocache-path-matching)) | `/wp-admin,/wp-json,/index.php/wp-json` |
+| `SIDEKICK_NOCACHE_QUERY` | Query parameter names whose presence bypasses cache as private (comma-separated; see [Query Parameter Bypass](#query-parameter-bypass)) | `rest_route,unapproved,moderation-hash` |
+| `SIDEKICK_NOCACHE_HOME` | Skip caching home page (the site root `/` only) | `false` |
 | `SIDEKICK_NOCACHE_REGEX` | Regex pattern for paths to bypass | `\.(jpg\|jpeg\|png\|gif\|ico\|css\|js\|svg\|woff\|woff2\|ttf\|eot\|otf\|mp4\|webm\|mp3\|ogg\|wav\|pdf\|zip\|tar\|gz\|7z\|exe\|doc\|docx\|xls\|xlsx\|ppt\|pptx)$` |
 | `SIDEKICK_CACHE_TTL` | Cache time-to-live in seconds | `300` |
 | `SIDEKICK_PURGE_HEADER` | HTTP header name for purge token | `X-Sidekick-Purge` |
@@ -59,7 +60,8 @@ All environment variables use the `SIDEKICK_` prefix for namespace isolation:
 | `SIDEKICK_CACHE_DISK_MAX_PERCENT` | Disk cache as % of available space (1-100, `0` = disabled, `-1` = unlimited). Mutually exclusive with `SIDEKICK_CACHE_DISK_MAX_SIZE` | _(none)_ |
 | `SIDEKICK_CACHE_DISK_MAX_COUNT` | Max number of items in disk cache (`-1` = unlimited, `0` = disabled) | `100000` |
 | `SIDEKICK_CACHE_KEY_HEADERS` | Headers to include in cache key (comma-separated) | `Accept-Encoding` |
-| `SIDEKICK_CACHE_KEY_QUERIES` | Query parameters to include in cache key (comma-separated, use `*` for all) | `p,page,paged,s,category,tag,author` |
+| `SIDEKICK_CACHE_KEY_QUERIES` | Query parameters that vary the cache key (comma-separated; trailing `*` for a prefix, bare `*` for all). A request with a parameter that is neither keyed nor ignored is **not cached**; see [Query Parameters](#query-parameters) | WordPress core query vars, `ver`, `v`, `utm_*`, `gad_*`, `mc_cid` |
+| `SIDEKICK_CACHE_IGNORE_QUERIES` | Per-click tracking IDs left out of the cache key (comma-separated) | `gclid`, `fbclid`, `msclkid`, … (see [Query Parameters](#query-parameters)) |
 | `SIDEKICK_CACHE_KEY_COOKIES` | Cookies to include in cache key (comma-separated, supports wildcards with `*`) | `wordpress_logged_in_*,wordpress_sec_*,wp-settings-*` |
 | `SIDEKICK_WP_MU_PLUGIN_ENABLED` | Enable automatic WordPress mu-plugin management | `true` |
 | `SIDEKICK_WP_MU_PLUGIN_DIR` | Directory for WordPress mu-plugins | `/var/www/html/wp-content/mu-plugins` |
@@ -133,7 +135,11 @@ example.com {
         cache_response_codes 200 301 302
         
         # Paths to bypass cache (uses prefix matching, so /wp-admin matches /wp-admin/*)
-        nocache /wp-admin /wp-json /wp-login.php
+        nocache /wp-admin /wp-json /index.php/wp-json /wp-login.php
+        
+        # Query parameters that bypass cache on ANY path (default shown). rest_route is
+        # WordPress's REST API on every path; see "Query Parameter Bypass" below.
+        nocache_query rest_route unapproved moderation-hash
         
         # Don't cache home page (optional)
         nocache_home false
@@ -193,7 +199,8 @@ example.com {
         
         # Cache key customization (defaults shown below if omitted)
         # Note: Set to "" (empty string) to disable, but this is not recommended
-        cache_key_queries page sort filter     # Default: p,page,paged,s,category,tag,author
+        cache_key_queries page sort filter_*   # Default: WordPress core query vars, ver, v, utm_*, gad_*, mc_cid
+        cache_ignore_queries gclid fbclid       # Default: per-click tracking IDs (see "Query Parameters")
         cache_key_headers Accept-Language      # Default: Accept-Encoding
         cache_key_cookies session_id user_*    # Default: wordpress_logged_in_*,wordpress_sec_*,wp-settings-*
                                                 # Supports wildcards with * for prefix matching
@@ -273,7 +280,8 @@ example.com {
                           "cache_dir": "/var/www/cache",
                           "cache_ttl": 3600,
                           "cache_response_codes": ["200", "301", "302"],
-                          "nocache": ["/wp-admin", "/wp-json", "/wp-login.php"],
+                          "nocache": ["/wp-admin", "/wp-json", "/index.php/wp-json", "/wp-login.php"],
+                          "nocache_query": ["rest_route", "unapproved", "moderation-hash"],
                           "nocache_home": false,
                           "nocache_regex": "\\.(mp4|webm|mp3|ogg|wav|pdf|zip|tar|gz|7z|exe)$",
                           "purge_path": "/__sidekick/purge",
@@ -428,6 +436,9 @@ curl -X POST https://example.com/__sidekick/purge \
 Sidekick automatically manages WordPress must-use plugins when `wp_mu_plugin_enabled` is set to `true` (default). These plugins provide:
 
 1. **Content Cache Purge**: Automatically purges cache when posts are updated
+   - Sends its path list as a form-encoded body, which the purge API (JSON only) treats
+     as an empty request, so a content change **flushes the whole cache**. That is what
+     keeps the home listing, widgets and archives fresh after an edit.
    - Uses `SIDEKICK_PURGE_URL` if set to send purge requests to a custom URL (e.g., `https://api.example.com`)
    - Falls back to WordPress `get_site_url()` if `SIDEKICK_PURGE_URL` is not set
    - Constructs the full purge URL as `{SIDEKICK_PURGE_URL}{SIDEKICK_PURGE_PATH}` or `{get_site_url()}{SIDEKICK_PURGE_PATH}`
@@ -457,7 +468,7 @@ SIDEKICK_WP_MU_PLUGIN_ENABLED=false
 
 By default, Sidekick includes the following in cache keys:
 
-- **Query Parameters**: `p`, `page`, `paged`, `s`, `category`, `tag`, `author` (common WordPress parameters)
+- **Query Parameters**: WordPress core's public query vars, asset versions and campaign labels (see [Query Parameters](#query-parameters))
 - **Headers**: `Host` (to prevent cache pollution/poisoning), `Accept-Encoding` (to vary cache by compression support)
 - **Cookies**: `wordpress_logged_in_*`, `wordpress_sec_*`, `wp-settings-*` (WordPress session cookies, with wildcard support)
 
@@ -479,6 +490,66 @@ sidekick {
 ```
 
 **Important**: Setting any of these to an empty string (`""`) will disable that component entirely, which is not recommended as it may cause cache pollution. If you see warnings about empty cache key options, consider if you really want to disable them.
+
+### Query Parameters
+
+Every query parameter on a request falls into exactly one class. Names are compared the
+way PHP registers them (see [Query Parameter Bypass](#query-parameter-bypass)).
+
+| Class | Option | Effect |
+|---|---|---|
+| Private | `nocache_query` | Bypass the cache, `private, no-store` |
+| Keyed | `cache_key_queries` | Part of the cache key, every value — each distinct value gets its own entry |
+| Ignored | `cache_ignore_queries` | Left out of the key, so the request shares the page's entry |
+| Anything else | — | **Not cached.** Sidekick cannot know whether the parameter changes the page, so it passes the request to the origin without storing the response |
+
+**Keyed by default** — keying is always safe; its only cost is more cache entries:
+
+- every public query var WordPress core registers (`p`, `page_id`, `cat`, `s`, `paged`,
+  `m`, `feed`, `orderby`, `post_type`, … and the sitemap vars), so sites on plain
+  permalinks keep caching;
+- `category`, the one historical default that is not a core var;
+- `ver` and `v`, the asset version parameters WordPress and themes append;
+- campaign labels: `utm_*`, `gad_*`, `mc_cid` (a handful of values per campaign).
+
+**Ignored by default** — per-click and per-recipient tracking IDs, unique on nearly every
+request, so keying them would make every ad or email click a cache miss: `gclid`,
+`gbraid`, `wbraid`, `dclid`, `fbclid`, `msclkid`, `ttclid`, `twclid`, `li_fat_id`,
+`igshid`, `yclid`, `srsltid`, `_gl`, `_ga`, `mc_eid`, `_kx`, `_hsenc`, `_hsmi`,
+`mkt_tok`. A request whose ID value contains anything outside `A–Z a–z 0–9 . _ ~ * = -`
+(or is longer than 512 characters) may be served the page's cached entry but never
+fills it.
+
+Plugin parameters (WooCommerce filters, `lang`, `amp`, …) are deliberately in neither
+list. Key one with `cache_key_queries` when its pages should be cached; the
+`caddy_sidekick_bypass_total{reason="query"}` metric shows how often unkeyed parameters
+bypass. If a parameter is in both lists, keyed wins. `cache_key_queries *` keys every
+parameter that is not ignored.
+
+Every key component (host, path, query, headers, cookies) is length-prefixed before
+hashing, so one component can never be mistaken for another.
+
+### List Adjustments (`+` / `-`)
+
+Every list option — `nocache`, `nocache_query`, `cache_key_queries`,
+`cache_ignore_queries`, `cache_key_headers`, `cache_key_cookies`,
+`cache_response_codes` — accepts either a plain list, which replaces the built-in
+default, or **adjustments** to that default:
+
+```caddyfile
+sidekick {
+    cache_key_queries +filter_color -utm_*
+    cache_ignore_queries +_branch_match_id
+    nocache +/members
+}
+```
+
+`+x` adds `x` if it is not already present and `-x` removes it, applied left to right.
+Adjustments keep a configuration current as the defaults change in later releases,
+where a copied plain list would freeze them. The same syntax works in environment
+variables (`SIDEKICK_CACHE_KEY_QUERIES=+filter_color`) and JSON config. A value that
+mixes adjustments and plain entries is a configuration error. Removing every entry
+leaves the option explicitly empty.
 
 ### Cookie Wildcard Matching
 
@@ -565,8 +636,9 @@ entitled to keep, so the same object was re-fetched from origin forever.
 | Situation | Emitted |
 |---|---|
 | HIT / 304 | `public, max-age=<remaining ttl>` + `Age` |
-| MISS | `public, max-age=<ttl>` + `Age: 0` — a MISS is as cacheable as a HIT, it just was not in the cache yet |
-| Bypass: `nocache` prefixes, WordPress login cookie | `private, no-store` |
+| MISS | `public, max-age=<ttl>` + `Age: 0` — a MISS is as cacheable as a HIT, it just was not in the cache yet. A MISS that sets a cookie is `private, no-store` (the stored entry carries no cookie, so later HITs are public) |
+| Bypass: unkeyed query parameter | Same as a MISS when the origin sends no `Cache-Control`/`Expires` and the response is one Sidekick would have stored; otherwise the origin's own headers |
+| Bypass: `nocache` prefixes, `nocache_query` parameters, `Authorization` header, WordPress login or comment-author cookie | `private, no-store` |
 | Bypass: `nocache_regex`, `nocache_home`, uncacheable response | origin's own `Cache-Control`, untouched |
 | Bypass: debug query | `no-cache, no-store, must-revalidate` |
 | **Any** cookie-varied request | `private, no-store` — overrides everything above |
@@ -641,6 +713,61 @@ sidekick {
 ```
 
 This makes it easy to exclude entire sections of your site from caching without listing every possible path.
+
+### WordPress Multisite
+
+Each `nocache` prefix also matches beneath **one** leading site segment, so on a
+subdirectory multisite `/wp-admin` covers `/blog/wp-admin/...` and `/wp-json` covers
+`/blog/wp-json/...`. This mirrors WordPress's own multisite rewrite, which routes a
+subsite's system paths by stripping one optional `[_0-9a-zA-Z-]+/` segment. It is always
+on. On a single site the only effect is that a path such as `/news/wp-admin` also
+bypasses — that can cost a cache hit, but it never serves the wrong content.
+
+Subdomain and domain-mapped multisite need nothing extra: the host is part of the cache
+key.
+
+`nocache_home` applies to the site root `/` only. On a subdirectory multisite a subsite's
+home (`/blog/`) cannot be told apart from a top-level page without the network's site
+list, so it is cached normally.
+
+## Query Parameter Bypass
+
+WordPress serves its REST API on **any** path when `?rest_route=` is present
+(`/index.php?rest_route=/wp/v2/posts`, `/?rest_route=/`), and that is the URL form
+`get_rest_url()` produces on sites without pretty permalinks. A path prefix such as
+`/wp-json` can never see it, so a query-based rule is needed to keep REST responses out
+of the cache.
+
+`nocache_query` lists parameter names whose presence makes a request bypass the cache as
+**private** (`private, no-store`), on any path:
+
+```caddyfile
+sidekick {
+    # Default. Add your own; a trailing * matches by prefix.
+    nocache_query rest_route unapproved moderation-hash
+}
+```
+
+| Default | Why |
+|---|---|
+| `rest_route` | The WordPress REST API, on any path |
+| `unapproved`, `moderation-hash` | WordPress shows a commenter their own comment while it is held for moderation; that view is specific to them |
+
+The defaults are WordPress core parameters only. Names are compared the way PHP
+registers them, not as Go parses them, so `rest.route`, `rest+route`, `rest[route` and
+`rest_route[]` all count as `rest_route` — exactly as WordPress would see them.
+
+Private wins over policy: a request matching `nocache_query` is private even where
+`nocache_home` or `nocache_regex` also matches. An explicitly empty value
+(`nocache_query ""`) disables query-based bypass entirely.
+
+### Other requests that always bypass as private
+
+- **`Authorization` header.** RFC 9111 §3.5: a shared cache must not reuse a response to
+  an authenticated request, and the cache key does not include the credentials.
+- **WordPress comment-author cookies** (`comment_author_*`). Set when a commenter ticks
+  "Save my name, email…"; WordPress then renders that visitor's own held comments into
+  the page. Static assets are exempt, as for the login cookie.
 
 ## Size Configuration Guidelines
 

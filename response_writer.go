@@ -67,26 +67,40 @@ func newBypassResponseWriter(w http.ResponseWriter, s *Sidekick, dims keyDims, s
 	return &bypassResponseWriter{ResponseWriter: w, sidekick: s, dims: dims, state: state}
 }
 
-// applyHeaders stamps the cache headers exactly once. Safe to call after the handler
-// returns, for handlers that never wrote anything.
-func (w *bypassResponseWriter) applyHeaders() {
+// applyHeaders stamps the cache headers exactly once, for the final response status.
+// Safe to call after the handler returns, for handlers that never wrote anything.
+func (w *bypassResponseWriter) applyHeaders(status int) {
 	if w.applied {
 		return
 	}
 	w.applied = true
 
 	hdr := w.Header()
+	state := w.state
+	// A query bypass advertises the response as a MISS would, which is only true of
+	// a response Sidekick would actually have stored. Anything else (an error status,
+	// a 206, a rate-limit response) keeps the origin's headers, as any policy bypass.
+	if state == cacheStateBypassQuery &&
+		(!isCacheableStatus(w.sidekick.CacheResponseCodes, status) || hasUncacheableHeader(hdr)) {
+		state = cacheStateBypassPolicy
+	}
+
 	hdr.Set(CacheHeaderName, "BYPASS")
-	w.sidekick.applyDownstreamCacheHeaders(hdr, w.dims, w.state, nil)
+	w.sidekick.applyDownstreamCacheHeaders(hdr, w.dims, state, nil)
 }
 
 func (w *bypassResponseWriter) WriteHeader(status int) {
-	w.applyHeaders()
+	// 1xx responses (103 Early Hints) are not the final response; decide on the real one.
+	if status >= 100 && status < 200 {
+		w.ResponseWriter.WriteHeader(status)
+		return
+	}
+	w.applyHeaders(status)
 	w.ResponseWriter.WriteHeader(status)
 }
 
 func (w *bypassResponseWriter) Write(b []byte) (int, error) {
-	w.applyHeaders()
+	w.applyHeaders(http.StatusOK)
 	return w.ResponseWriter.Write(b)
 }
 
@@ -256,40 +270,15 @@ func (r *ResponseWriter) WriteHeader(status int) {
 	atomic.StoreInt32(&r.status, int32(status))
 
 	r.Debug("Writing response", zap.String("path", r.origUrl.Path))
-	bypass := true
 
 	// check if the response code is in the cache response codes
-	if bypass {
-		statusStr := strconv.Itoa(status)
-		for _, code := range r.cacheResponseCodes {
-			r.Debug("Checking status code", zap.String("code", code), zap.String("status", statusStr))
-
-			if code == statusStr {
-				r.Debug("Caching because of status code", zap.String("code", code), zap.String("status", statusStr))
-				bypass = false
-				break
-			}
-
-			// code may be single digit because of wildcard usage (e.g. 2XX, 4XX, 5XX)
-			if len(code) == 1 {
-				if code == statusStr[0:1] {
-					r.Debug("Caching because of wildcard", zap.String("code", code), zap.String("status", statusStr))
-					bypass = false
-					break
-				}
-			}
-		}
-	}
+	bypass := !isCacheableStatus(r.cacheResponseCodes, status)
 
 	hdr := r.Header()
 
 	// check if response should not be cached
-	for h := range hdr {
-		ok := slices.Contains(hdrResNotCacheList, h)
-		if ok {
-			bypass = true
-			break
-		}
+	if hasUncacheableHeader(hdr) {
+		bypass = true
 	}
 
 	// Check Content-Length if available
@@ -597,4 +586,27 @@ func (r *ResponseWriter) Push(target string, opts *http.PushOptions) error {
 		return pusher.Push(target, opts)
 	}
 	return fmt.Errorf("push not supported")
+}
+
+// isCacheableStatus reports whether status is in cache_response_codes. An entry may be a
+// single digit, which is how a "2XX"-style wildcard is stored after config parsing.
+func isCacheableStatus(codes []string, status int) bool {
+	statusStr := strconv.Itoa(status)
+	for _, code := range codes {
+		if code == statusStr || (len(code) == 1 && code == statusStr[0:1]) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasUncacheableHeader reports whether the response carries a header that rules out
+// storing it (hdrResNotCacheList: Content-Range, Www-Authenticate, Retry-After, ...).
+func hasUncacheableHeader(hdr http.Header) bool {
+	for h := range hdr {
+		if slices.Contains(hdrResNotCacheList, h) {
+			return true
+		}
+	}
+	return false
 }

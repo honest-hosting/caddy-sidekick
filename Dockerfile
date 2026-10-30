@@ -1,7 +1,6 @@
 # Multi-stage build for Caddy with FrankenPHP and Sidekick module
 FROM dunglas/frankenphp:builder-php8.3-bookworm AS builder
 
-ARG GO_VERSION
 ARG XCADDY_VERSION
 ARG CADDY_VERSION
 ARG FRANKENPHP_CADDY_VERSION
@@ -18,10 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install xcaddy
 WORKDIR /tmp
 RUN curl --silent -Lo - https://github.com/caddyserver/xcaddy/releases/download/v${XCADDY_VERSION}/xcaddy_${XCADDY_VERSION}_linux_amd64.tar.gz | tar -zxf - && install -D /tmp/xcaddy /usr/local/bin/xcaddy
-RUN curl --silent -Lo - https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | tar -zxf - && mv go /usr/local/go
 
-ENV PATH=${PATH}:/root/go/bin:/usr/local/go/bin
-ENV GOROOT=/usr/local/go
+# Go comes from the builder image (/usr/local/go, already first on PATH), the same
+# toolchain the fleet's frankenwp-base build uses.
 
 # Set working directory
 WORKDIR /build
