@@ -3,6 +3,7 @@ package sidekick
 import (
 	"context"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +38,11 @@ type MetricsCollector struct {
 	// Range-specific outcomes. Tracked separately because they happen IN ADDITION
 	// to the underlying hit/miss rather than instead of it.
 	rangeOperations *prometheus.CounterVec
+
+	// Why requests bypassed the cache. Tracked separately, alongside the plain bypass
+	// count, so a rise in unkeyed-query bypasses (a parameter worth keying or ignoring)
+	// is visible without guessing.
+	bypassReasons *prometheus.CounterVec
 
 	// Response time histogram
 	responseTime *prometheus.HistogramVec
@@ -203,6 +209,18 @@ func (m *MetricsCollector) initMetrics() {
 	m.registry.MustRegister(m.rangeOperations)
 	_ = prometheus.DefaultRegisterer.Register(m.rangeOperations)
 
+	// Bypass reasons. The label set is fixed (bypassReasonLabels); parameter names are
+	// never used as labels, because they are request-controlled.
+	m.bypassReasons = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "caddy_sidekick_bypass_total",
+			Help: "Requests that bypassed the cache, by reason: private, policy, debug, query (an unkeyed query parameter), query_readonly (a click-ID value that may not fill the cache)",
+		},
+		[]string{"reason"},
+	)
+	m.registry.MustRegister(m.bypassReasons)
+	_ = prometheus.DefaultRegisterer.Register(m.bypassReasons)
+
 	// Response time
 	m.responseTime = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -231,6 +249,9 @@ func (m *MetricsCollector) initMetrics() {
 	}
 	for _, op := range []string{"hit", "fill", "collapsed", "collapse_fallback"} {
 		m.rangeOperations.WithLabelValues(op).Add(0)
+	}
+	for _, reason := range bypassReasonLabels {
+		m.bypassReasons.WithLabelValues(reason).Add(0)
 	}
 }
 
@@ -404,6 +425,27 @@ func (m *MetricsCollector) RecordCacheOperation(operation, status, serverName st
 // underlying hit/miss, so routing them through that method double-counted
 // totalRequests — and because "range_*" matched no case in its switch, recorded
 // nothing else at all. Without this the new paths were invisible in production.
+// bypassReasonLabels is the complete, fixed label set for caddy_sidekick_bypass_total.
+var bypassReasonLabels = []string{"private", "policy", "debug", "query", "query_readonly"}
+
+// RecordBypassReason counts a bypass by reason. Unknown reasons are folded into
+// "private" so the label set can never grow.
+func (m *MetricsCollector) RecordBypassReason(reason string) {
+	if m == nil {
+		return
+	}
+	if !slices.Contains(bypassReasonLabels, reason) {
+		reason = "private"
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.bypassReasons != nil {
+		m.bypassReasons.WithLabelValues(reason).Inc()
+	}
+}
+
 func (m *MetricsCollector) RecordRangeOperation(operation string) {
 	if m == nil {
 		return

@@ -3,7 +3,7 @@
  * Plugin Name:     Caddy Sidekick Content Cache Purge
  * Author:          Stephen Miracle, Kyle Mott
  * Description:     Purge the content on publish.
- * Version:         0.1.1
+ * Version:         0.1.2
  *
  */
 if (!defined('ABSPATH')) {
@@ -86,9 +86,19 @@ function sidekick_purge_paths_for_post($post_id) {
 
     $paths = [];
 
-    // Single post
-    $link = wp_make_link_relative(get_permalink($post_id));
-    $paths[] = $link . "/*";
+    // Single post. Sidekick matches these against the request PATH it cached, which
+    // never includes the query string, so build from the path alone.
+    // "wp_make_link_relative($link) . '/*'" produced "/hello-world//*" (the default
+    // /%postname%/ keeps its trailing slash), "/hello-world/*" for /%postname% (which
+    // misses "/hello-world"), and "/?p=123/*" for plain permalinks: none of them ever
+    // matched the post itself.
+    $post_path = wp_parse_url(get_permalink($post_id), PHP_URL_PATH) ?: '/';
+    $home_path = wp_parse_url(home_url('/'), PHP_URL_PATH) ?: '/';
+    $paths[] = $post_path;
+    if ($post_path !== '/' && $post_path !== $home_path) {
+        // Never for the home path: untrailingslashit('/') . '/*' is '/*', a full flush.
+        $paths[] = untrailingslashit($post_path) . '/*';
+    }
 
     // Categories
     $cats = get_the_category($post_id);
@@ -108,7 +118,7 @@ function sidekick_purge_paths_for_post($post_id) {
 
     // Feeds
     $paths[] = "/feed/";
-    $paths[] = $link . "/feed/";
+    $paths[] = untrailingslashit($post_path) . '/feed/';
 
     return array_unique($paths);
 }

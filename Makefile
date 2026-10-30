@@ -15,14 +15,16 @@ lint: ## Run linter against codebase
 	@golangci-lint -v run
 .PHONY: lint
 
-# GO_VERSION should (generally) match go.mod version
-build: export GO_VERSION               ?= 1.25.5
-build: export XCADDY_VERSION           ?= 0.4.5
-build: export CADDY_VERSION            ?= 2.10.2
-build: export FRANKENPHP_CADDY_VERSION ?= 1.9.0
+# Caddy / FrankenPHP / xcaddy / brotli versions match the fleet's frankenwp-base image
+# (infrastructure/packer/docker/frankenwp-base/frankenwp-base.auto.pkrvars.hcl), so the
+# integration suite tests what production runs. Go comes from the dunglas/frankenphp
+# builder image, as it does for the fleet build.
+build: export XCADDY_VERSION           ?= 0.4.7
+build: export CADDY_VERSION            ?= 2.11.7
+build: export FRANKENPHP_CADDY_VERSION ?= 1.13.1
 build: export BROTLI_CADDY_VERSION     ?= 1.0.1
 build: lint ## Run 'docker composer build' to build caddy with plugin, copy output binary to ./bin/caddy
-	@docker compose build --build-arg GO_VERSION=$(GO_VERSION) --build-arg XCADDY_VERSION=$(XCADDY_VERSION) --build-arg CADDY_VERSION=$(CADDY_VERSION) --build-arg FRANKENPHP_CADDY_VERSION=$(FRANKENPHP_CADDY_VERSION) --build-arg BROTLI_CADDY_VERSION=$(BROTLI_CADDY_VERSION)
+	@docker compose build --build-arg XCADDY_VERSION=$(XCADDY_VERSION) --build-arg CADDY_VERSION=$(CADDY_VERSION) --build-arg FRANKENPHP_CADDY_VERSION=$(FRANKENPHP_CADDY_VERSION) --build-arg BROTLI_CADDY_VERSION=$(BROTLI_CADDY_VERSION)
 	@CID=$$(docker create caddy-sidekick-integration-test:latest);          \
 		docker cp $$CID:/usr/local/bin/caddy ./bin/caddy >/dev/null 2>&1;   \
 		docker rm $$CID >/dev/null
