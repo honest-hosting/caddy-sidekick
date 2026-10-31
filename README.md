@@ -880,6 +880,24 @@ When metrics are enabled, they are available in two locations:
    - URL: `http://localhost:2019/metrics/sidekick` (Prometheus format)
    - URL: `http://localhost:2019/metrics/sidekick/stats` (JSON format)
    - Note: The admin API listens on localhost:2019 by default. Replace with your configured admin address if different.
+   - **Without the admin API:** the `sidekick_metrics` directive serves the same two endpoints from an
+     ordinary site, so you can run `admin off` (the admin API also serves `/config` and `/load`, which
+     anything that can reach it can use to read or replace the running config). A path ending in `/stats`
+     gets the JSON document; any other matched path gets the Prometheus metrics:
+     ```caddyfile
+     {
+         admin off
+     }
+
+     http://:2019 {
+         route {
+             metrics /metrics
+             sidekick_metrics /metrics/sidekick*
+             respond 404
+         }
+     }
+     ```
+     Keep the `route` block: outside it Caddy sorts `respond` ahead of `metrics`.
 
 2. **Caddy's standard metrics endpoint** (includes sidekick metrics):
    ```caddyfile
