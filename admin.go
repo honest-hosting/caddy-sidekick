@@ -101,11 +101,14 @@ func (am *AdminMetrics) serveStats(w http.ResponseWriter, r *http.Request) error
 		}
 	}
 
-	// Get current rates for all cache types
-	rates := metrics.GetRates()
+	return writeStats(w, metrics)
+}
 
+// writeStats writes the JSON stats document (current rates and totals). Shared by the
+// admin endpoint and the sidekick_metrics HTTP handler.
+func writeStats(w http.ResponseWriter, metrics *MetricsCollector) error {
 	stats := map[string]interface{}{
-		"rates": rates,
+		"rates": metrics.GetRates(),
 		"totals": map[string]uint64{
 			"total_requests": metrics.totalRequests.Load(),
 			"memory_hits":    metrics.memoryHits.Load(),
